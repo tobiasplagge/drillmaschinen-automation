@@ -13,6 +13,7 @@ Ethernet-basierte Steuerung mit 8 digitalen Eingängen und 8 digitalen Ausgänge
 **Features:**
 - ✅ 8 digitale Eingänge (DI1..DI8) auf GPIO4-11
 - ✅ 8 digitale Ausgänge (DO1..DO8) via I2C-IO-Expander (TCA9554)
+- ✅ Kanalnamen im Webinterface bearbeitbar und im ESP32 gespeichert
 - ✅ Ethernet-Konnektivität (PoE)
 - ✅ Webinterface und REST-API
 - ✅ WLAN Access Point Fallback
@@ -25,6 +26,10 @@ Passwort: 12345678
 Webseite: http://192.168.4.1/
 API: http://192.168.4.1/api/status
 ```
+
+Die Kanalnamen koennen direkt im Webinterface geaendert werden. Nach `OK`
+speichert der ESP32 den Namen im internen NVS-Speicher; `/api/status` liefert
+ihn pro Kanal als Feld `name` mit.
 
 **Hardware:**
 - **Board:** Waveshare ESP32-S3-POE-ETH-8DI-8DO
