@@ -1,67 +1,281 @@
-# Waveshare ESP32-S3-POE-ETH-8DI-8DO Drillmaschine
+# Drillmaschinen-Automation
 
-PlatformIO/Arduino-Projekt fuer das Waveshare `ESP32-S3-POE-ETH-8DI-8DO`.
+Firmware-Projekte für die Automatisierung und Steuerung von Drillmaschinen mit verschiedenen ESP32-basierten Hardwareplattformen.
 
-## Funktion
+## 📋 Projektübersicht
 
-- liest 8 digitale Eingänge `DI1..DI8`
-- berechnet je Kanal einen Status
-- spiegelt aktive Eingänge auf die 8 digitalen Ausgänge `DO1..DO8`
-- stellt eine lokale Webseite bereit
-- stellt eine REST-API unter `/api/status` bereit
-- startet aktuell einen WLAN Access Point
+Dieses Repository enthält zwei Kontrollvarianten:
 
-## WLAN
+### 1. **Waveshare ESP32-S3-POE-8DI-8DO** 
 
-```text
+Ethernet-basierte Steuerung mit 8 digitalen Eingängen und 8 digitalen Ausgängen.
+
+**Features:**
+- ✅ 8 digitale Eingänge (DI1..DI8) auf GPIO4-11
+- ✅ 8 digitale Ausgänge (DO1..DO8) via I2C-IO-Expander (TCA9554)
+- ✅ Ethernet-Konnektivität (PoE)
+- ✅ Webinterface und REST-API
+- ✅ WLAN Access Point Fallback
+- ✅ ArduinoJson Verarbeitung
+
+**WLAN-Zugang:**
+```
 SSID: DRILL-8DI8DO
 Passwort: 12345678
 Webseite: http://192.168.4.1/
 API: http://192.168.4.1/api/status
 ```
 
-## Waveshare Pinbelegung
+**Hardware:**
+- **Board:** Waveshare ESP32-S3-POE-ETH-8DI-8DO
+- **Prozessor:** ESP32-S3 (240 MHz Dual-Core)
+- **RAM:** 8 MB PSRAM
+- **Flash:** 16 MB (QIO OPI Mode)
+- **Ethernet:** W5500 über SPI (PoE)
+- **I/O Expander:** TCA9554 (I2C 0x20)
 
-Laut Waveshare-Wiki:
+**Pinbelegung:**
 
-| Funktion | GPIO |
-| --- | --- |
-| DI1 | GPIO4 |
-| DI2 | GPIO5 |
-| DI3 | GPIO6 |
-| DI4 | GPIO7 |
-| DI5 | GPIO8 |
-| DI6 | GPIO9 |
-| DI7 | GPIO10 |
-| DI8 | GPIO11 |
-| DO1..DO8 | TCA9554 I/O-Expander, I2C-Adresse `0x20` |
-| I2C SDA | GPIO42 |
-| I2C SCL | GPIO41 |
-| CAN TX | GPIO2 |
-| CAN RX | GPIO3 |
-| RS485 TX | GPIO17 |
-| RS485 RX | GPIO18 |
-| RS485 RTS | GPIO21 |
+| Funktion | GPIO | Bemerkung |
+|----------|------|-----------|
+| DI1 | GPIO4 | Digital Input 1 |
+| DI2 | GPIO5 | Digital Input 2 |
+| DI3 | GPIO6 | Digital Input 3 |
+| DI4 | GPIO7 | Digital Input 4 |
+| DI5 | GPIO8 | Digital Input 5 |
+| DI6 | GPIO9 | Digital Input 6 |
+| DI7 | GPIO10 | Digital Input 7 |
+| DI8 | GPIO11 | Digital Input 8 |
+| DO1..DO8 | I2C | via TCA9554 I/O-Expander |
+| I2C SDA | GPIO42 | Serial Data |
+| I2C SCL | GPIO41 | Serial Clock |
+| CAN TX | GPIO2 | CAN Bus TX |
+| CAN RX | GPIO3 | CAN Bus RX |
+| RS485 TX | GPIO17 | RS485 Transmit |
+| RS485 RX | GPIO18 | RS485 Receive |
+| RS485 RTS | GPIO21 | RS485 Request to Send |
 
-## Logik
-
-Aktuell gilt:
-
-```text
-DI aktiv   -> status = red  -> passender DO-Ausgang ein
-DI inaktiv -> status = none -> passender DO-Ausgang aus
+**Logik (src/main.cpp):**
+```cpp
+DI aktiv   → status = red  → Ausgabe DO aktiv
+DI inaktiv → status = none → Ausgabe DO inaktiv
 ```
 
-Die Logik kann oben in `src/main.cpp` angepasst werden:
-
+Konfigurierbar via:
 ```cpp
 static constexpr bool DO_ACTIVE_HIGH = true;
 static constexpr bool INPUT_ACTIVE_HIGH = true;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
 ```
 
-## Hinweis
+### 2. **ESP32 LD2410 Radar** 
 
-Die Ethernet/W5500-Hardware ist auf dem Board vorhanden, die aktuelle Firmware
-nutzt aber bewusst zuerst WLAN-AP, weil das fuer Inbetriebnahme und Handy-Test
-am einfachsten ist.
+Radar-basierte Präsenzerkennung mit LD2410 Sensor.
+
+**Features:**
+- ✅ LD2410 24-GHz-Radarmodul
+- ✅ Präsenzerkennung
+- ✅ Bewegungserfassung
+- ✅ Entfernungsmessung
+- ✅ UART/Seriell-Interface
+
+---
+
+## 🚀 Installation & Setup
+
+### Voraussetzungen
+
+- [PlatformIO](https://platformio.org/) CLI oder VS Code Extension
+- Python 3.8+
+- Git
+- USB-zu-UART Adapter (bei Bedarf)
+
+### Projekt klonen
+
+```bash
+git clone https://github.com/tobiasplagge/drillmaschinen-automation.git
+cd drillmaschinen-automation
+```
+
+### Build
+
+```bash
+# Waveshare Projekt
+cd waveshare_esp32_s3_poe_8di8do_Drillmaschine
+platformio run -e waveshare_esp32_s3_poe_8di8do
+
+# LD2410 Projekt
+cd ../esp32-ld2410-Drillmaschine
+platformio run -e esp32_s3_poe_8di8do
+```
+
+### Upload
+
+```bash
+cd waveshare_esp32_s3_poe_8di8do_Drillmaschine
+platformio run -e waveshare_esp32_s3_poe_8di8do --target upload
+```
+
+### Serial Monitor
+
+```bash
+platformio device monitor
+```
+
+---
+
+## ⚙️ Konfiguration
+
+### platformio.ini - Waveshare Board
+
+```ini
+[env:waveshare_esp32_s3_poe_8di8do]
+platform = espressif32
+board = esp32-s3-devkitm-1
+framework = arduino
+
+monitor_speed = 115200
+upload_speed = 115200
+
+board_build.flash_size = 16MB
+board_build.psram_type = opi
+board_build.arduino.memory_type = qio_opi
+board_build.f_flash = 80000000L
+board_build.flash_mode = qio
+
+build_flags =
+  -DARDUINO_USB_CDC_ON_BOOT=1
+  -DBOARD_HAS_PSRAM
+  -DCORE_DEBUG_LEVEL=3
+
+lib_deps =
+  bblanchon/ArduinoJson@^7.4.2
+```
+
+### Build-Flags
+
+| Flag | Beschreibung |
+|------|-------------|
+| `ARDUINO_USB_CDC_ON_BOOT=1` | USB CDC bei Boot aktivieren |
+| `BOARD_HAS_PSRAM` | Externes PSRAM aktivieren |
+| `CORE_DEBUG_LEVEL=3` | Debug-Level (0-5) |
+
+---
+
+## 📡 API-Referenz
+
+### Status abrufen
+
+```bash
+curl http://192.168.4.1/api/status
+```
+
+**Response:**
+```json
+{
+  "di": [0, 1, 0, 1, 0, 0, 1, 0],
+  "do": [0, 1, 0, 1, 0, 0, 1, 0],
+  "timestamp": 1234567890
+}
+```
+
+---
+
+## 📦 Abhängigkeiten
+
+- **ArduinoJson** v7.4.2+ – JSON-Verarbeitung und REST-API
+
+---
+
+## 📁 Projektstruktur
+
+```
+drillmaschinen-automation/
+├── waveshare_esp32_s3_poe_8di8do_Drillmaschine/
+│   ├── src/
+│   │   └── main.cpp              # Hauptprogramm Waveshare
+│   ├── include/
+│   ├── lib/
+│   ├── platformio.ini
+│   └── README.md
+├── esp32-ld2410-Drillmaschine/
+│   ├── src/
+│   │   └── main.cpp              # Hauptprogramm LD2410
+│   ├── include/
+│   ├── lib/
+│   ├── platformio.ini
+│   └── README.md
+└── README.md                     # Dieses Dokument
+```
+
+---
+
+## 🔧 Entwicklung & Debug
+
+### Debug-Level erhöhen
+
+```ini
+[env:waveshare_esp32_s3_poe_8di8do]
+build_flags = 
+  -DCORE_DEBUG_LEVEL=4
+```
+
+**Debug-Level:**
+- 0: Keine Ausgabe
+- 1: Fehler
+- 2: Fehler + Warnungen
+- 3: Fehler + Warnungen + Info
+- 4: Verbose
+- 5: Very Verbose
+
+---
+
+## 🐛 Troubleshooting
+
+### USB wird nicht erkannt
+
+1. Treiber installieren: `pip install esptool`
+2. Verfügbare Ports auflisten: `platformio device list`
+3. Board zurücksetzen: Boot-Button halten → Reset drücken
+
+### WLAN funktioniert nicht
+
+- Access Point mit SSID `DRILL-8DI8DO` suchen
+- Passwort: `12345678`
+- In der Konsole Fehler überprüfen
+
+### I2C-Fehler (TCA9554)
+
+- GPIO41 (SCL) und GPIO42 (SDA) überprüfen
+- I2C-Adresse `0x20` mit `i2cdetect` überprüfen
+- Pullup-Widerstände überprüfen (4,7kΩ empfohlen)
+
+### Upload schlägt fehl
+
+- USB-Kabel überprüfen
+- Board in Bootloader-Modus versetzen
+- ESP32 Tool neu installieren: `pip install esptool --upgrade`
+
+---
+
+## 📚 Weitere Ressourcen
+
+- [PlatformIO Dokumentation](https://docs.platformio.org/)
+- [ESP32 Arduino Core](https://github.com/espressif/arduino-esp32)
+- [Waveshare ESP32-S3-POE Wiki](https://www.waveshare.com/wiki/ESP32-S3-POE-ETH-8DI-8DO)
+- [LD2410 Präsenzsensor](https://www.seeedstudio.com/LD2410-Human-Presence-Sensor-p-5643.html)
+- [ArduinoJson Dokumentation](https://arduinojson.org/)
+
+---
+
+## 📝 Lizenz
+
+MIT License
+
+## 👤 Autor
+
+Tobias Plagge
+
+---
+
+**Zuletzt aktualisiert:** 17. Mai 2026
