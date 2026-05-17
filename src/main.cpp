@@ -13,6 +13,7 @@ static const char *AP_PASSWORD = "12345678";
 
 static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschine 8DI/8DO";
+static const char *FIRMWARE_VERSION = "0.3.0";
 
 static constexpr uint8_t CHANNEL_COUNT = 8;
 static constexpr uint8_t CHANNEL_NAME_LENGTH = 24;
@@ -201,6 +202,7 @@ String statusJson() {
   JsonDocument doc;
   doc["device_id"] = DEVICE_ID;
   doc["device_name"] = DEVICE_NAME;
+  doc["firmware_version"] = FIRMWARE_VERSION;
   doc["uptime_ms"] = millis();
   doc["wifi_ap_ssid"] = AP_SSID;
   doc["ip"] = WiFi.softAPIP().toString();
@@ -241,10 +243,8 @@ String htmlPage() {
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
     .card { border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; }
     .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .name-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; margin-bottom: 12px; }
-    .name-input { min-width: 0; height: 38px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #f9fafb; padding: 0 10px; font: inherit; font-weight: 700; }
-    .save-name { height: 38px; border: 0; border-radius: 6px; background: #2563eb; color: white; padding: 0 11px; font-weight: 750; cursor: pointer; }
-    .save-name:disabled { opacity: .45; cursor: default; }
+    .name { min-width: 0; font-weight: 800; font-size: 1.08rem; overflow-wrap: anywhere; }
+    .channel { color: #9ca3af; font-size: .85rem; margin-top: 2px; }
     .dot { width: 40px; height: 40px; border-radius: 50%; background: #6b7280; box-shadow: 0 0 14px #6b7280; flex: 0 0 auto; }
     .dot.red { background: #ef4444; box-shadow: 0 0 20px #ef4444; }
     .dot.none { background: #6b7280; }
@@ -258,14 +258,12 @@ String htmlPage() {
   <main>
     <h1 id="title">Drillmaschine 8DI/8DO</h1>
     <div class="meta">
-      <span id="ip">IP: -</span> · <span id="updated">-</span>
+      <span id="ip">IP: -</span> · <span id="version">Version: -</span> · <span id="updated">-</span>
     </div>
     <div id="grid" class="grid"></div>
     <div id="error" class="error"></div>
   </main>
   <script>
-    const editing = new Set();
-
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, c => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -276,12 +274,11 @@ String htmlPage() {
       const name = escapeHtml(ch.name || ('Kanal ' + ch.channel));
       return `
         <div class="card" data-channel="${ch.channel}">
-          <div class="name-row">
-            <input class="name-input" data-channel="${ch.channel}" maxlength="23" value="${name}">
-            <button class="save-name" data-channel="${ch.channel}" type="button">OK</button>
-          </div>
           <div class="top">
-            <div>Kanal ${ch.channel}</div>
+            <div>
+              <div class="name">${name}</div>
+              <div class="channel">Kanal ${ch.channel}</div>
+            </div>
             <div class="dot ${ch.status}"></div>
           </div>
           <dl>
@@ -294,50 +291,6 @@ String htmlPage() {
         </div>`;
     }
 
-    async function saveName(channel, name, button) {
-      button.disabled = true;
-      try {
-        const res = await fetch('/api/channel-name', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ channel, name })
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        editing.delete(channel);
-        await refresh(true);
-      } catch (err) {
-        document.getElementById('error').textContent = 'Name konnte nicht gespeichert werden';
-      } finally {
-        button.disabled = false;
-      }
-    }
-
-    function wireNameEditor() {
-      document.querySelectorAll('.name-input').forEach(input => {
-        const channel = Number(input.dataset.channel);
-        input.addEventListener('focus', () => editing.add(channel));
-        input.addEventListener('input', () => editing.add(channel));
-        input.addEventListener('keydown', event => {
-          if (event.key === 'Enter') {
-            const button = document.querySelector(`.save-name[data-channel="${channel}"]`);
-            saveName(channel, input.value, button);
-          }
-        });
-      });
-
-      document.querySelectorAll('.save-name').forEach(button => {
-        button.addEventListener('click', () => {
-          const channel = Number(button.dataset.channel);
-          const input = document.querySelector(`.name-input[data-channel="${channel}"]`);
-          saveName(channel, input.value, button);
-        });
-      });
-    }
-
-    function shouldHoldRefresh(data) {
-      return data.channels.some(ch => editing.has(ch.channel));
-    }
-
     async function refresh() {
       try {
         const res = await fetch('/api/status', { cache: 'no-store' });
@@ -345,11 +298,9 @@ String htmlPage() {
         const data = await res.json();
         document.getElementById('title').textContent = data.device_name || data.device_id;
         document.getElementById('ip').textContent = 'IP: ' + data.ip;
+        document.getElementById('version').textContent = 'Version: ' + (data.firmware_version || '-');
         document.getElementById('updated').textContent = 'Aktualisiert: ' + new Date().toLocaleTimeString();
-        if (!shouldHoldRefresh(data)) {
-          document.getElementById('grid').innerHTML = data.channels.map(card).join('');
-          wireNameEditor();
-        }
+        document.getElementById('grid').innerHTML = data.channels.map(card).join('');
         document.getElementById('error').textContent = '';
       } catch (err) {
         document.getElementById('error').textContent = 'Keine Verbindung zur API';
