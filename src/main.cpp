@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
@@ -14,6 +15,7 @@ static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschine 8DI/8DO";
 
 static constexpr uint8_t CHANNEL_COUNT = 8;
+static constexpr uint8_t CHANNEL_NAME_LENGTH = 24;
 
 // Waveshare wiki: DI1..DI8 are GPIO4..GPIO11.
 static constexpr uint8_t DI_PINS[CHANNEL_COUNT] = {4, 5, 6, 7, 8, 9, 10, 11};
@@ -34,6 +36,7 @@ static constexpr bool INPUT_ACTIVE_HIGH = true;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
 
 WebServer server(80);
+Preferences preferences;
 
 struct ChannelState {
   bool inputRaw = false;
@@ -45,8 +48,68 @@ struct ChannelState {
 };
 
 ChannelState channels[CHANNEL_COUNT];
+char channelNames[CHANNEL_COUNT][CHANNEL_NAME_LENGTH] = {
+    "Kanal 1",
+    "Kanal 2",
+    "Kanal 3",
+    "Kanal 4",
+    "Kanal 5",
+    "Kanal 6",
+    "Kanal 7",
+    "Kanal 8",
+};
 uint8_t tcaOutputState = 0x00;
 uint32_t lastDebugMs = 0;
+
+void sanitizeChannelName(char *name) {
+  name[CHANNEL_NAME_LENGTH - 1] = '\0';
+  String cleaned = String(name);
+  cleaned.trim();
+
+  if (cleaned.length() == 0) {
+    cleaned = "Kanal";
+  }
+
+  cleaned.replace("\"", "'");
+  cleaned.replace("<", "");
+  cleaned.replace(">", "");
+  cleaned.toCharArray(name, CHANNEL_NAME_LENGTH);
+}
+
+void setDefaultChannelName(uint8_t channelIndex) {
+  snprintf(channelNames[channelIndex], CHANNEL_NAME_LENGTH, "Kanal %u", channelIndex + 1);
+}
+
+void loadChannelNames() {
+  preferences.begin("channels", false);
+
+  for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
+    char key[6];
+    snprintf(key, sizeof(key), "ch%u", i + 1);
+
+    String stored = preferences.getString(key, "");
+    if (stored.length() > 0) {
+      stored.toCharArray(channelNames[i], CHANNEL_NAME_LENGTH);
+      sanitizeChannelName(channelNames[i]);
+    } else {
+      setDefaultChannelName(i);
+    }
+  }
+}
+
+bool saveChannelName(uint8_t channelIndex, const String &name) {
+  if (channelIndex >= CHANNEL_COUNT) {
+    return false;
+  }
+
+  name.toCharArray(channelNames[channelIndex], CHANNEL_NAME_LENGTH);
+  sanitizeChannelName(channelNames[channelIndex]);
+
+  char key[6];
+  snprintf(key, sizeof(key), "ch%u", channelIndex + 1);
+  preferences.putString(key, channelNames[channelIndex]);
+  return true;
+}
 
 bool tcaWrite(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(TCA9554_ADDRESS);
@@ -146,6 +209,7 @@ String statusJson() {
   for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
     JsonObject ch = array.add<JsonObject>();
     ch["channel"] = i + 1;
+    ch["name"] = channelNames[i];
     ch["di_gpio"] = DI_PINS[i];
     ch["input_raw"] = channels[i].inputRaw;
     ch["active"] = channels[i].active;
@@ -177,7 +241,10 @@ String htmlPage() {
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
     .card { border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; }
     .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .name { font-weight: 750; font-size: 1.1rem; }
+    .name-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .name-input { min-width: 0; height: 38px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #f9fafb; padding: 0 10px; font: inherit; font-weight: 700; }
+    .save-name { height: 38px; border: 0; border-radius: 6px; background: #2563eb; color: white; padding: 0 11px; font-weight: 750; cursor: pointer; }
+    .save-name:disabled { opacity: .45; cursor: default; }
     .dot { width: 40px; height: 40px; border-radius: 50%; background: #6b7280; box-shadow: 0 0 14px #6b7280; flex: 0 0 auto; }
     .dot.red { background: #ef4444; box-shadow: 0 0 20px #ef4444; }
     .dot.none { background: #6b7280; }
@@ -197,11 +264,24 @@ String htmlPage() {
     <div id="error" class="error"></div>
   </main>
   <script>
+    const editing = new Set();
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+
     function card(ch) {
+      const name = escapeHtml(ch.name || ('Kanal ' + ch.channel));
       return `
-        <div class="card">
+        <div class="card" data-channel="${ch.channel}">
+          <div class="name-row">
+            <input class="name-input" data-channel="${ch.channel}" maxlength="23" value="${name}">
+            <button class="save-name" data-channel="${ch.channel}" type="button">OK</button>
+          </div>
           <div class="top">
-            <div class="name">Kanal ${ch.channel}</div>
+            <div>Kanal ${ch.channel}</div>
             <div class="dot ${ch.status}"></div>
           </div>
           <dl>
@@ -214,6 +294,50 @@ String htmlPage() {
         </div>`;
     }
 
+    async function saveName(channel, name, button) {
+      button.disabled = true;
+      try {
+        const res = await fetch('/api/channel-name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel, name })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        editing.delete(channel);
+        await refresh(true);
+      } catch (err) {
+        document.getElementById('error').textContent = 'Name konnte nicht gespeichert werden';
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function wireNameEditor() {
+      document.querySelectorAll('.name-input').forEach(input => {
+        const channel = Number(input.dataset.channel);
+        input.addEventListener('focus', () => editing.add(channel));
+        input.addEventListener('input', () => editing.add(channel));
+        input.addEventListener('keydown', event => {
+          if (event.key === 'Enter') {
+            const button = document.querySelector(`.save-name[data-channel="${channel}"]`);
+            saveName(channel, input.value, button);
+          }
+        });
+      });
+
+      document.querySelectorAll('.save-name').forEach(button => {
+        button.addEventListener('click', () => {
+          const channel = Number(button.dataset.channel);
+          const input = document.querySelector(`.name-input[data-channel="${channel}"]`);
+          saveName(channel, input.value, button);
+        });
+      });
+    }
+
+    function shouldHoldRefresh(data) {
+      return data.channels.some(ch => editing.has(ch.channel));
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/api/status', { cache: 'no-store' });
@@ -222,7 +346,10 @@ String htmlPage() {
         document.getElementById('title').textContent = data.device_name || data.device_id;
         document.getElementById('ip').textContent = 'IP: ' + data.ip;
         document.getElementById('updated').textContent = 'Aktualisiert: ' + new Date().toLocaleTimeString();
-        document.getElementById('grid').innerHTML = data.channels.map(card).join('');
+        if (!shouldHoldRefresh(data)) {
+          document.getElementById('grid').innerHTML = data.channels.map(card).join('');
+          wireNameEditor();
+        }
         document.getElementById('error').textContent = '';
       } catch (err) {
         document.getElementById('error').textContent = 'Keine Verbindung zur API';
@@ -244,6 +371,39 @@ void handleRoot() {
 void handleApiStatus() {
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", statusJson());
+}
+
+void handleApiChannelName() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"error\":\"missing_body\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+  if (error) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+
+  const int channel = doc["channel"] | 0;
+  const String name = doc["name"] | "";
+
+  if (channel < 1 || channel > CHANNEL_COUNT || name.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"invalid_channel_or_name\"}");
+    return;
+  }
+
+  saveChannelName(static_cast<uint8_t>(channel - 1), name);
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["channel"] = channel;
+  response["name"] = channelNames[channel - 1];
+
+  String json;
+  serializeJson(response, json);
+  server.send(200, "application/json", json);
 }
 
 void startWiFiAccessPoint() {
@@ -294,12 +454,14 @@ void setup() {
   Serial.println();
   Serial.println("Waveshare ESP32-S3-POE-ETH-8DI-8DO Drillmaschine");
 
+  loadChannelNames();
   initDigitalInputs();
   startWiFiAccessPoint();
   initDigitalOutputs();
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/channel-name", HTTP_POST, handleApiChannelName);
   server.onNotFound([]() {
     server.send(404, "application/json", "{\"error\":\"not_found\"}");
   });
