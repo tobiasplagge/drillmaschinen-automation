@@ -14,8 +14,11 @@ Ethernet-basierte Steuerung mit 8 digitalen Eingängen und 8 digitalen Ausgänge
 - ✅ 8 digitale Eingänge (DI1..DI8) auf GPIO4-11
 - ✅ 8 digitale Ausgänge (DO1..DO8) via I2C-IO-Expander (TCA9554)
 - ✅ Kanalnamen im Webinterface bearbeitbar und im ESP32 gespeichert
-- ✅ Ethernet-Konnektivität (PoE)
-- ✅ Webinterface und REST-API
+- ✅ Drillmaschinenüberwachung mit Live-Status und Hauptsignal je Kanal
+- ✅ Webinterface und REST-API über HTTPS mit Self-Signed-Zertifikat
+- ✅ Fahrtaufzeichnung mit Tablet-/Smartphone-GPS
+- ✅ Ereignislog für Hauptsignale mit GPS-Koordinaten, sofern verfügbar
+- ✅ Alarmton auf Tablet/Smartphone mit Quittierung
 - ✅ WLAN Access Point Fallback
 - ✅ ArduinoJson Verarbeitung
 
@@ -23,13 +26,49 @@ Ethernet-basierte Steuerung mit 8 digitalen Eingängen und 8 digitalen Ausgänge
 ```
 SSID: DRILL-8DI8DO
 Passwort: 12345678
-Webseite: http://192.168.4.1/
-API: http://192.168.4.1/api/status
+Webseite: https://192.168.4.1/
+API: https://192.168.4.1/api/status
 ```
 
 Die Kanalnamen koennen direkt im Webinterface geaendert werden. Nach `OK`
 speichert der ESP32 den Namen im internen NVS-Speicher; `/api/status` liefert
 ihn pro Kanal als Feld `name` mit.
+
+Die Bearbeitung der Kanalnamen ist im normalen Statusbereich ausgeblendet und
+kann ueber die Detailansicht geoeffnet werden. Die Webseite zeigt ausserdem die
+Firmware-Version und die interne ESP32-Temperatur an.
+
+### Fahrtaufzeichnung und GPS
+
+Die Fahrtaufzeichnung nutzt die GPS-Position des Tablets oder Smartphones im
+Browser. Dafuer muss die Webseite ueber `https://192.168.4.1/` geoeffnet und
+das Self-Signed-Zertifikat im Browser akzeptiert werden. Aufgezeichnet werden:
+
+- GPS-Punkte fuer die Fahrspur
+- aktuelles Saatgut/Feldfrucht
+- Live- und Hauptsignalmaske der 8 Kanaele
+- Hauptsignal-Ereignisse mit GPS-Position, wenn zum Zeitpunkt der Stoerung eine Position bekannt ist
+
+Downloads im Webinterface:
+
+- Fahrtaufzeichnung als CSV
+- Fahrtaufzeichnung als GeoJSON fuer Google Maps / My Maps
+- Hauptsignal-Log als CSV
+- Hauptsignal-Log als GeoJSON
+
+Bekannter Stand: Die GPS-Funktion ist noch nicht zu 100% stabil. Auf manchen
+Tablets/Browserversionen koennen einzelne Punkte fehlen oder die Uebertragung
+vom Browser zum ESP32 mit einem Fetch-/400-Fehler abbrechen. Die
+Maschinenueberwachung der Kanaele funktioniert unabhaengig davon weiter.
+
+### Alarmton
+
+Der Alarmton wird im Browser auf dem Tablet oder Smartphone abgespielt. Er muss
+einmal ueber `Ton aktivieren` freigeschaltet werden. Wenn ein Kanal den Status
+`Erkannt` erreicht, startet ein pulsierender Ton. Mit `Alarm quittieren` wird
+der Ton fuer die aktuell anliegenden Stoerungen stummgeschaltet. Neue
+Stoerungen loesen den Alarm erneut aus; wenn alle Kanaele wieder `OK` sind,
+wird die Quittierung automatisch zurueckgesetzt.
 
 **Hardware:**
 - **Board:** Waveshare ESP32-S3-POE-ETH-8DI-8DO
@@ -62,14 +101,15 @@ ihn pro Kanal als Feld `name` mit.
 
 **Logik (src/main.cpp):**
 ```cpp
-DI aktiv   → status = red  → Ausgabe DO aktiv
-DI inaktiv → status = none → Ausgabe DO inaktiv
+DI aktiv, aber kuerzer als 1,5 s → Status Kein Status
+DI aktiv ab 1,5 s                → Status Erkannt / Hauptsignal
+DI inaktiv                       → Status OK
 ```
 
 Konfigurierbar via:
 ```cpp
 static constexpr bool DO_ACTIVE_HIGH = true;
-static constexpr bool INPUT_ACTIVE_HIGH = true;
+static constexpr bool INPUT_ACTIVE_HIGH = false;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
 ```
 
@@ -155,6 +195,7 @@ build_flags =
 
 lib_deps =
   bblanchon/ArduinoJson@^7.4.2
+  esp32_idf5_https_server_compat
 ```
 
 ### Build-Flags
@@ -172,7 +213,7 @@ lib_deps =
 ### Status abrufen
 
 ```bash
-curl http://192.168.4.1/api/status
+curl -k https://192.168.4.1/api/status
 ```
 
 **Response:**
@@ -184,11 +225,32 @@ curl http://192.168.4.1/api/status
 }
 ```
 
+Hinweis: Bei aktiver HTTPS-Firmware lautet die Browser-/App-Adresse
+`https://192.168.4.1/api/status`. Fuer Tests mit `curl` muss das
+Self-Signed-Zertifikat ggf. mit `-k` akzeptiert werden:
+
+```bash
+curl -k https://192.168.4.1/api/status
+```
+
+Weitere Endpunkte:
+
+| Endpoint | Beschreibung |
+|----------|--------------|
+| `/api/status` | aktueller Kanal-, Alarm-, Temperatur- und Logstatus |
+| `/api/crop` | Saatgut/Feldfrucht speichern |
+| `/api/gps-log` | GPS-Punkt vom Browser an den ESP32 uebertragen |
+| `/api/gps-log.csv` | Fahrtaufzeichnung als CSV herunterladen |
+| `/api/gps-log.geojson` | Fahrtaufzeichnung als GeoJSON herunterladen |
+| `/api/main-events.csv` | Hauptsignal-Ereignisse als CSV herunterladen |
+| `/api/main-events.geojson` | Hauptsignal-Ereignisse als GeoJSON herunterladen |
+
 ---
 
 ## 📦 Abhängigkeiten
 
 - **ArduinoJson** v7.4.2+ – JSON-Verarbeitung und REST-API
+- **esp32_idf5_https_server_compat** – HTTPS-Webserver fuer ESP32 Arduino
 
 ---
 
@@ -200,9 +262,12 @@ drillmaschinen-automation/
 │   ├── src/
 │   │   └── main.cpp              # Hauptprogramm Waveshare
 │   ├── include/
+│   │   ├── tls_server_cert_der.h # Self-Signed-Zertifikat
+│   │   └── tls_server_key_der.h  # TLS Private Key
 │   ├── lib/
 │   ├── platformio.ini
-│   └── README.md
+│   ├── README.md
+│   └── RELEASE_NOTES.md
 ├── esp32-ld2410-Drillmaschine/
 │   ├── src/
 │   │   └── main.cpp              # Hauptprogramm LD2410
@@ -249,6 +314,14 @@ build_flags =
 - Passwort: `12345678`
 - In der Konsole Fehler überprüfen
 
+### GPS/Fahrtaufzeichnung funktioniert nicht
+
+- Webseite unbedingt ueber `https://192.168.4.1/` oeffnen
+- Self-Signed-Zertifikat im Browser akzeptieren
+- Standortfreigabe im Browser erlauben
+- Auf dem Tablet/Smartphone pruefen, ob Standortdienste aktiv sind
+- Bekannter Stand: GPS ist noch nicht final stabil; Fetch-/400-Fehler und leere GeoJSON-Dateien koennen noch auftreten
+
 ### I2C-Fehler (TCA9554)
 
 - GPIO41 (SCL) und GPIO42 (SDA) überprüfen
@@ -283,4 +356,4 @@ Tobias Plagge
 
 ---
 
-**Zuletzt aktualisiert:** 17. Mai 2026
+**Zuletzt aktualisiert:** 25. Mai 2026
