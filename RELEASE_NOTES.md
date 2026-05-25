@@ -1,5 +1,50 @@
 # Release Notes
 
+## 1.3.1 - 2026-05-25
+
+### Neu
+
+- Sensorlog fuer abgeschlossene Hauptsignal-Ausloesungen ergänzt.
+- Sensorlog enthaelt Kanal, Kanalname, Saat, Startzeit, Endzeit, Dauer und GPS-Bezug.
+- Neue Downloads: `/api/sensor-events.csv` und `/api/sensor-events.txt`.
+
+### Geändert
+
+- WLAN-SSID auf `Drillmaschine-M01` umbenannt.
+- `M01` steht fuer `Modul 01`, damit spaeter mehrere Module fortlaufend benannt werden koennen.
+- Webserver wieder von HTTPS auf HTTP umgestellt.
+- Grund: Browser-GPS wurde entfernt, daher ist HTTPS nicht mehr notwendig.
+- HTTP ist auf dem ESP32-S3 stabiler bei Seiten-Refresh und zyklischen API-Abfragen.
+- API-Adresse ist wieder `http://192.168.4.1/api/status`.
+
+## 1.3.0 - 2026-05-25
+
+### Neu
+
+- Ebyte EWD108-GN05(485) als GNSS-Quelle vorbereitet.
+- RS485/Modbus-RTU-Abfrage direkt im ESP32 ergänzt.
+- Fahrtaufzeichnung startet/stoppt jetzt lokal im ESP32; Tablet-/Smartphone-GPS wird nicht mehr verwendet.
+- GNSS-Status im Webinterface ergänzt:
+  - Fix ja/nein
+  - Quelle
+  - aktuelle Position
+  - Genauigkeit
+  - Satelliten
+  - RS485-Status und Fehlerzähler
+- `/api/status` liefert einen `gnss`-Block mit Modbus-/Fix-/Positionsdaten.
+- Neuer Endpoint `/api/recording` zum Starten/Stoppen der Fahrtaufzeichnung.
+
+### Entfernt
+
+- Browser-Geolocation über Tablet/Smartphone.
+- `/api/gps-log` als Browser-GPS-Eingang.
+
+### Bekannte Einschränkungen
+
+- Die Modbus-Registerbelegung des echten EWD108-GN05(485) muss noch am Modul verifiziert werden.
+- Die Firmware scannt aktuell Holding-Register ab `0x0000` nach NMEA RMC/GGA.
+- Falls das Modul NMEA in einem anderen Registerbereich bereitstellt, müssen `GNSS_SCAN_START_REGISTER` und `GNSS_SCAN_REGISTER_COUNT` angepasst werden.
+
 ## 1.2.0 - 2026-05-25
 
 ### Neu

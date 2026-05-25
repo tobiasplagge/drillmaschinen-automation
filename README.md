@@ -15,8 +15,8 @@ Ethernet-basierte Steuerung mit 8 digitalen Eingängen und 8 digitalen Ausgänge
 - ✅ 8 digitale Ausgänge (DO1..DO8) via I2C-IO-Expander (TCA9554)
 - ✅ Kanalnamen im Webinterface bearbeitbar und im ESP32 gespeichert
 - ✅ Drillmaschinenüberwachung mit Live-Status und Hauptsignal je Kanal
-- ✅ Webinterface und REST-API über HTTPS mit Self-Signed-Zertifikat
-- ✅ Fahrtaufzeichnung mit Tablet-/Smartphone-GPS
+- ✅ Webinterface und REST-API über lokalen HTTP-Server
+- ✅ Fahrtaufzeichnung mit Ebyte EWD108-GN05(485) per RS485/Modbus RTU
 - ✅ Ereignislog für Hauptsignale mit GPS-Koordinaten, sofern verfügbar
 - ✅ Alarmton auf Tablet/Smartphone mit Quittierung
 - ✅ WLAN Access Point Fallback
@@ -24,11 +24,16 @@ Ethernet-basierte Steuerung mit 8 digitalen Eingängen und 8 digitalen Ausgänge
 
 **WLAN-Zugang:**
 ```
-SSID: DRILL-8DI8DO
+SSID: Drillmaschine-M01
 Passwort: 12345678
-Webseite: https://192.168.4.1/
-API: https://192.168.4.1/api/status
+Webseite: http://192.168.4.1/
+API: http://192.168.4.1/api/status
 ```
+
+Hinweis zur SSID: `M01` steht fuer `Modul 01`. Wenn spaeter mehrere
+Waveshare-Module an der Maschine verwendet werden, koennen sie fortlaufend
+benannt werden, z. B. `Drillmaschine-M01`, `Drillmaschine-M02`,
+`Drillmaschine-M03` und `Drillmaschine-M04`.
 
 Die Kanalnamen koennen direkt im Webinterface geaendert werden. Nach `OK`
 speichert der ESP32 den Namen im internen NVS-Speicher; `/api/status` liefert
@@ -38,11 +43,38 @@ Die Bearbeitung der Kanalnamen ist im normalen Statusbereich ausgeblendet und
 kann ueber die Detailansicht geoeffnet werden. Die Webseite zeigt ausserdem die
 Firmware-Version und die interne ESP32-Temperatur an.
 
-### Fahrtaufzeichnung und GPS
+### Fahrtaufzeichnung und GNSS
 
-Die Fahrtaufzeichnung nutzt die GPS-Position des Tablets oder Smartphones im
-Browser. Dafuer muss die Webseite ueber `https://192.168.4.1/` geoeffnet und
-das Self-Signed-Zertifikat im Browser akzeptiert werden. Aufgezeichnet werden:
+Die Fahrtaufzeichnung nutzt ein Ebyte EWD108-GN05(485) GNSS-Modul am
+RS485-Anschluss des Waveshare-Boards. Der ESP32 liest die Position direkt per
+Modbus RTU aus; Tablet-/Smartphone-GPS wird nicht mehr verwendet.
+
+Werkseinstellung des EWD108-GN05(485):
+
+- Modbus-Adresse: `1`
+- Baudrate: `9600`
+- Format: `8N1`
+- Versorgung: `5-24 V DC`
+
+Anschluss:
+
+| EWD108-GN05(485) | Waveshare |
+|------------------|-----------|
+| V+ | 5-24 V Versorgung |
+| GND / V- | GND |
+| RS485 A | RS485 A |
+| RS485 B | RS485 B |
+| Antenne | SMA-Antenne nach oben/aussen montieren |
+
+Firmware-Pins fuer den internen RS485-UART:
+
+| Funktion | GPIO |
+|----------|------|
+| RS485 RX | GPIO18 |
+| RS485 TX | GPIO17 |
+| RS485 DE/RE | GPIO21 |
+
+Aufgezeichnet werden:
 
 - GPS-Punkte fuer die Fahrspur
 - aktuelles Saatgut/Feldfrucht
@@ -55,10 +87,14 @@ Downloads im Webinterface:
 - Fahrtaufzeichnung als GeoJSON fuer Google Maps / My Maps
 - Hauptsignal-Log als CSV
 - Hauptsignal-Log als GeoJSON
+- Sensorlog als CSV und TXT mit Start, Ende, Dauer, Kanal und GPS-Bezug
 
-Bekannter Stand: Die GPS-Funktion ist noch nicht zu 100% stabil. Auf manchen
-Tablets/Browserversionen koennen einzelne Punkte fehlen oder die Uebertragung
-vom Browser zum ESP32 mit einem Fetch-/400-Fehler abbrechen. Die
+Bekannter Stand: Das EWD108-GN05(485) ist vorbereitet, muss aber am echten
+Modul noch gegen die tatsaechliche Registerbelegung getestet werden. Die
+Firmware scannt die Modbus-Holding-Register ab Register `0x0000` nach einem
+NMEA-RMC/GGA-Satz. Falls das Modul die NMEA-Zeichenkette an einem anderen
+Registerbereich ablegt, muessen `GNSS_SCAN_START_REGISTER` und
+`GNSS_SCAN_REGISTER_COUNT` oben in `src/main.cpp` angepasst werden. Die
 Maschinenueberwachung der Kanaele funktioniert unabhaengig davon weiter.
 
 ### Alarmton
@@ -195,7 +231,6 @@ build_flags =
 
 lib_deps =
   bblanchon/ArduinoJson@^7.4.2
-  esp32_idf5_https_server_compat
 ```
 
 ### Build-Flags
@@ -213,7 +248,7 @@ lib_deps =
 ### Status abrufen
 
 ```bash
-curl -k https://192.168.4.1/api/status
+curl http://192.168.4.1/api/status
 ```
 
 **Response:**
@@ -225,12 +260,12 @@ curl -k https://192.168.4.1/api/status
 }
 ```
 
-Hinweis: Bei aktiver HTTPS-Firmware lautet die Browser-/App-Adresse
-`https://192.168.4.1/api/status`. Fuer Tests mit `curl` muss das
-Self-Signed-Zertifikat ggf. mit `-k` akzeptiert werden:
+Hinweis: Seit die Fahrtaufzeichnung ueber das RS485-GNSS-Modul laeuft, wird
+kein Browser-GPS mehr benoetigt. Deshalb nutzt die Firmware wieder HTTP, weil
+das auf dem ESP32 stabiler laeuft als ein Self-Signed-HTTPS-Server:
 
 ```bash
-curl -k https://192.168.4.1/api/status
+curl http://192.168.4.1/api/status
 ```
 
 Weitere Endpunkte:
@@ -239,18 +274,19 @@ Weitere Endpunkte:
 |----------|--------------|
 | `/api/status` | aktueller Kanal-, Alarm-, Temperatur- und Logstatus |
 | `/api/crop` | Saatgut/Feldfrucht speichern |
-| `/api/gps-log` | GPS-Punkt vom Browser an den ESP32 uebertragen |
+| `/api/recording` | Fahrtaufzeichnung starten/stoppen |
 | `/api/gps-log.csv` | Fahrtaufzeichnung als CSV herunterladen |
 | `/api/gps-log.geojson` | Fahrtaufzeichnung als GeoJSON herunterladen |
 | `/api/main-events.csv` | Hauptsignal-Ereignisse als CSV herunterladen |
 | `/api/main-events.geojson` | Hauptsignal-Ereignisse als GeoJSON herunterladen |
+| `/api/sensor-events.csv` | abgeschlossene Sensor-Ausloesungen mit Dauer als CSV herunterladen |
+| `/api/sensor-events.txt` | abgeschlossene Sensor-Ausloesungen als lesbares Textfile herunterladen |
 
 ---
 
 ## 📦 Abhängigkeiten
 
 - **ArduinoJson** v7.4.2+ – JSON-Verarbeitung und REST-API
-- **esp32_idf5_https_server_compat** – HTTPS-Webserver fuer ESP32 Arduino
 
 ---
 
@@ -262,8 +298,6 @@ drillmaschinen-automation/
 │   ├── src/
 │   │   └── main.cpp              # Hauptprogramm Waveshare
 │   ├── include/
-│   │   ├── tls_server_cert_der.h # Self-Signed-Zertifikat
-│   │   └── tls_server_key_der.h  # TLS Private Key
 │   ├── lib/
 │   ├── platformio.ini
 │   ├── README.md
@@ -310,17 +344,19 @@ build_flags =
 
 ### WLAN funktioniert nicht
 
-- Access Point mit SSID `DRILL-8DI8DO` suchen
+- Access Point mit SSID `Drillmaschine-M01` suchen
 - Passwort: `12345678`
 - In der Konsole Fehler überprüfen
 
-### GPS/Fahrtaufzeichnung funktioniert nicht
+### GNSS/Fahrtaufzeichnung funktioniert nicht
 
-- Webseite unbedingt ueber `https://192.168.4.1/` oeffnen
-- Self-Signed-Zertifikat im Browser akzeptieren
-- Standortfreigabe im Browser erlauben
-- Auf dem Tablet/Smartphone pruefen, ob Standortdienste aktiv sind
-- Bekannter Stand: GPS ist noch nicht final stabil; Fetch-/400-Fehler und leere GeoJSON-Dateien koennen noch auftreten
+- EWD108-GN05(485) mit 5-24 V versorgen
+- RS485 A/B pruefen; bei keiner Antwort A/B testweise tauschen
+- Werkseinstellung pruefen: Adresse `1`, `9600 8N1`
+- Antenne nach oben/aussen montieren
+- PPS-LED am EWD108 pruefen: bei Fix blinkt sie laut Hersteller einmal pro Sekunde
+- Im Webinterface auf `GNSS Fix`, `RS485` und Fehlerzaehler achten
+- Bekannter Stand: Registerbereich muss am echten Modul noch verifiziert werden
 
 ### I2C-Fehler (TCA9554)
 

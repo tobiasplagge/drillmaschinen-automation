@@ -1,30 +1,30 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <ESPWebServerSecure.hpp>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <esp_heap_caps.h>
-#include "tls_server_cert_der.h"
-#include "tls_server_key_der.h"
 
 // ---------------------------------------------------------------------------
 // Waveshare ESP32-S3-POE-ETH-8DI-8DO configuration
 // ---------------------------------------------------------------------------
-static const char *AP_SSID = "DRILL-8DI8DO";
+static const char *AP_SSID = "Drillmaschine-M01";
 static const char *AP_PASSWORD = "12345678";
 
 static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
-static const char *FIRMWARE_VERSION = "1.2.0";
+static const char *FIRMWARE_VERSION = "1.3.1";
 
 static constexpr uint8_t CHANNEL_COUNT = 8;
 static constexpr uint8_t CHANNEL_NAME_LENGTH = 24;
 static constexpr uint8_t CROP_NAME_LENGTH = 24;
 static constexpr uint32_t MAIN_SIGNAL_HOLD_MS = 1500;
 static constexpr uint32_t GPS_LOG_INTERVAL_MS = 3000;
+static constexpr uint32_t GNSS_POLL_INTERVAL_MS = 1000;
 static constexpr uint16_t GPS_LOG_TARGET_CAPACITY = 5000;
 static constexpr uint16_t MAIN_EVENT_LOG_CAPACITY = 512;
+static constexpr uint16_t SENSOR_EVENT_LOG_CAPACITY = 512;
 
 // Waveshare wiki: DI1..DI8 are GPIO4..GPIO11.
 static constexpr uint8_t DI_PINS[CHANNEL_COUNT] = {4, 5, 6, 7, 8, 9, 10, 11};
@@ -37,6 +37,20 @@ static constexpr uint8_t TCA9554_INPUT_REG = 0x00;
 static constexpr uint8_t TCA9554_OUTPUT_REG = 0x01;
 static constexpr uint8_t TCA9554_CONFIG_REG = 0x03;
 
+// Ebyte EWD108-GN05(485) factory defaults according to the manufacturer:
+// Modbus RTU slave address 1, 9600 baud, 8N1. The module exposes GNSS data via
+// holding registers and can store an NMEA RMC ASCII sentence in registers. The
+// exact register offset can differ by firmware; keep the scan window here easy
+// to adjust after the first real-module test.
+static constexpr uint8_t GNSS_RS485_RX_PIN = 18;
+static constexpr uint8_t GNSS_RS485_TX_PIN = 17;
+static constexpr uint8_t GNSS_RS485_DE_RE_PIN = 21;
+static constexpr uint8_t GNSS_MODBUS_ADDRESS = 1;
+static constexpr uint32_t GNSS_MODBUS_BAUD = 9600;
+static constexpr uint16_t GNSS_SCAN_START_REGISTER = 0x0000;
+static constexpr uint16_t GNSS_SCAN_REGISTER_COUNT = 96;
+static constexpr uint8_t GNSS_MODBUS_FUNCTION_READ_HOLDING = 0x03;
+
 // On this board the digital outputs are controlled through the TCA9554. The
 // Waveshare examples initialize all outputs HIGH. Keep this configurable in
 // case your wiring expects the opposite logic.
@@ -44,8 +58,9 @@ static constexpr bool DO_ACTIVE_HIGH = true;
 static constexpr bool INPUT_ACTIVE_HIGH = false;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
 
-ESPWebServerSecure server(443);
+WebServer server(80);
 Preferences preferences;
+HardwareSerial gnssSerial(1);
 
 struct ChannelState {
   bool inputRaw = false;
@@ -68,8 +83,28 @@ struct GpsLogEntry {
   float accuracyM = -1;
   float speedMps = -1;
   float headingDeg = -1;
+  uint8_t satellites = 0;
   uint8_t liveMask = 0;
   uint8_t mainMask = 0;
+};
+
+struct GnssState {
+  bool fix = false;
+  bool seen = false;
+  double latitude = 0;
+  double longitude = 0;
+  float accuracyM = -1;
+  float speedMps = -1;
+  float headingDeg = -1;
+  uint8_t satellites = 0;
+  uint32_t lastPollMs = 0;
+  uint32_t lastFixMs = 0;
+  uint32_t pollCount = 0;
+  uint32_t okCount = 0;
+  uint32_t errorCount = 0;
+  char lastError[32] = "not_started";
+  char lastSentence[128] = "";
+  char rawPreview[96] = "";
 };
 
 struct MainSignalEvent {
@@ -82,6 +117,27 @@ struct MainSignalEvent {
   float accuracyM = -1;
   uint8_t liveMask = 0;
   uint8_t mainMask = 0;
+  char crop[CROP_NAME_LENGTH] = "";
+};
+
+struct SensorTriggerEvent {
+  uint32_t startUptimeMs = 0;
+  uint32_t endUptimeMs = 0;
+  uint32_t durationMs = 0;
+  uint8_t channel = 0;
+  bool startHasGps = false;
+  bool endHasGps = false;
+  double startLatitude = 0;
+  double startLongitude = 0;
+  double endLatitude = 0;
+  double endLongitude = 0;
+  float startAccuracyM = -1;
+  float endAccuracyM = -1;
+  uint8_t liveMaskAtStart = 0;
+  uint8_t mainMaskAtStart = 0;
+  uint8_t liveMaskAtEnd = 0;
+  uint8_t mainMaskAtEnd = 0;
+  char channelName[CHANNEL_NAME_LENGTH] = "";
   char crop[CROP_NAME_LENGTH] = "";
 };
 
@@ -108,10 +164,23 @@ bool lastGpsValid = false;
 double lastGpsLatitude = 0;
 double lastGpsLongitude = 0;
 float lastGpsAccuracyM = -1;
+bool recordingActive = false;
+GnssState gnss;
 MainSignalEvent mainEventLog[MAIN_EVENT_LOG_CAPACITY];
 uint16_t mainEventHead = 0;
 uint16_t mainEventCount = 0;
 uint32_t mainEventTotal = 0;
+SensorTriggerEvent sensorEventLog[SENSOR_EVENT_LOG_CAPACITY];
+uint16_t sensorEventHead = 0;
+uint16_t sensorEventCount = 0;
+uint32_t sensorEventTotal = 0;
+uint32_t sensorActiveStartMs[CHANNEL_COUNT] = {};
+bool sensorActiveStartHasGps[CHANNEL_COUNT] = {};
+double sensorActiveStartLatitude[CHANNEL_COUNT] = {};
+double sensorActiveStartLongitude[CHANNEL_COUNT] = {};
+float sensorActiveStartAccuracyM[CHANNEL_COUNT] = {};
+uint8_t sensorActiveStartLiveMask[CHANNEL_COUNT] = {};
+uint8_t sensorActiveStartMainMask[CHANNEL_COUNT] = {};
 
 uint8_t liveSignalMask() {
   uint8_t mask = 0;
@@ -257,7 +326,19 @@ const MainSignalEvent &mainEventAt(uint16_t orderedIndex) {
   return mainEventLog[(start + orderedIndex) % MAIN_EVENT_LOG_CAPACITY];
 }
 
-void appendGpsLog(double latitude, double longitude, float accuracyM, float speedMps, float headingDeg) {
+uint16_t sensorEventOldestIndex() {
+  if (sensorEventCount < SENSOR_EVENT_LOG_CAPACITY) {
+    return 0;
+  }
+  return sensorEventHead;
+}
+
+const SensorTriggerEvent &sensorEventAt(uint16_t orderedIndex) {
+  const uint16_t start = sensorEventOldestIndex();
+  return sensorEventLog[(start + orderedIndex) % SENSOR_EVENT_LOG_CAPACITY];
+}
+
+void appendGpsLog(double latitude, double longitude, float accuracyM, float speedMps, float headingDeg, uint8_t satellites) {
   if (gpsLog == nullptr || gpsLogCapacity == 0) {
     return;
   }
@@ -269,6 +350,7 @@ void appendGpsLog(double latitude, double longitude, float accuracyM, float spee
   entry.accuracyM = accuracyM;
   entry.speedMps = speedMps;
   entry.headingDeg = headingDeg;
+  entry.satellites = satellites;
   entry.liveMask = liveSignalMask();
   entry.mainMask = mainSignalMask();
 
@@ -284,15 +366,299 @@ void appendGpsLog(double latitude, double longitude, float accuracyM, float spee
   lastGpsAccuracyM = accuracyM;
 }
 
+uint16_t modbusCrc(const uint8_t *data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      if (crc & 0x0001) {
+        crc = (crc >> 1) ^ 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+void setGnssError(const char *message) {
+  strncpy(gnss.lastError, message, sizeof(gnss.lastError) - 1);
+  gnss.lastError[sizeof(gnss.lastError) - 1] = '\0';
+}
+
+void initGnssRs485() {
+  pinMode(GNSS_RS485_DE_RE_PIN, OUTPUT);
+  digitalWrite(GNSS_RS485_DE_RE_PIN, LOW);
+  gnssSerial.begin(GNSS_MODBUS_BAUD, SERIAL_8N1, GNSS_RS485_RX_PIN, GNSS_RS485_TX_PIN);
+  setGnssError("waiting");
+  Serial.printf("EWD108-GN05(485) RS485: addr=%u baud=%lu RX=%u TX=%u DE/RE=%u\n",
+                GNSS_MODBUS_ADDRESS,
+                static_cast<unsigned long>(GNSS_MODBUS_BAUD),
+                GNSS_RS485_RX_PIN,
+                GNSS_RS485_TX_PIN,
+                GNSS_RS485_DE_RE_PIN);
+}
+
+bool readModbusHoldingRegisters(uint16_t startRegister, uint16_t registerCount, uint8_t *payload, size_t payloadSize, uint8_t &byteCount) {
+  if (registerCount == 0 || registerCount > 120 || payloadSize < static_cast<size_t>(registerCount * 2)) {
+    setGnssError("bad_request");
+    return false;
+  }
+
+  while (gnssSerial.available()) {
+    gnssSerial.read();
+  }
+
+  uint8_t request[8];
+  request[0] = GNSS_MODBUS_ADDRESS;
+  request[1] = GNSS_MODBUS_FUNCTION_READ_HOLDING;
+  request[2] = highByte(startRegister);
+  request[3] = lowByte(startRegister);
+  request[4] = highByte(registerCount);
+  request[5] = lowByte(registerCount);
+  const uint16_t crc = modbusCrc(request, 6);
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+  digitalWrite(GNSS_RS485_DE_RE_PIN, HIGH);
+  delayMicroseconds(80);
+  gnssSerial.write(request, sizeof(request));
+  gnssSerial.flush();
+  delayMicroseconds(120);
+  digitalWrite(GNSS_RS485_DE_RE_PIN, LOW);
+
+  const size_t expectedLength = 5 + static_cast<size_t>(registerCount * 2);
+  uint8_t response[245];
+  size_t index = 0;
+  const uint32_t deadline = millis() + 350;
+  while (millis() < deadline && index < expectedLength) {
+    while (gnssSerial.available() && index < sizeof(response)) {
+      response[index++] = static_cast<uint8_t>(gnssSerial.read());
+    }
+    delay(1);
+  }
+
+  if (index < 5) {
+    setGnssError("timeout");
+    return false;
+  }
+
+  const uint16_t receivedCrc = static_cast<uint16_t>(response[index - 2]) | (static_cast<uint16_t>(response[index - 1]) << 8);
+  if (modbusCrc(response, index - 2) != receivedCrc) {
+    setGnssError("crc");
+    return false;
+  }
+
+  if (response[0] != GNSS_MODBUS_ADDRESS) {
+    setGnssError("wrong_addr");
+    return false;
+  }
+
+  if (response[1] & 0x80) {
+    setGnssError("exception");
+    return false;
+  }
+
+  if (response[1] != GNSS_MODBUS_FUNCTION_READ_HOLDING) {
+    setGnssError("wrong_func");
+    return false;
+  }
+
+  byteCount = response[2];
+  if (byteCount > payloadSize || index < static_cast<size_t>(byteCount + 5)) {
+    setGnssError("bad_len");
+    return false;
+  }
+
+  memcpy(payload, response + 3, byteCount);
+  setGnssError("ok");
+  return true;
+}
+
+double parseNmeaCoordinate(const String &value, const String &hemisphere) {
+  if (value.length() < 4) {
+    return 0;
+  }
+
+  const int dotIndex = value.indexOf('.');
+  const int degreeDigits = (dotIndex > 4) ? dotIndex - 2 : value.length() - 2;
+  const double degrees = value.substring(0, degreeDigits).toDouble();
+  const double minutes = value.substring(degreeDigits).toDouble();
+  double decimal = degrees + (minutes / 60.0);
+  if (hemisphere == "S" || hemisphere == "W") {
+    decimal = -decimal;
+  }
+  return decimal;
+}
+
+String nmeaField(const String &sentence, uint8_t wantedField) {
+  int start = 0;
+  uint8_t field = 0;
+  for (int i = 0; i <= sentence.length(); i++) {
+    if (i == sentence.length() || sentence[i] == ',' || sentence[i] == '*') {
+      if (field == wantedField) {
+        return sentence.substring(start, i);
+      }
+      field++;
+      start = i + 1;
+    }
+  }
+  return "";
+}
+
+bool applyNmeaSentence(const String &sentence) {
+  if (!sentence.startsWith("$") || sentence.length() < 10) {
+    return false;
+  }
+
+  const String type = nmeaField(sentence, 0);
+  if (type.endsWith("RMC")) {
+    const String valid = nmeaField(sentence, 2);
+    if (valid != "A") {
+      gnss.fix = false;
+      setGnssError("no_fix");
+      return false;
+    }
+
+    const double lat = parseNmeaCoordinate(nmeaField(sentence, 3), nmeaField(sentence, 4));
+    const double lon = parseNmeaCoordinate(nmeaField(sentence, 5), nmeaField(sentence, 6));
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 || (lat == 0 && lon == 0)) {
+      setGnssError("bad_nmea");
+      return false;
+    }
+
+    gnss.fix = true;
+    gnss.seen = true;
+    gnss.latitude = lat;
+    gnss.longitude = lon;
+    gnss.speedMps = nmeaField(sentence, 7).toFloat() * 0.514444f;
+    gnss.headingDeg = nmeaField(sentence, 8).length() > 0 ? nmeaField(sentence, 8).toFloat() : -1.0f;
+    gnss.lastFixMs = millis();
+    sentence.toCharArray(gnss.lastSentence, sizeof(gnss.lastSentence));
+    setGnssError("ok");
+    return true;
+  }
+
+  if (type.endsWith("GGA")) {
+    const int fixQuality = nmeaField(sentence, 6).toInt();
+    if (fixQuality <= 0) {
+      gnss.fix = false;
+      setGnssError("no_fix");
+      return false;
+    }
+
+    const double lat = parseNmeaCoordinate(nmeaField(sentence, 2), nmeaField(sentence, 3));
+    const double lon = parseNmeaCoordinate(nmeaField(sentence, 4), nmeaField(sentence, 5));
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 || (lat == 0 && lon == 0)) {
+      setGnssError("bad_nmea");
+      return false;
+    }
+
+    gnss.fix = true;
+    gnss.seen = true;
+    gnss.latitude = lat;
+    gnss.longitude = lon;
+    gnss.satellites = static_cast<uint8_t>(constrain(nmeaField(sentence, 7).toInt(), 0, 255));
+    gnss.accuracyM = nmeaField(sentence, 8).length() > 0 ? nmeaField(sentence, 8).toFloat() : -1.0f;
+    gnss.lastFixMs = millis();
+    sentence.toCharArray(gnss.lastSentence, sizeof(gnss.lastSentence));
+    setGnssError("ok");
+    return true;
+  }
+
+  return false;
+}
+
+bool scanAsciiForNmea(const char *ascii) {
+  String text = String(ascii);
+  int start = text.indexOf('$');
+  while (start >= 0) {
+    int end = text.indexOf('$', start + 1);
+    if (end < 0) {
+      end = text.length();
+    }
+    String sentence = text.substring(start, end);
+    sentence.trim();
+    if (applyNmeaSentence(sentence)) {
+      return true;
+    }
+    start = text.indexOf('$', start + 1);
+  }
+  return false;
+}
+
+bool scanPayloadForNmea(const uint8_t *payload, uint8_t byteCount) {
+  char ascii[GNSS_SCAN_REGISTER_COUNT * 2 + 1];
+  const uint8_t copyLength = min<uint8_t>(byteCount, sizeof(ascii) - 1);
+  for (uint8_t i = 0; i < copyLength; i++) {
+    const char c = static_cast<char>(payload[i]);
+    ascii[i] = (c >= 32 && c <= 126) ? c : ' ';
+  }
+  ascii[copyLength] = '\0';
+  strncpy(gnss.rawPreview, ascii, sizeof(gnss.rawPreview) - 1);
+  gnss.rawPreview[sizeof(gnss.rawPreview) - 1] = '\0';
+
+  if (scanAsciiForNmea(ascii)) {
+    return true;
+  }
+
+  // Some Modbus devices expose two ASCII bytes per register in swapped order.
+  // Try that layout too before declaring the scan window invalid.
+  char swapped[GNSS_SCAN_REGISTER_COUNT * 2 + 1];
+  for (uint8_t i = 0; i < copyLength; i += 2) {
+    if (i + 1 < copyLength) {
+      swapped[i] = ascii[i + 1];
+      swapped[i + 1] = ascii[i];
+    } else {
+      swapped[i] = ascii[i];
+    }
+  }
+  swapped[copyLength] = '\0';
+  if (scanAsciiForNmea(swapped)) {
+    strncpy(gnss.rawPreview, swapped, sizeof(gnss.rawPreview) - 1);
+    gnss.rawPreview[sizeof(gnss.rawPreview) - 1] = '\0';
+    return true;
+  }
+
+  setGnssError("no_nmea");
+  return false;
+}
+
+void pollGnss() {
+  const uint32_t now = millis();
+  if (now - gnss.lastPollMs < GNSS_POLL_INTERVAL_MS) {
+    return;
+  }
+  gnss.lastPollMs = now;
+  gnss.pollCount++;
+
+  uint8_t payload[GNSS_SCAN_REGISTER_COUNT * 2] = {};
+  uint8_t byteCount = 0;
+  if (!readModbusHoldingRegisters(GNSS_SCAN_START_REGISTER, GNSS_SCAN_REGISTER_COUNT, payload, sizeof(payload), byteCount)) {
+    gnss.errorCount++;
+    return;
+  }
+
+  if (scanPayloadForNmea(payload, byteCount)) {
+    gnss.okCount++;
+  } else {
+    gnss.errorCount++;
+  }
+
+  if (recordingActive && gnss.fix && now - lastGpsLogMs >= GPS_LOG_INTERVAL_MS) {
+    appendGpsLog(gnss.latitude, gnss.longitude, gnss.accuracyM, gnss.speedMps, gnss.headingDeg, gnss.satellites);
+  }
+}
+
 void appendMainSignalEvent(uint8_t channelIndex, bool detected) {
   MainSignalEvent &event = mainEventLog[mainEventHead];
   event.uptimeMs = millis();
   event.channel = channelIndex + 1;
   event.detected = detected;
-  event.hasGps = lastGpsValid;
-  event.latitude = lastGpsLatitude;
-  event.longitude = lastGpsLongitude;
-  event.accuracyM = lastGpsAccuracyM;
+  event.hasGps = gnss.fix;
+  event.latitude = gnss.fix ? gnss.latitude : lastGpsLatitude;
+  event.longitude = gnss.fix ? gnss.longitude : lastGpsLongitude;
+  event.accuracyM = gnss.fix ? gnss.accuracyM : lastGpsAccuracyM;
   event.liveMask = liveSignalMask();
   event.mainMask = mainSignalMask();
   strncpy(event.crop, cropName, CROP_NAME_LENGTH);
@@ -305,6 +671,58 @@ void appendMainSignalEvent(uint8_t channelIndex, bool detected) {
   mainEventTotal++;
 }
 
+void startSensorTriggerEvent(uint8_t channelIndex) {
+  if (channelIndex >= CHANNEL_COUNT) {
+    return;
+  }
+
+  sensorActiveStartMs[channelIndex] = millis();
+  sensorActiveStartHasGps[channelIndex] = gnss.fix;
+  sensorActiveStartLatitude[channelIndex] = gnss.fix ? gnss.latitude : lastGpsLatitude;
+  sensorActiveStartLongitude[channelIndex] = gnss.fix ? gnss.longitude : lastGpsLongitude;
+  sensorActiveStartAccuracyM[channelIndex] = gnss.fix ? gnss.accuracyM : lastGpsAccuracyM;
+  sensorActiveStartLiveMask[channelIndex] = liveSignalMask();
+  sensorActiveStartMainMask[channelIndex] = mainSignalMask();
+}
+
+void finishSensorTriggerEvent(uint8_t channelIndex) {
+  if (channelIndex >= CHANNEL_COUNT || sensorActiveStartMs[channelIndex] == 0) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  SensorTriggerEvent &event = sensorEventLog[sensorEventHead];
+  event.startUptimeMs = sensorActiveStartMs[channelIndex];
+  event.endUptimeMs = now;
+  event.durationMs = now - sensorActiveStartMs[channelIndex];
+  event.channel = channelIndex + 1;
+  event.startHasGps = sensorActiveStartHasGps[channelIndex];
+  event.endHasGps = gnss.fix;
+  event.startLatitude = sensorActiveStartLatitude[channelIndex];
+  event.startLongitude = sensorActiveStartLongitude[channelIndex];
+  event.endLatitude = gnss.fix ? gnss.latitude : lastGpsLatitude;
+  event.endLongitude = gnss.fix ? gnss.longitude : lastGpsLongitude;
+  event.startAccuracyM = sensorActiveStartAccuracyM[channelIndex];
+  event.endAccuracyM = gnss.fix ? gnss.accuracyM : lastGpsAccuracyM;
+  event.liveMaskAtStart = sensorActiveStartLiveMask[channelIndex];
+  event.mainMaskAtStart = sensorActiveStartMainMask[channelIndex];
+  event.liveMaskAtEnd = liveSignalMask();
+  event.mainMaskAtEnd = mainSignalMask();
+  strncpy(event.channelName, channelNames[channelIndex], CHANNEL_NAME_LENGTH);
+  event.channelName[CHANNEL_NAME_LENGTH - 1] = '\0';
+  strncpy(event.crop, cropName, CROP_NAME_LENGTH);
+  event.crop[CROP_NAME_LENGTH - 1] = '\0';
+
+  sensorEventHead = (sensorEventHead + 1) % SENSOR_EVENT_LOG_CAPACITY;
+  if (sensorEventCount < SENSOR_EVENT_LOG_CAPACITY) {
+    sensorEventCount++;
+  }
+  sensorEventTotal++;
+
+  sensorActiveStartMs[channelIndex] = 0;
+  sensorActiveStartHasGps[channelIndex] = false;
+}
+
 void clearGpsLog() {
   gpsLogHead = 0;
   gpsLogCount = 0;
@@ -314,6 +732,10 @@ void clearGpsLog() {
   mainEventHead = 0;
   mainEventCount = 0;
   mainEventTotal = 0;
+  sensorEventHead = 0;
+  sensorEventCount = 0;
+  sensorEventTotal = 0;
+  memset(sensorActiveStartMs, 0, sizeof(sensorActiveStartMs));
 }
 
 bool tcaWrite(uint8_t reg, uint8_t value) {
@@ -405,6 +827,11 @@ void readDigitalInputs() {
       channels[i].mainSignalChanges++;
       channels[i].lastMainSignalChangeMs = now;
       appendMainSignalEvent(i, mainSignal);
+      if (mainSignal) {
+        startSensorTriggerEvent(i);
+      } else {
+        finishSensorTriggerEvent(i);
+      }
     } else {
       channels[i].mainSignal = mainSignal;
     }
@@ -427,9 +854,10 @@ String statusJson() {
   doc["uptime_ms"] = millis();
   doc["wifi_ap_ssid"] = AP_SSID;
   doc["ip"] = WiFi.softAPIP().toString();
-  doc["web_url"] = "https://" + WiFi.softAPIP().toString() + "/";
+  doc["web_url"] = "http://" + WiFi.softAPIP().toString() + "/";
   doc["main_signal_hold_ms"] = MAIN_SIGNAL_HOLD_MS;
   doc["gps_log_interval_ms"] = GPS_LOG_INTERVAL_MS;
+  doc["recording_active"] = recordingActive;
   doc["gps_log_count"] = gpsLogCount;
   doc["gps_log_total"] = gpsLogTotal;
   doc["gps_log_capacity"] = gpsLogCapacity;
@@ -437,7 +865,31 @@ String statusJson() {
   doc["main_event_count"] = mainEventCount;
   doc["main_event_total"] = mainEventTotal;
   doc["main_event_capacity"] = MAIN_EVENT_LOG_CAPACITY;
+  doc["sensor_event_count"] = sensorEventCount;
+  doc["sensor_event_total"] = sensorEventTotal;
+  doc["sensor_event_capacity"] = SENSOR_EVENT_LOG_CAPACITY;
   doc["last_gps_valid"] = lastGpsValid;
+
+  JsonObject gnssJson = doc["gnss"].to<JsonObject>();
+  gnssJson["source"] = "EWD108-GN05(485)";
+  gnssJson["interface"] = "RS485 Modbus RTU";
+  gnssJson["modbus_address"] = GNSS_MODBUS_ADDRESS;
+  gnssJson["baud"] = GNSS_MODBUS_BAUD;
+  gnssJson["fix"] = gnss.fix;
+  gnssJson["seen"] = gnss.seen;
+  gnssJson["latitude"] = gnss.latitude;
+  gnssJson["longitude"] = gnss.longitude;
+  gnssJson["accuracy_m"] = gnss.accuracyM;
+  gnssJson["speed_mps"] = gnss.speedMps;
+  gnssJson["heading_deg"] = gnss.headingDeg;
+  gnssJson["satellites"] = gnss.satellites;
+  gnssJson["last_fix_age_ms"] = gnss.lastFixMs > 0 ? static_cast<int32_t>(millis() - gnss.lastFixMs) : -1;
+  gnssJson["poll_count"] = gnss.pollCount;
+  gnssJson["ok_count"] = gnss.okCount;
+  gnssJson["error_count"] = gnss.errorCount;
+  gnssJson["last_error"] = gnss.lastError;
+  gnssJson["last_sentence"] = gnss.lastSentence;
+  gnssJson["raw_preview"] = gnss.rawPreview;
 
   JsonArray array = doc["channels"].to<JsonArray>();
   const uint32_t now = millis();
@@ -540,15 +992,23 @@ String htmlPage() {
         <a class="link-button secondary" href="/api/gps-log.geojson">GeoJSON</a>
         <a class="link-button secondary" href="/api/main-events.csv">Hauptsignale CSV</a>
         <a class="link-button secondary" href="/api/main-events.geojson">Hauptsignale GeoJSON</a>
+        <a class="link-button secondary" href="/api/sensor-events.csv">Sensorlog CSV</a>
+        <a class="link-button secondary" href="/api/sensor-events.txt">Sensorlog TXT</a>
         <button id="gpsClear" class="danger" type="button">Log löschen</button>
       </div>
       <div class="gps-meta">
-        <div>Status: <strong id="gpsStatus">Aus</strong></div>
+        <div>Aufzeichnung: <strong id="gpsStatus">Aus</strong></div>
+        <div>GNSS Fix: <strong id="gnssFix">-</strong></div>
+        <div>GNSS Quelle: <strong id="gnssSource">-</strong></div>
         <div>Alarm: <strong id="alarmStatus">Aus</strong></div>
         <div>Punkte: <strong id="gpsCount">0</strong></div>
         <div>Hauptsignal-Log: <strong id="mainEventCount">0</strong></div>
+        <div>Sensorlog: <strong id="sensorEventCount">0</strong></div>
         <div>Letzter Punkt: <strong id="gpsLast">-</strong></div>
+        <div>Position: <strong id="gpsPosition">-</strong></div>
         <div>Genauigkeit: <strong id="gpsAccuracy">-</strong></div>
+        <div>Satelliten: <strong id="gpsSatellites">-</strong></div>
+        <div>RS485: <strong id="gnssRs485">-</strong></div>
       </div>
     </section>
     <section class="panel">
@@ -575,9 +1035,9 @@ String htmlPage() {
     <div id="error" class="error"></div>
   </main>
   <script>
-    let gpsWatchId = null;
-    let lastGpsPostMs = 0;
-    let requestBusy = false;
+    let actionBusy = false;
+    let refreshBusy = false;
+    let pageActive = true;
     let alarmEnabled = false;
     let audioContext = null;
     let alarmOscillator = null;
@@ -590,7 +1050,8 @@ String htmlPage() {
     let currentMainMask = 0;
     let lastSuccessfulContactMs = 0;
     let connectionTimer = null;
-    const gpsLogIntervalMs = 3000;
+    let renderingGrid = false;
+    const openDetailChannels = new Set();
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, c => ({
@@ -600,6 +1061,7 @@ String htmlPage() {
 
     function card(ch) {
       const name = escapeHtml(ch.name || ('Kanal ' + ch.channel));
+      const detailsOpen = openDetailChannels.has(String(ch.channel)) ? ' open' : '';
       const view = ch.main_signal
         ? { label: 'Erkannt', pill: 'main', dot: 'red' }
         : (ch.live_active
@@ -617,7 +1079,7 @@ String htmlPage() {
               <div class="dot ${view.dot}"></div>
             </div>
           </div>
-          <details>
+          <details${detailsOpen}>
             <summary>Details</summary>
             <dl>
               <dt>Live Signal</dt><dd><span class="pill ${ch.live_active ? 'on' : ''}">${ch.live_active ? 'JA' : 'NEIN'}</span></dd>
@@ -781,10 +1243,25 @@ String htmlPage() {
       }
     }
 
-    async function refresh() {
-      if (requestBusy || gpsWatchId !== null) return;
+    async function fetchWithTimeout(url, options = {}, timeoutMs = 2500) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const res = await fetch('/api/status', { cache: 'no-store' });
+        return await fetch(url, {
+          cache: 'no-store',
+          ...options,
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function refresh() {
+      if (refreshBusy || !pageActive) return;
+      refreshBusy = true;
+      try {
+        const res = await fetchWithTimeout('/api/status');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         lastSuccessfulContactMs = Date.now();
@@ -801,89 +1278,62 @@ String htmlPage() {
         }
         document.getElementById('gpsCount').textContent = `${data.gps_log_count || 0} / ${data.gps_log_capacity || 0}`;
         document.getElementById('mainEventCount').textContent = `${data.main_event_count || 0} / ${data.main_event_capacity || 0}`;
+        document.getElementById('sensorEventCount').textContent = `${data.sensor_event_count || 0} / ${data.sensor_event_capacity || 0}`;
         document.getElementById('gpsLast').textContent = data.last_gps_log_age_ms >= 0 ? data.last_gps_log_age_ms + ' ms' : '-';
+        document.getElementById('gpsStatus').textContent = data.recording_active ? 'Aktiv' : 'Aus';
+        document.getElementById('gpsStart').disabled = Boolean(data.recording_active);
+        document.getElementById('gpsStop').disabled = !data.recording_active;
+        const gnss = data.gnss || {};
+        document.getElementById('gnssFix').textContent = gnss.fix ? 'Ja' : (gnss.seen ? 'Nein' : 'Nicht empfangen');
+        document.getElementById('gnssSource').textContent = gnss.source || '-';
+        document.getElementById('gpsPosition').textContent = gnss.fix ? `${Number(gnss.latitude).toFixed(6)}, ${Number(gnss.longitude).toFixed(6)}` : '-';
+        document.getElementById('gpsAccuracy').textContent = Number.isFinite(gnss.accuracy_m) && gnss.accuracy_m >= 0 ? `${Number(gnss.accuracy_m).toFixed(1)} m` : '-';
+        document.getElementById('gpsSatellites').textContent = gnss.satellites ?? '-';
+        document.getElementById('gnssRs485').textContent = `${gnss.last_error || '-'} · OK ${gnss.ok_count || 0} / Fehler ${gnss.error_count || 0}`;
         checkMainSignalAlarms(data.channels || []);
-        document.getElementById('grid').innerHTML = data.channels.map(card).join('');
+        const grid = document.getElementById('grid');
+        renderingGrid = true;
+        grid.innerHTML = data.channels.map(card).join('');
+        setTimeout(() => { renderingGrid = false; }, 80);
         document.getElementById('error').textContent = '';
       } catch (err) {
         setConnectionState('offline', err.message || 'Keine API');
         updateLastContact();
         document.getElementById('error').textContent = 'Keine Verbindung zur API';
+      } finally {
+        refreshBusy = false;
       }
     }
 
-    async function postGps(position) {
-      const now = Date.now();
-      if (now - lastGpsPostMs < gpsLogIntervalMs) return;
-      lastGpsPostMs = now;
-
-      const coords = position.coords;
-      document.getElementById('gpsStatus').textContent = 'Aktiv';
-      document.getElementById('gpsAccuracy').textContent = Math.round(coords.accuracy || 0) + ' m';
-
+    async function setRecording(active) {
+      if (actionBusy) return;
+      actionBusy = true;
       try {
-        const url = new URL('/api/gps-log', window.location.href);
-        url.searchParams.set('latitude', coords.latitude);
-        url.searchParams.set('longitude', coords.longitude);
-        url.searchParams.set('accuracy_m', coords.accuracy ?? -1);
-        url.searchParams.set('speed_mps', coords.speed ?? -1);
-        url.searchParams.set('heading_deg', coords.heading ?? -1);
-
-        const res = await fetch(url.href, { method: 'GET', cache: 'no-store' });
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error('HTTP ' + res.status + (text ? ': ' + text.slice(0, 80) : ''));
-        }
-        const result = await res.json();
-        document.getElementById('gpsStatus').textContent = 'Aktiv - Punkt ' + result.count;
+        const res = await fetchWithTimeout('/api/recording', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ active })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await refresh();
       } catch (err) {
-        document.getElementById('gpsStatus').textContent = 'Senden fehlgeschlagen: ' + (err.message || err);
+        document.getElementById('gpsStatus').textContent = 'Schalten fehlgeschlagen';
+      } finally {
+        actionBusy = false;
       }
     }
 
     function startGps() {
-      if (!window.isSecureContext) {
-        document.getElementById('gpsStatus').textContent = 'Browser blockiert GPS: HTTPS nicht vertrauenswürdig';
-        return;
-      }
-      if (!navigator.geolocation) {
-        document.getElementById('gpsStatus').textContent = 'Nicht verfügbar';
-        return;
-      }
-      if (gpsWatchId !== null) return;
-
-      gpsWatchId = navigator.geolocation.watchPosition(postGps, err => {
-        const messages = {
-          1: 'GPS Berechtigung verweigert',
-          2: 'GPS Position nicht verfügbar',
-          3: 'GPS Zeitüberschreitung'
-        };
-        document.getElementById('gpsStatus').textContent = messages[err.code] || err.message || 'GPS Fehler';
-      }, {
-        enableHighAccuracy: true,
-        maximumAge: 1000,
-        timeout: 10000
-      });
-
-      document.getElementById('gpsStart').disabled = true;
-      document.getElementById('gpsStop').disabled = false;
-      document.getElementById('gpsStatus').textContent = 'Warte auf GPS';
+      setRecording(true);
     }
 
     function stopGps() {
-      if (gpsWatchId !== null) {
-        navigator.geolocation.clearWatch(gpsWatchId);
-        gpsWatchId = null;
-      }
-      lastGpsPostMs = 0;
-      document.getElementById('gpsStart').disabled = false;
-      document.getElementById('gpsStop').disabled = true;
-      document.getElementById('gpsStatus').textContent = 'Aus';
+      setRecording(false);
     }
 
     async function clearGpsLog() {
       try {
-        const res = await fetch('/api/gps-log/clear', { method: 'POST' });
+        const res = await fetchWithTimeout('/api/gps-log/clear', { method: 'POST' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         await refresh();
       } catch (err) {
@@ -894,7 +1344,7 @@ String htmlPage() {
     async function saveCrop() {
       const input = document.getElementById('cropInput');
       try {
-        const res = await fetch('/api/crop', {
+        const res = await fetchWithTimeout('/api/crop', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ crop_name: input.value })
@@ -912,9 +1362,36 @@ String htmlPage() {
     document.getElementById('cropSave').addEventListener('click', saveCrop);
     document.getElementById('alarmEnable').addEventListener('click', enableAlarm);
     document.getElementById('alarmAck').addEventListener('click', acknowledgeAlarm);
+    window.addEventListener('pagehide', () => {
+      pageActive = false;
+    });
+    document.getElementById('grid').addEventListener('click', event => {
+      if (event.target.tagName !== 'SUMMARY') return;
+      const details = event.target.closest('details');
+      const channel = event.target.closest('.card')?.dataset.channel;
+      if (!details || !channel) return;
+      setTimeout(() => {
+        if (details.open) {
+          openDetailChannels.add(channel);
+        } else {
+          openDetailChannels.delete(channel);
+        }
+      }, 0);
+    });
+    document.getElementById('grid').addEventListener('toggle', event => {
+      if (event.target.tagName !== 'DETAILS') return;
+      if (renderingGrid) return;
+      const channel = event.target.closest('.card')?.dataset.channel;
+      if (!channel) return;
+      if (event.target.open) {
+        openDetailChannels.add(channel);
+      } else {
+        openDetailChannels.delete(channel);
+      }
+    }, true);
     refresh();
     connectionTimer = setInterval(updateLastContact, 1000);
-    setInterval(refresh, 500);
+    setInterval(refresh, 1000);
   </script>
 </body>
 </html>
@@ -922,6 +1399,7 @@ String htmlPage() {
 }
 
 void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html; charset=utf-8", htmlPage());
 }
 
@@ -995,7 +1473,7 @@ void handleApiCrop() {
   server.send(200, "application/json", json);
 }
 
-void handleApiGpsLogPost() {
+void handleApiRecording() {
   const String body = server.arg("plain");
   if (body.length() == 0) {
     server.send(400, "application/json", "{\"error\":\"missing_body\"}");
@@ -1009,63 +1487,22 @@ void handleApiGpsLogPost() {
     return;
   }
 
-  const double latitude = doc["latitude"] | 999.0;
-  const double longitude = doc["longitude"] | 999.0;
-  const float accuracyM = doc["accuracy_m"] | -1.0f;
-  const float speedMps = doc["speed_mps"] | -1.0f;
-  const float headingDeg = doc["heading_deg"] | -1.0f;
-
-  if (latitude < -90.0 || latitude > 90.0 || longitude < -180.0 || longitude > 180.0) {
-    server.send(400, "application/json", "{\"error\":\"invalid_coordinates\"}");
-    return;
-  }
-
-  appendGpsLog(latitude, longitude, accuracyM, speedMps, headingDeg);
+  recordingActive = doc["active"] | false;
 
   JsonDocument response;
   response["ok"] = true;
-  response["count"] = gpsLogCount;
-  response["total"] = gpsLogTotal;
+  response["recording_active"] = recordingActive;
+  response["gnss_fix"] = gnss.fix;
 
   String json;
   serializeJson(response, json);
-  server.send(200, "application/json", json);
-}
-
-void handleApiGpsLogGet() {
-  const double latitude = server.arg("latitude").toDouble();
-  const double longitude = server.arg("longitude").toDouble();
-  const float accuracyM = server.arg("accuracy_m").length() > 0 ? server.arg("accuracy_m").toFloat() : -1.0f;
-  const float speedMps = server.arg("speed_mps").length() > 0 ? server.arg("speed_mps").toFloat() : -1.0f;
-  const float headingDeg = server.arg("heading_deg").length() > 0 ? server.arg("heading_deg").toFloat() : -1.0f;
-
-  if (!server.hasArg("latitude") || !server.hasArg("longitude")) {
-    server.send(400, "application/json", "{\"error\":\"missing_coordinates\"}");
-    return;
-  }
-
-  if (latitude < -90.0 || latitude > 90.0 || longitude < -180.0 || longitude > 180.0) {
-    server.send(400, "application/json", "{\"error\":\"invalid_coordinates\"}");
-    return;
-  }
-
-  appendGpsLog(latitude, longitude, accuracyM, speedMps, headingDeg);
-
-  JsonDocument response;
-  response["ok"] = true;
-  response["count"] = gpsLogCount;
-  response["total"] = gpsLogTotal;
-
-  String json;
-  serializeJson(response, json);
-  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
 void handleApiGpsLogCsv() {
   String csv;
   csv.reserve(96 + gpsLogCount * 96);
-  csv += "index,uptime_ms,crop_name,latitude,longitude,accuracy_m,speed_mps,heading_deg,live_mask,main_mask\n";
+  csv += "index,uptime_ms,crop_name,latitude,longitude,accuracy_m,speed_mps,heading_deg,satellites,source,live_mask,main_mask\n";
 
   for (uint16_t i = 0; i < gpsLogCount; i++) {
     const GpsLogEntry &entry = gpsLogAt(i);
@@ -1085,6 +1522,8 @@ void handleApiGpsLogCsv() {
     csv += ",";
     csv += String(entry.headingDeg, 1);
     csv += ",";
+    csv += static_cast<unsigned int>(entry.satellites);
+    csv += ",EWD108-GN05(485),";
     csv += static_cast<unsigned int>(entry.liveMask);
     csv += ",";
     csv += static_cast<unsigned int>(entry.mainMask);
@@ -1122,6 +1561,9 @@ void handleApiGpsLogGeoJson() {
     json += String(entry.speedMps, 2);
     json += ",\"heading_deg\":";
     json += String(entry.headingDeg, 1);
+    json += ",\"satellites\":";
+    json += static_cast<unsigned int>(entry.satellites);
+    json += ",\"source\":\"EWD108-GN05(485)\"";
     json += ",\"live_mask\":";
     json += static_cast<unsigned int>(entry.liveMask);
     json += ",\"main_mask\":";
@@ -1217,6 +1659,115 @@ void handleApiMainEventsGeoJson() {
   server.send(200, "application/geo+json; charset=utf-8", json);
 }
 
+void handleApiSensorEventsCsv() {
+  String csv;
+  csv.reserve(128 + sensorEventCount * 170);
+  csv += "index,start_uptime_ms,end_uptime_ms,duration_ms,duration_s,channel,channel_name,crop_name,start_latitude,start_longitude,start_accuracy_m,end_latitude,end_longitude,end_accuracy_m,live_mask_start,main_mask_start,live_mask_end,main_mask_end\n";
+
+  for (uint16_t i = 0; i < sensorEventCount; i++) {
+    const SensorTriggerEvent &event = sensorEventAt(i);
+    csv += i;
+    csv += ",";
+    csv += event.startUptimeMs;
+    csv += ",";
+    csv += event.endUptimeMs;
+    csv += ",";
+    csv += event.durationMs;
+    csv += ",";
+    csv += String(event.durationMs / 1000.0f, 2);
+    csv += ",";
+    csv += event.channel;
+    csv += ",";
+    csv += event.channelName;
+    csv += ",";
+    csv += event.crop;
+    csv += ",";
+    if (event.startHasGps) {
+      csv += String(event.startLatitude, 7);
+      csv += ",";
+      csv += String(event.startLongitude, 7);
+      csv += ",";
+      csv += String(event.startAccuracyM, 1);
+    } else {
+      csv += ",,";
+    }
+    csv += ",";
+    if (event.endHasGps) {
+      csv += String(event.endLatitude, 7);
+      csv += ",";
+      csv += String(event.endLongitude, 7);
+      csv += ",";
+      csv += String(event.endAccuracyM, 1);
+    } else {
+      csv += ",,";
+    }
+    csv += ",";
+    csv += static_cast<unsigned int>(event.liveMaskAtStart);
+    csv += ",";
+    csv += static_cast<unsigned int>(event.mainMaskAtStart);
+    csv += ",";
+    csv += static_cast<unsigned int>(event.liveMaskAtEnd);
+    csv += ",";
+    csv += static_cast<unsigned int>(event.mainMaskAtEnd);
+    csv += "\n";
+  }
+
+  server.sendHeader("Content-Disposition", "attachment; filename=sensorlog.csv");
+  server.send(200, "text/csv; charset=utf-8", csv);
+}
+
+void handleApiSensorEventsTxt() {
+  String text;
+  text.reserve(128 + sensorEventCount * 180);
+  text += "Sensorlog Drillmaschinenueberwachung\n";
+  text += "SSID: ";
+  text += AP_SSID;
+  text += "\n";
+  text += "Saat: ";
+  text += cropName;
+  text += "\n\n";
+
+  for (uint16_t i = 0; i < sensorEventCount; i++) {
+    const SensorTriggerEvent &event = sensorEventAt(i);
+    text += "#";
+    text += i + 1;
+    text += " | Kanal ";
+    text += event.channel;
+    text += " (";
+    text += event.channelName;
+    text += ") | Dauer ";
+    text += String(event.durationMs / 1000.0f, 2);
+    text += " s | Start ";
+    text += event.startUptimeMs;
+    text += " ms | Ende ";
+    text += event.endUptimeMs;
+    text += " ms | Saat ";
+    text += event.crop;
+    if (event.startHasGps) {
+      text += " | GPS Start ";
+      text += String(event.startLatitude, 7);
+      text += ",";
+      text += String(event.startLongitude, 7);
+      text += " +/-";
+      text += String(event.startAccuracyM, 1);
+      text += " m";
+    }
+    if (event.endHasGps) {
+      text += " | GPS Ende ";
+      text += String(event.endLatitude, 7);
+      text += ",";
+      text += String(event.endLongitude, 7);
+      text += " +/-";
+      text += String(event.endAccuracyM, 1);
+      text += " m";
+    }
+    text += "\n";
+  }
+
+  server.sendHeader("Content-Disposition", "attachment; filename=sensorlog.txt");
+  server.send(200, "text/plain; charset=utf-8", text);
+}
+
 void handleApiGpsLogClear() {
   clearGpsLog();
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1273,35 +1824,36 @@ void setup() {
   loadChannelNames();
   loadCropName();
   initGpsLog();
+  initGnssRs485();
   initDigitalInputs();
   startWiFiAccessPoint();
   initDigitalOutputs();
-
-  server.setServerKeyAndCert(TLS_SERVER_KEY_DER, TLS_SERVER_KEY_DER_len, TLS_SERVER_CERT_DER, TLS_SERVER_CERT_DER_len);
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleApiStatus);
   server.on("/api/channel-name", HTTP_POST, handleApiChannelName);
   server.on("/api/crop", HTTP_POST, handleApiCrop);
-  server.on("/api/gps-log", HTTP_GET, handleApiGpsLogGet);
-  server.on("/api/gps-log", HTTP_POST, handleApiGpsLogPost);
+  server.on("/api/recording", HTTP_POST, handleApiRecording);
   server.on("/api/gps-log.csv", HTTP_GET, handleApiGpsLogCsv);
   server.on("/api/gps-log.geojson", HTTP_GET, handleApiGpsLogGeoJson);
   server.on("/api/main-events.csv", HTTP_GET, handleApiMainEventsCsv);
   server.on("/api/main-events.geojson", HTTP_GET, handleApiMainEventsGeoJson);
+  server.on("/api/sensor-events.csv", HTTP_GET, handleApiSensorEventsCsv);
+  server.on("/api/sensor-events.txt", HTTP_GET, handleApiSensorEventsTxt);
   server.on("/api/gps-log/clear", HTTP_POST, handleApiGpsLogClear);
   server.onNotFound([]() {
     server.send(404, "application/json", "{\"error\":\"not_found\"}");
   });
   server.begin();
 
-  Serial.println("HTTPS Server gestartet");
-  Serial.println("Webseite: https://" + WiFi.softAPIP().toString() + "/");
-  Serial.println("API:      https://" + WiFi.softAPIP().toString() + "/api/status");
+  Serial.println("HTTP Server gestartet");
+  Serial.println("Webseite: http://" + WiFi.softAPIP().toString() + "/");
+  Serial.println("API:      http://" + WiFi.softAPIP().toString() + "/api/status");
 }
 
 void loop() {
   readDigitalInputs();
+  pollGnss();
   server.handleClient();
 
   if (millis() - lastDebugMs > 1000) {
@@ -1318,6 +1870,12 @@ void loop() {
     for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
       Serial.print(channels[i].output ? " 1" : " 0");
     }
+    Serial.print(" GNSS:");
+    Serial.print(gnss.fix ? " FIX" : " NOFIX");
+    Serial.print(" REC:");
+    Serial.print(recordingActive ? " 1" : " 0");
+    Serial.print(" ERR:");
+    Serial.print(gnss.lastError);
     Serial.println();
   }
 }
