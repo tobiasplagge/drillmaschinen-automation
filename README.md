@@ -85,9 +85,29 @@ Downloads im Webinterface:
 
 - Fahrtaufzeichnung als CSV
 - Fahrtaufzeichnung als GeoJSON fuer Google Maps / My Maps
+- kombinierte Route und Sensorereignisse als GeoJSON
 - Hauptsignal-Log als CSV
 - Hauptsignal-Log als GeoJSON
 - Sensorlog als CSV und TXT mit Start, Ende, Dauer, Kanal und GPS-Bezug
+
+### Fahrtarchiv und Bedienablauf
+
+Sobald der GNSS-Fix mindestens drei Sekunden stabil ist, startet die
+Fahrtaufzeichnung automatisch. Eine manuell gestoppte Fahrt startet erst nach
+einem erneuten GNSS-Fix wieder automatisch. Der Fahrer kann die Aufzeichnung
+weiterhin manuell starten und stoppen.
+
+Jede Fahrt erhaelt eine eindeutige Fahrt-ID, zum Beispiel
+`M01-B000012-F0007`. Neben der Saat kann ein Feldname eingegeben werden. GPS-
+und Sensorlogs werden zusaetzlich zum Live-Ringpuffer als Fahrtdateien in
+LittleFS gespeichert. GPS-Schreibzugriffe werden gepuffert und spaetestens alle
+30 Sekunden geschrieben. Bei einem unerwarteten Neustart koennen dadurch nur
+die letzten Sekunden fehlen.
+
+Im Webinterface liegen Downloads, Archiv und das Loeschen des Live-Logs unter
+`Dateien und Wartung`. Archivierte Fahrtdateien bleiben beim Loeschen des
+Live-Logs erhalten. Waehrend einer aktiven Aufzeichnung ist das Loeschen
+gesperrt.
 
 ### Live-Fahrt und Karten-Reiter
 
@@ -104,6 +124,10 @@ eine lokale Rasteransicht mit Nordpfeil und Massstab als Fallback verfuegbar.
 Die Sensorueberwachung und Datenaufzeichnung funktionieren unabhaengig von der
 Online-Karte weiter.
 
+Mit `Position folgen` kann das automatische Zentrieren der Karte ausgeschaltet
+werden. Das geschieht ebenfalls automatisch, sobald die Karte manuell
+verschoben oder gezoomt wird.
+
 Fuer die Live-Ansicht liefert `/api/track` maximal die letzten 1.200 Spurpunkte
 und 128 Stoerungsmarker. Die vollstaendigen Logs bleiben separat als CSV und
 GeoJSON verfuegbar.
@@ -115,6 +139,39 @@ NMEA-RMC/GGA-Satz. Falls das Modul die NMEA-Zeichenkette an einem anderen
 Registerbereich ablegt, muessen `GNSS_SCAN_START_REGISTER` und
 `GNSS_SCAN_REGISTER_COUNT` oben in `src/main.cpp` angepasst werden. Die
 Maschinenueberwachung der Kanaele funktioniert unabhaengig davon weiter.
+
+Die Oberflaeche unterscheidet drei GNSS-Fehlerbilder:
+
+- `no_rs485`: das RS485-GNSS-Modul antwortet nicht
+- `no_fix`: das Modul antwortet, hat aber keinen Satelliten-Fix
+- `invalid_data`: Daten kommen an, lassen sich aber nicht auswerten
+
+### Mehrere Module
+
+Die Oberflaeche ist fuer `M01` bis `M04` vorbereitet. In der aktuellen Version
+ist `M01` das lokale Waveshare-Modul; `M02` bis `M04` werden als vorbereitet
+angezeigt. Fuer eine gemeinsame Live-Ansicht aller vier Module wird spaeter ein
+zentrales Gateway oder eine Tablet-App benoetigt. Vier getrennte WLAN-Hotspots
+koennen nicht gleichzeitig direkt im Browser zusammengefuehrt werden.
+
+### Schutzbeschaltung an der Landmaschine
+
+Fuer einen produktiven Einbau an der Maschine sollte die Versorgung nicht
+ungeschuetzt direkt aus dem Bordnetz kommen. Empfohlen sind:
+
+- eigene Sicherung nahe am Abgriff
+- Verpolschutz
+- TVS-Diode gegen Spannungsspitzen
+- geeigneter Automotive-DC/DC-Wandler fuer die Versorgung
+- gemeinsamer, sauber gefuehrter Massepunkt
+- geschirmte oder verdrillte Leitungen fuer RS485
+- 120-Ohm-Abschluss am RS485-Bus nur an den beiden Busenden
+- Zugentlastung und vibrationsfeste Steckverbinder
+
+Die Firmware protokolliert Boot-Zaehlung und Reset-Grund in
+`/system-events.log`. Das Protokoll ist unter `Dateien und Wartung` als
+`Neustart-Log` downloadbar. Ein Task-Watchdog startet den Controller neu, falls
+die Hauptschleife dauerhaft blockiert.
 
 ### Alarmton
 

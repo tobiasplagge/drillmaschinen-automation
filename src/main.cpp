@@ -1,10 +1,13 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 
 // ---------------------------------------------------------------------------
 // Waveshare ESP32-S3-POE-ETH-8DI-8DO configuration
@@ -14,14 +17,21 @@ static const char *AP_PASSWORD = "12345678";
 
 static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
-static const char *FIRMWARE_VERSION = "1.4.0";
+static const char *FIRMWARE_VERSION = "1.5.0";
+static const char *MODULE_ID = "M01";
 
 static constexpr uint8_t CHANNEL_COUNT = 8;
 static constexpr uint8_t CHANNEL_NAME_LENGTH = 24;
 static constexpr uint8_t CROP_NAME_LENGTH = 24;
+static constexpr uint8_t FIELD_NAME_LENGTH = 32;
+static constexpr uint8_t TRIP_ID_LENGTH = 48;
 static constexpr uint32_t MAIN_SIGNAL_HOLD_MS = 1500;
 static constexpr uint32_t GPS_LOG_INTERVAL_MS = 3000;
 static constexpr uint32_t GNSS_POLL_INTERVAL_MS = 1000;
+static constexpr uint32_t GNSS_STALE_MS = 10000;
+static constexpr uint32_t GNSS_AUTO_START_HOLD_MS = 3000;
+static constexpr uint32_t FILE_FLUSH_INTERVAL_MS = 30000;
+static constexpr uint8_t WATCHDOG_TIMEOUT_SECONDS = 8;
 static constexpr uint16_t GPS_LOG_TARGET_CAPACITY = 5000;
 static constexpr uint16_t MAIN_EVENT_LOG_CAPACITY = 512;
 static constexpr uint16_t SENSOR_EVENT_LOG_CAPACITY = 512;
@@ -104,6 +114,8 @@ struct GnssState {
   uint32_t pollCount = 0;
   uint32_t okCount = 0;
   uint32_t errorCount = 0;
+  uint32_t lastResponseMs = 0;
+  uint32_t fixAvailableSinceMs = 0;
   char lastError[32] = "not_started";
   char lastSentence[128] = "";
   char rawPreview[96] = "";
@@ -154,8 +166,21 @@ char channelNames[CHANNEL_COUNT][CHANNEL_NAME_LENGTH] = {
     "Kanal 8",
 };
 char cropName[CROP_NAME_LENGTH] = "Weizen";
+char fieldName[FIELD_NAME_LENGTH] = "Feld";
+char tripId[TRIP_ID_LENGTH] = "-";
+char tripGpsPath[64] = "";
+char tripSensorPath[64] = "";
+char tripMetaPath[64] = "";
 uint8_t tcaOutputState = 0x00;
 uint32_t lastDebugMs = 0;
+uint32_t bootCounter = 0;
+uint32_t tripCounter = 0;
+const char *resetReason = "unknown";
+bool filesystemReady = false;
+bool autoStartEnabled = true;
+bool autoStartArmed = true;
+String persistentGpsBuffer;
+uint32_t lastFileFlushMs = 0;
 GpsLogEntry *gpsLog = nullptr;
 uint16_t gpsLogCapacity = 0;
 uint16_t gpsLogHead = 0;
@@ -183,6 +208,9 @@ double sensorActiveStartLongitude[CHANNEL_COUNT] = {};
 float sensorActiveStartAccuracyM[CHANNEL_COUNT] = {};
 uint8_t sensorActiveStartLiveMask[CHANNEL_COUNT] = {};
 uint8_t sensorActiveStartMainMask[CHANNEL_COUNT] = {};
+
+void startRecording(const char *source);
+void stopRecording(const char *source);
 
 uint8_t liveSignalMask() {
   uint8_t mask = 0;
@@ -234,6 +262,65 @@ void sanitizeCropName(char *name) {
   cleaned.toCharArray(name, CROP_NAME_LENGTH);
 }
 
+void sanitizeFieldName(char *name) {
+  name[FIELD_NAME_LENGTH - 1] = '\0';
+  String cleaned = String(name);
+  cleaned.trim();
+  if (cleaned.length() == 0) {
+    cleaned = "Feld";
+  }
+  cleaned.replace("\"", "'");
+  cleaned.replace("<", "");
+  cleaned.replace(">", "");
+  cleaned.replace(",", " ");
+  cleaned.toCharArray(name, FIELD_NAME_LENGTH);
+}
+
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT: return "task_watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    default: return "unknown";
+  }
+}
+
+bool appendFile(const char *path, const String &content) {
+  if (!filesystemReady || content.length() == 0) {
+    return false;
+  }
+  File file = LittleFS.open(path, FILE_APPEND);
+  if (!file) {
+    Serial.printf("WARNUNG: Datei %s nicht beschreibbar\n", path);
+    return false;
+  }
+  const bool ok = file.print(content) == content.length();
+  file.close();
+  return ok;
+}
+
+void appendSystemEvent(const String &message) {
+  String line = String(millis()) + "," + MODULE_ID + "," + message + "\n";
+  appendFile("/system-events.log", line);
+}
+
+void initFilesystem() {
+  filesystemReady = LittleFS.begin(true);
+  Serial.printf("LittleFS: %s\n", filesystemReady ? "bereit" : "nicht verfügbar");
+  if (!filesystemReady) {
+    return;
+  }
+  if (!LittleFS.exists("/system-events.log")) {
+    appendFile("/system-events.log", "uptime_ms,module,event\n");
+  }
+}
+
 void setDefaultChannelName(uint8_t channelIndex) {
   snprintf(channelNames[channelIndex], CHANNEL_NAME_LENGTH, "Kanal %u", channelIndex + 1);
 }
@@ -265,6 +352,14 @@ void loadCropName() {
   }
 }
 
+void loadFieldName() {
+  String stored = preferences.getString("field", "");
+  if (stored.length() > 0) {
+    stored.toCharArray(fieldName, FIELD_NAME_LENGTH);
+  }
+  sanitizeFieldName(fieldName);
+}
+
 bool saveChannelName(uint8_t channelIndex, const String &name) {
   if (channelIndex >= CHANNEL_COUNT) {
     return false;
@@ -283,6 +378,12 @@ void saveCropName(const String &name) {
   name.toCharArray(cropName, CROP_NAME_LENGTH);
   sanitizeCropName(cropName);
   preferences.putString("crop", cropName);
+}
+
+void saveFieldName(const String &name) {
+  name.toCharArray(fieldName, FIELD_NAME_LENGTH);
+  sanitizeFieldName(fieldName);
+  preferences.putString("field", fieldName);
 }
 
 void initGpsLog() {
@@ -340,6 +441,16 @@ const SensorTriggerEvent &sensorEventAt(uint16_t orderedIndex) {
   return sensorEventLog[(start + orderedIndex) % SENSOR_EVENT_LOG_CAPACITY];
 }
 
+void flushPersistentGpsBuffer() {
+  if (persistentGpsBuffer.length() == 0 || tripGpsPath[0] == '\0') {
+    return;
+  }
+  if (appendFile(tripGpsPath, persistentGpsBuffer)) {
+    persistentGpsBuffer = "";
+    lastFileFlushMs = millis();
+  }
+}
+
 void appendGpsLog(double latitude, double longitude, float accuracyM, float speedMps, float headingDeg, uint8_t satellites) {
   if (gpsLog == nullptr || gpsLogCapacity == 0) {
     return;
@@ -366,6 +477,17 @@ void appendGpsLog(double latitude, double longitude, float accuracyM, float spee
   lastGpsLatitude = latitude;
   lastGpsLongitude = longitude;
   lastGpsAccuracyM = accuracyM;
+
+  if (recordingActive && tripGpsPath[0] != '\0') {
+    persistentGpsBuffer += String(entry.uptimeMs) + "," + cropName + "," + fieldName + "," +
+                           String(entry.latitude, 7) + "," + String(entry.longitude, 7) + "," +
+                           String(entry.accuracyM, 1) + "," + String(entry.speedMps, 2) + "," +
+                           String(entry.headingDeg, 1) + "," + String(entry.satellites) + "," +
+                           String(entry.liveMask) + "," + String(entry.mainMask) + "\n";
+    if (persistentGpsBuffer.length() > 2048 || millis() - lastFileFlushMs >= FILE_FLUSH_INTERVAL_MS) {
+      flushPersistentGpsBuffer();
+    }
+  }
 }
 
 uint16_t modbusCrc(const uint8_t *data, size_t length) {
@@ -536,6 +658,9 @@ bool applyNmeaSentence(const String &sentence) {
     gnss.speedMps = nmeaField(sentence, 7).toFloat() * 0.514444f;
     gnss.headingDeg = nmeaField(sentence, 8).length() > 0 ? nmeaField(sentence, 8).toFloat() : -1.0f;
     gnss.lastFixMs = millis();
+    if (gnss.fixAvailableSinceMs == 0) {
+      gnss.fixAvailableSinceMs = gnss.lastFixMs;
+    }
     sentence.toCharArray(gnss.lastSentence, sizeof(gnss.lastSentence));
     setGnssError("ok");
     return true;
@@ -563,6 +688,9 @@ bool applyNmeaSentence(const String &sentence) {
     gnss.satellites = static_cast<uint8_t>(constrain(nmeaField(sentence, 7).toInt(), 0, 255));
     gnss.accuracyM = nmeaField(sentence, 8).length() > 0 ? nmeaField(sentence, 8).toFloat() : -1.0f;
     gnss.lastFixMs = millis();
+    if (gnss.fixAvailableSinceMs == 0) {
+      gnss.fixAvailableSinceMs = gnss.lastFixMs;
+    }
     sentence.toCharArray(gnss.lastSentence, sizeof(gnss.lastSentence));
     setGnssError("ok");
     return true;
@@ -640,6 +768,7 @@ void pollGnss() {
     gnss.errorCount++;
     return;
   }
+  gnss.lastResponseMs = now;
 
   if (scanPayloadForNmea(payload, byteCount)) {
     gnss.okCount++;
@@ -649,6 +778,34 @@ void pollGnss() {
 
   if (recordingActive && gnss.fix && now - lastGpsLogMs >= GPS_LOG_INTERVAL_MS) {
     appendGpsLog(gnss.latitude, gnss.longitude, gnss.accuracyM, gnss.speedMps, gnss.headingDeg, gnss.satellites);
+  }
+}
+
+const char *gnssHealth() {
+  const uint32_t now = millis();
+  if (gnss.lastResponseMs == 0 || now - gnss.lastResponseMs > GNSS_STALE_MS) {
+    return "no_rs485";
+  }
+  if (strcmp(gnss.lastError, "no_nmea") == 0 || strcmp(gnss.lastError, "bad_nmea") == 0 ||
+      strcmp(gnss.lastError, "crc") == 0) {
+    return "invalid_data";
+  }
+  if (!gnss.fix || gnss.lastFixMs == 0 || now - gnss.lastFixMs > GNSS_STALE_MS) {
+    return "no_fix";
+  }
+  return "ok";
+}
+
+void updateGnssHealthAndRecording() {
+  const uint32_t now = millis();
+  if (gnss.lastFixMs == 0 || now - gnss.lastFixMs > GNSS_STALE_MS) {
+    gnss.fix = false;
+    gnss.fixAvailableSinceMs = 0;
+    autoStartArmed = true;
+  }
+  if (autoStartEnabled && autoStartArmed && !recordingActive && gnss.fix &&
+      gnss.fixAvailableSinceMs > 0 && now - gnss.fixAvailableSinceMs >= GNSS_AUTO_START_HOLD_MS) {
+    startRecording("gnss_auto");
   }
 }
 
@@ -721,6 +878,25 @@ void finishSensorTriggerEvent(uint8_t channelIndex) {
   }
   sensorEventTotal++;
 
+  if (recordingActive && tripSensorPath[0] != '\0') {
+    String line = String(event.startUptimeMs) + "," + String(event.endUptimeMs) + "," +
+                  String(event.durationMs) + "," + String(event.channel) + "," +
+                  event.channelName + "," + event.crop + "," + fieldName + ",";
+    if (event.startHasGps) {
+      line += String(event.startLatitude, 7) + "," + String(event.startLongitude, 7);
+    } else {
+      line += ",";
+    }
+    line += ",";
+    if (event.endHasGps) {
+      line += String(event.endLatitude, 7) + "," + String(event.endLongitude, 7);
+    } else {
+      line += ",";
+    }
+    line += "\n";
+    appendFile(tripSensorPath, line);
+  }
+
   sensorActiveStartMs[channelIndex] = 0;
   sensorActiveStartHasGps[channelIndex] = false;
 }
@@ -738,6 +914,65 @@ void clearGpsLog() {
   sensorEventCount = 0;
   sensorEventTotal = 0;
   memset(sensorActiveStartMs, 0, sizeof(sensorActiveStartMs));
+}
+
+void createTripFiles() {
+  snprintf(tripGpsPath, sizeof(tripGpsPath), "/trip-%s-gps.csv", tripId);
+  snprintf(tripSensorPath, sizeof(tripSensorPath), "/trip-%s-sensor.csv", tripId);
+  snprintf(tripMetaPath, sizeof(tripMetaPath), "/trip-%s-meta.txt", tripId);
+  if (!filesystemReady) {
+    return;
+  }
+  LittleFS.remove(tripGpsPath);
+  LittleFS.remove(tripSensorPath);
+  LittleFS.remove(tripMetaPath);
+  appendFile(tripGpsPath, "uptime_ms,crop_name,field_name,latitude,longitude,accuracy_m,speed_mps,heading_deg,satellites,live_mask,main_mask\n");
+  appendFile(tripSensorPath, "start_uptime_ms,end_uptime_ms,duration_ms,channel,channel_name,crop_name,field_name,start_latitude,start_longitude,end_latitude,end_longitude\n");
+  String meta = "trip_id=" + String(tripId) + "\nmodule=" + MODULE_ID + "\nfield=" + fieldName +
+                "\ncrop=" + cropName + "\nstart_uptime_ms=" + String(millis()) + "\nstatus=active\n";
+  appendFile(tripMetaPath, meta);
+}
+
+void startRecording(const char *source) {
+  if (recordingActive) {
+    return;
+  }
+  clearGpsLog();
+  tripCounter++;
+  preferences.putUInt("trip_counter", tripCounter);
+  snprintf(tripId, sizeof(tripId), "%s-B%06lu-F%04lu", MODULE_ID,
+           static_cast<unsigned long>(bootCounter), static_cast<unsigned long>(tripCounter));
+  createTripFiles();
+  persistentGpsBuffer = "";
+  lastFileFlushMs = millis();
+  recordingActive = true;
+  autoStartArmed = false;
+  appendSystemEvent("recording_start," + String(source) + "," + tripId);
+  for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
+    if (channels[i].mainSignal) {
+      startSensorTriggerEvent(i);
+    }
+  }
+  Serial.printf("Fahrtaufzeichnung gestartet: %s (%s)\n", tripId, source);
+}
+
+void stopRecording(const char *source) {
+  if (!recordingActive) {
+    return;
+  }
+  for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
+    finishSensorTriggerEvent(i);
+  }
+  flushPersistentGpsBuffer();
+  if (tripMetaPath[0] != '\0') {
+    appendFile(tripMetaPath, "end_uptime_ms=" + String(millis()) + "\nstatus=completed\n");
+  }
+  appendSystemEvent("recording_stop," + String(source) + "," + tripId);
+  recordingActive = false;
+  if (strcmp(source, "manual") == 0) {
+    autoStartArmed = false;
+  }
+  Serial.printf("Fahrtaufzeichnung beendet: %s (%s)\n", tripId, source);
 }
 
 bool tcaWrite(uint8_t reg, uint8_t value) {
@@ -851,8 +1086,17 @@ String statusJson() {
   doc["device_id"] = DEVICE_ID;
   doc["device_name"] = DEVICE_NAME;
   doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["module_id"] = MODULE_ID;
   doc["esp_temperature_c"] = temperatureRead();
   doc["crop_name"] = cropName;
+  doc["field_name"] = fieldName;
+  doc["trip_id"] = tripId;
+  doc["auto_start_enabled"] = autoStartEnabled;
+  doc["filesystem_ready"] = filesystemReady;
+  doc["filesystem_used_bytes"] = filesystemReady ? LittleFS.usedBytes() : 0;
+  doc["filesystem_total_bytes"] = filesystemReady ? LittleFS.totalBytes() : 0;
+  doc["boot_counter"] = bootCounter;
+  doc["reset_reason"] = resetReason;
   doc["uptime_ms"] = millis();
   doc["wifi_ap_ssid"] = AP_SSID;
   doc["ip"] = WiFi.softAPIP().toString();
@@ -878,6 +1122,8 @@ String statusJson() {
   gnssJson["modbus_address"] = GNSS_MODBUS_ADDRESS;
   gnssJson["baud"] = GNSS_MODBUS_BAUD;
   gnssJson["fix"] = gnss.fix;
+  gnssJson["health"] = gnssHealth();
+  gnssJson["warning"] = strcmp(gnssHealth(), "ok") != 0;
   gnssJson["seen"] = gnss.seen;
   gnssJson["latitude"] = gnss.latitude;
   gnssJson["longitude"] = gnss.longitude;
@@ -892,6 +1138,18 @@ String statusJson() {
   gnssJson["last_error"] = gnss.lastError;
   gnssJson["last_sentence"] = gnss.lastSentence;
   gnssJson["raw_preview"] = gnss.rawPreview;
+
+  JsonArray modules = doc["modules"].to<JsonArray>();
+  for (uint8_t i = 1; i <= 4; i++) {
+    JsonObject module = modules.add<JsonObject>();
+    char id[4];
+    snprintf(id, sizeof(id), "M%02u", i);
+    module["id"] = id;
+    module["label"] = "Modul " + String(i);
+    module["local"] = i == 1;
+    module["online"] = i == 1;
+    module["prepared"] = i != 1;
+  }
 
   JsonArray array = doc["channels"].to<JsonArray>();
   const uint32_t now = millis();
@@ -939,6 +1197,7 @@ String htmlPage() {
     .connection-dot { width: 13px; height: 13px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 10px #22c55e; display: inline-block; margin-right: 6px; vertical-align: -1px; }
     .connection.offline .connection-dot { background: #ef4444; box-shadow: 0 0 12px #ef4444; }
     .connection.stale .connection-dot { background: #facc15; box-shadow: 0 0 10px #facc15; }
+    .warning { border: 1px solid #f59e0b; border-radius: 6px; background: #78350f; color: #fef3c7; padding: 10px 12px; margin-bottom: 14px; font-weight: 750; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
     .card { min-width: 0; border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; }
     .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -959,6 +1218,12 @@ String htmlPage() {
     .panel h2 { margin: 0 0 10px; font-size: 1rem; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .actions > * { max-width: 100%; }
+    .tools-details { margin-top: 12px; }
+    .archive-list { margin-top: 10px; display: grid; gap: 6px; font-size: .88rem; }
+    .archive-list a { color: #bfdbfe; overflow-wrap: anywhere; }
+    .module-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .module { border: 1px solid #4b5563; border-radius: 6px; padding: 9px; color: #9ca3af; }
+    .module.online { border-color: #16a34a; color: #dcfce7; }
     .field-row { display: grid; grid-template-columns: minmax(130px, 1fr) auto; gap: 8px; margin-bottom: 12px; }
     input, select { min-width: 0; height: 40px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #f9fafb; padding: 0 10px; font: inherit; }
     button, .link-button { border: 0; border-radius: 6px; background: #2563eb; color: white; padding: 9px 12px; font: inherit; font-weight: 750; text-decoration: none; cursor: pointer; }
@@ -996,6 +1261,7 @@ String htmlPage() {
       .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .actions > * { display: flex; min-width: 0; width: 100%; align-items: center; justify-content: center; overflow-wrap: anywhere; text-align: center; }
       .gps-meta { grid-template-columns: 1fr; }
+      .module-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       #topoMap, #trackCanvas { height: 430px; }
     }
   </style>
@@ -1011,6 +1277,7 @@ String htmlPage() {
       <span>Letzter Kontakt: <strong id="lastContact">-</strong></span>
       <span>ESP Temperatur: <strong id="espTemp">-</strong></span>
     </div>
+    <div id="gnssWarning" class="warning hidden"></div>
     <nav class="tabs" aria-label="Ansicht">
       <button id="monitoringTab" class="tab-button active" type="button">Überwachung</button>
       <button id="mapTab" class="tab-button" type="button">Karte</button>
@@ -1022,16 +1289,25 @@ String htmlPage() {
         <button id="gpsStop" class="secondary" type="button" disabled>Aufzeichnung Stop</button>
         <button id="alarmEnable" class="secondary" type="button">Ton aktivieren</button>
         <button id="alarmAck" class="secondary" type="button">Alarm quittieren</button>
-        <a class="link-button secondary" href="/api/gps-log.csv">CSV</a>
-        <a class="link-button secondary" href="/api/gps-log.geojson">GeoJSON</a>
-        <a class="link-button secondary" href="/api/main-events.csv">Hauptsignale CSV</a>
-        <a class="link-button secondary" href="/api/main-events.geojson">Hauptsignale GeoJSON</a>
-        <a class="link-button secondary" href="/api/sensor-events.csv">Sensorlog CSV</a>
-        <a class="link-button secondary" href="/api/sensor-events.txt">Sensorlog TXT</a>
-        <button id="gpsClear" class="danger" type="button">Log löschen</button>
       </div>
+      <details class="tools-details">
+        <summary>Dateien und Wartung</summary>
+        <div class="actions">
+          <a class="link-button secondary" href="/api/gps-log.csv">CSV</a>
+          <a class="link-button secondary" href="/api/gps-log.geojson">GeoJSON</a>
+          <a class="link-button secondary" href="/api/combined.geojson">Route + Sensoren</a>
+          <a class="link-button secondary" href="/api/main-events.csv">Hauptsignale CSV</a>
+          <a class="link-button secondary" href="/api/sensor-events.csv">Sensorlog CSV</a>
+          <a class="link-button secondary" href="/api/sensor-events.txt">Sensorlog TXT</a>
+          <a class="link-button secondary" href="/api/system-events.log">Neustart-Log</a>
+          <button id="archiveRefresh" class="secondary" type="button">Archiv anzeigen</button>
+          <button id="gpsClear" class="danger" type="button">Live-Log löschen</button>
+        </div>
+        <div id="archiveList" class="archive-list"></div>
+      </details>
       <div class="gps-meta">
         <div>Aufzeichnung: <strong id="gpsStatus">Aus</strong></div>
+        <div>Fahrt-ID: <strong id="tripId">-</strong></div>
         <div>GNSS Fix: <strong id="gnssFix">-</strong></div>
         <div>GNSS Quelle: <strong id="gnssSource">-</strong></div>
         <div>Alarm: <strong id="alarmStatus">Aus</strong></div>
@@ -1043,11 +1319,13 @@ String htmlPage() {
         <div>Genauigkeit: <strong id="gpsAccuracy">-</strong></div>
         <div>Satelliten: <strong id="gpsSatellites">-</strong></div>
         <div>RS485: <strong id="gnssRs485">-</strong></div>
+        <div>Flash-Archiv: <strong id="filesystem">-</strong></div>
       </div>
     </section>
     <section id="mapView" class="panel hidden">
       <h2>Live-Fahrt</h2>
       <p id="mapStatus" class="map-status">Topografische Karte wird beim Öffnen geladen.</p>
+      <div class="actions"><button id="mapFollow" class="secondary" type="button">Position folgen: Ein</button></div>
       <div id="topoMap" class="hidden"></div>
       <div id="trackFallback" class="track-wrap">
         <canvas id="trackCanvas"></canvas>
@@ -1061,6 +1339,10 @@ String htmlPage() {
     </section>
     <section class="panel monitoring-view">
       <h2>Saat</h2>
+      <div class="field-row">
+        <input id="fieldInput" maxlength="31" value="Feld" placeholder="Feldname">
+        <button id="fieldSave" type="button">Feld speichern</button>
+      </div>
       <div class="field-row">
         <input id="cropInput" list="cropSuggestions" maxlength="23" value="Weizen">
         <datalist id="cropSuggestions">
@@ -1077,7 +1359,12 @@ String htmlPage() {
       </div>
       <div class="gps-meta">
         <div>Aktuell: <strong id="cropCurrent">-</strong></div>
+        <div>Feld: <strong id="fieldCurrent">-</strong></div>
       </div>
+    </section>
+    <section class="panel monitoring-view">
+      <h2>Module</h2>
+      <div id="modules" class="module-grid"></div>
     </section>
     <div id="grid" class="grid monitoring-view"></div>
     <div id="error" class="error"></div>
@@ -1096,6 +1383,8 @@ String htmlPage() {
     let mainSignalSnapshotReady = false;
     let acknowledgedMainMask = 0;
     let currentMainMask = 0;
+    let systemWarningActive = false;
+    let acknowledgedSystemWarning = false;
     let lastSuccessfulContactMs = 0;
     let connectionTimer = null;
     let renderingGrid = false;
@@ -1107,6 +1396,7 @@ String htmlPage() {
     let topoEvents = null;
     let leafletLoading = false;
     let topoFitted = false;
+    let followMap = true;
     const openDetailChannels = new Set();
 
     function escapeHtml(value) {
@@ -1218,7 +1508,8 @@ String htmlPage() {
         target.textContent = 'Nicht aktiviert';
       } else if (alarmPulsing) {
         target.textContent = 'Aktiv';
-      } else if (currentMainMask !== 0 && currentMainMask === acknowledgedMainMask) {
+      } else if ((currentMainMask !== 0 && currentMainMask === acknowledgedMainMask) ||
+                 (systemWarningActive && acknowledgedSystemWarning)) {
         target.textContent = 'Quittiert';
       } else {
         target.textContent = 'Bereit';
@@ -1239,6 +1530,7 @@ String htmlPage() {
 
     function acknowledgeAlarm() {
       acknowledgedMainMask = currentMainMask;
+      acknowledgedSystemWarning = systemWarningActive;
       stopPulsingAlarm();
       updateAlarmStatus();
     }
@@ -1255,15 +1547,36 @@ String htmlPage() {
       });
       currentMainMask = mask;
       mainSignalSnapshotReady = true;
+      syncAlarm();
+    }
+
+    function syncAlarm() {
       if (currentMainMask === 0) {
         acknowledgedMainMask = 0;
-        stopPulsingAlarm();
-      } else if ((currentMainMask & ~acknowledgedMainMask) !== 0) {
+      }
+      if (!systemWarningActive) {
+        acknowledgedSystemWarning = false;
+      }
+      if ((currentMainMask & ~acknowledgedMainMask) !== 0 || (systemWarningActive && !acknowledgedSystemWarning)) {
         startPulsingAlarm();
       } else {
         stopPulsingAlarm();
       }
       updateAlarmStatus();
+    }
+
+    function updateGnssWarning(gnss) {
+      const box = document.getElementById('gnssWarning');
+      const messages = {
+        no_rs485: 'GNSS-Warnung: RS485-GPS-Modul antwortet nicht.',
+        no_fix: 'GNSS-Warnung: GPS-Modul erreichbar, aber noch kein Satelliten-Fix.',
+        invalid_data: 'GNSS-Warnung: GPS-Daten empfangen, aber nicht auswertbar.'
+      };
+      const message = messages[gnss.health];
+      systemWarningActive = Boolean(message);
+      box.textContent = message || '';
+      box.classList.toggle('hidden', !message);
+      syncAlarm();
     }
 
     function setConnectionState(state, detail) {
@@ -1323,7 +1636,7 @@ String htmlPage() {
           if (route.length > 1) topoMap.fitBounds(topoRoute.getBounds(), { padding: [28, 28] });
           else topoMap.setView(current, 17);
           topoFitted = true;
-        } else {
+        } else if (followMap) {
           topoMap.panTo(current, { animate: true });
         }
       }
@@ -1336,6 +1649,7 @@ String htmlPage() {
       target.classList.remove('hidden');
       document.getElementById('trackFallback').classList.add('hidden');
       topoMap = L.map('topoMap').setView([51.0, 10.0], 6);
+      topoMap.on('dragstart zoomstart', () => setMapFollow(false));
       const tiles = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
         maxZoom: 17,
         attribution: 'Kartendaten: © OpenStreetMap-Mitwirkende, SRTM | Darstellung: © OpenTopoMap (CC-BY-SA)'
@@ -1351,6 +1665,15 @@ String htmlPage() {
       }).addTo(topoMap);
       setTimeout(() => topoMap.invalidateSize(), 0);
       updateTopoMap();
+    }
+
+    function setMapFollow(enabled) {
+      followMap = enabled;
+      document.getElementById('mapFollow').textContent = 'Position folgen: ' + (followMap ? 'Ein' : 'Aus');
+      if (followMap) {
+        topoFitted = false;
+        updateTopoMap();
+      }
     }
 
     function loadTopoMap() {
@@ -1531,8 +1854,16 @@ String htmlPage() {
         document.getElementById('updated').textContent = 'Aktualisiert: ' + new Date().toLocaleTimeString();
         document.getElementById('espTemp').textContent = Number.isFinite(data.esp_temperature_c) ? data.esp_temperature_c.toFixed(1) + ' °C' : '-';
         document.getElementById('cropCurrent').textContent = data.crop_name || '-';
+        document.getElementById('fieldCurrent').textContent = data.field_name || '-';
+        document.getElementById('tripId').textContent = data.trip_id || '-';
+        document.getElementById('filesystem').textContent = data.filesystem_ready
+          ? `${Math.round((data.filesystem_used_bytes || 0) / 1024)} / ${Math.round((data.filesystem_total_bytes || 0) / 1024)} KB`
+          : 'Nicht verfügbar';
         if (document.activeElement !== document.getElementById('cropInput')) {
           document.getElementById('cropInput').value = data.crop_name || '';
+        }
+        if (document.activeElement !== document.getElementById('fieldInput')) {
+          document.getElementById('fieldInput').value = data.field_name || '';
         }
         document.getElementById('gpsCount').textContent = `${data.gps_log_count || 0} / ${data.gps_log_capacity || 0}`;
         document.getElementById('mainEventCount').textContent = `${data.main_event_count || 0} / ${data.main_event_capacity || 0}`;
@@ -1548,6 +1879,10 @@ String htmlPage() {
         document.getElementById('gpsAccuracy').textContent = Number.isFinite(gnss.accuracy_m) && gnss.accuracy_m >= 0 ? `${Number(gnss.accuracy_m).toFixed(1)} m` : '-';
         document.getElementById('gpsSatellites').textContent = gnss.satellites ?? '-';
         document.getElementById('gnssRs485').textContent = `${gnss.last_error || '-'} · OK ${gnss.ok_count || 0} / Fehler ${gnss.error_count || 0}`;
+        updateGnssWarning(gnss);
+        document.getElementById('modules').innerHTML = (data.modules || []).map(module =>
+          `<div class="module ${module.online ? 'online' : ''}"><strong>${escapeHtml(module.id)}</strong><br>${module.online ? 'Lokal online' : 'Vorbereitet'}</div>`
+        ).join('');
         checkMainSignalAlarms(data.channels || []);
         const grid = document.getElementById('grid');
         renderingGrid = true;
@@ -1590,12 +1925,43 @@ String htmlPage() {
     }
 
     async function clearGpsLog() {
+      if (!confirm('Live-Log wirklich löschen? Bereits archivierte Fahrtdateien bleiben erhalten.')) return;
       try {
         const res = await fetchWithTimeout('/api/gps-log/clear', { method: 'POST' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         await refresh();
       } catch (err) {
         document.getElementById('gpsStatus').textContent = 'Löschen fehlgeschlagen';
+      }
+    }
+
+    async function saveField() {
+      const input = document.getElementById('fieldInput');
+      try {
+        const res = await fetchWithTimeout('/api/field', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ field_name: input.value })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await refresh();
+      } catch (err) {
+        document.getElementById('gpsStatus').textContent = 'Feld speichern fehlgeschlagen';
+      }
+    }
+
+    async function loadArchive() {
+      const target = document.getElementById('archiveList');
+      target.textContent = 'Archiv wird geladen …';
+      try {
+        const res = await fetchWithTimeout('/api/archive');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        target.innerHTML = (data.files || []).length
+          ? data.files.map(file => `<a href="/api/archive/download?path=${encodeURIComponent(file.path)}">${escapeHtml(file.name)} (${Math.round(file.size / 1024)} KB)</a>`).join('')
+          : 'Noch keine archivierten Fahrtdateien.';
+      } catch (err) {
+        target.textContent = 'Archiv nicht erreichbar';
       }
     }
 
@@ -1618,10 +1984,13 @@ String htmlPage() {
     document.getElementById('gpsStop').addEventListener('click', stopGps);
     document.getElementById('gpsClear').addEventListener('click', clearGpsLog);
     document.getElementById('cropSave').addEventListener('click', saveCrop);
+    document.getElementById('fieldSave').addEventListener('click', saveField);
+    document.getElementById('archiveRefresh').addEventListener('click', loadArchive);
     document.getElementById('alarmEnable').addEventListener('click', enableAlarm);
     document.getElementById('alarmAck').addEventListener('click', acknowledgeAlarm);
     document.getElementById('monitoringTab').addEventListener('click', () => selectView('monitoring'));
     document.getElementById('mapTab').addEventListener('click', () => selectView('map'));
+    document.getElementById('mapFollow').addEventListener('click', () => setMapFollow(!followMap));
     window.addEventListener('pagehide', () => {
       pageActive = false;
     });
@@ -1736,6 +2105,22 @@ void handleApiCrop() {
   server.send(200, "application/json", json);
 }
 
+void handleApiField() {
+  const String body = server.arg("plain");
+  JsonDocument doc;
+  if (body.length() == 0 || deserializeJson(doc, body)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_body\"}");
+    return;
+  }
+  const String name = doc["field_name"] | "";
+  if (name.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"invalid_field_name\"}");
+    return;
+  }
+  saveFieldName(name);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleApiRecording() {
   const String body = server.arg("plain");
   if (body.length() == 0) {
@@ -1750,7 +2135,12 @@ void handleApiRecording() {
     return;
   }
 
-  recordingActive = doc["active"] | false;
+  const bool active = doc["active"] | false;
+  if (active) {
+    startRecording("manual");
+  } else {
+    stopRecording("manual");
+  }
 
   JsonDocument response;
   response["ok"] = true;
@@ -1760,6 +2150,85 @@ void handleApiRecording() {
   String json;
   serializeJson(response, json);
   server.send(200, "application/json", json);
+}
+
+void handleApiCombinedGeoJson() {
+  String json;
+  json.reserve(256 + gpsLogCount * 36 + sensorEventCount * 190);
+  json += "{\"type\":\"FeatureCollection\",\"features\":[";
+  if (gpsLogCount > 0) {
+    json += "{\"type\":\"Feature\",\"geometry\":{\"type\":\"LineString\",\"coordinates\":[";
+    for (uint16_t i = 0; i < gpsLogCount; i++) {
+      if (i > 0) json += ",";
+      const GpsLogEntry &entry = gpsLogAt(i);
+      json += "[" + String(entry.longitude, 7) + "," + String(entry.latitude, 7) + "]";
+    }
+    json += "]},\"properties\":{\"trip_id\":\"" + String(tripId) + "\",\"type\":\"route\"}}";
+  }
+  bool needsComma = gpsLogCount > 0;
+  for (uint16_t i = 0; i < sensorEventCount; i++) {
+    const SensorTriggerEvent &event = sensorEventAt(i);
+    if (!event.startHasGps) continue;
+    if (needsComma) json += ",";
+    needsComma = true;
+    json += "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[" +
+            String(event.startLongitude, 7) + "," + String(event.startLatitude, 7) +
+            "]},\"properties\":{\"type\":\"sensor_event\",\"channel\":" + String(event.channel) +
+            ",\"channel_name\":\"" + event.channelName + "\",\"duration_ms\":" +
+            String(event.durationMs) + ",\"crop_name\":\"" + event.crop + "\"}}";
+  }
+  json += "]}";
+  server.sendHeader("Content-Disposition", "attachment; filename=fahrt-mit-sensoren.geojson");
+  server.send(200, "application/geo+json; charset=utf-8", json);
+}
+
+void handleApiArchive() {
+  JsonDocument doc;
+  JsonArray files = doc["files"].to<JsonArray>();
+  if (filesystemReady) {
+    File root = LittleFS.open("/");
+    File file = root.openNextFile();
+    while (file) {
+      String name = file.name();
+      if (!name.startsWith("/")) {
+        name = "/" + name;
+      }
+      if (name.startsWith("/trip-")) {
+        JsonObject item = files.add<JsonObject>();
+        item["name"] = name.substring(1);
+        item["path"] = name;
+        item["size"] = file.size();
+      }
+      file = root.openNextFile();
+    }
+  }
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+void handleApiArchiveDownload() {
+  flushPersistentGpsBuffer();
+  const String path = server.arg("path");
+  if (!filesystemReady || !path.startsWith("/trip-") || path.indexOf("..") >= 0 || !LittleFS.exists(path)) {
+    server.send(404, "application/json", "{\"error\":\"file_not_found\"}");
+    return;
+  }
+  File file = LittleFS.open(path, FILE_READ);
+  server.sendHeader("Content-Disposition", "attachment; filename=" + path.substring(1));
+  server.streamFile(file, path.endsWith(".txt") ? "text/plain; charset=utf-8" : "text/csv; charset=utf-8");
+  file.close();
+}
+
+void handleApiSystemEvents() {
+  if (!filesystemReady || !LittleFS.exists("/system-events.log")) {
+    server.send(404, "application/json", "{\"error\":\"file_not_found\"}");
+    return;
+  }
+  File file = LittleFS.open("/system-events.log", FILE_READ);
+  server.sendHeader("Content-Disposition", "attachment; filename=system-events.log");
+  server.streamFile(file, "text/plain; charset=utf-8");
+  file.close();
 }
 
 void handleApiTrack() {
@@ -2088,6 +2557,10 @@ void handleApiSensorEventsTxt() {
 }
 
 void handleApiGpsLogClear() {
+  if (recordingActive) {
+    server.send(409, "application/json", "{\"error\":\"recording_active\"}");
+    return;
+  }
   clearGpsLog();
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -2140,8 +2613,15 @@ void setup() {
   Serial.println();
   Serial.println("Waveshare ESP32-S3-POE-ETH-8DI-8DO Drillmaschine");
 
+  resetReason = resetReasonName(esp_reset_reason());
   loadChannelNames();
   loadCropName();
+  loadFieldName();
+  bootCounter = preferences.getUInt("boot_counter", 0) + 1;
+  tripCounter = preferences.getUInt("trip_counter", 0);
+  preferences.putUInt("boot_counter", bootCounter);
+  initFilesystem();
+  appendSystemEvent("boot," + String(resetReason) + ",firmware=" + FIRMWARE_VERSION);
   initGpsLog();
   initGnssRs485();
   initDigitalInputs();
@@ -2152,6 +2632,7 @@ void setup() {
   server.on("/api/status", HTTP_GET, handleApiStatus);
   server.on("/api/channel-name", HTTP_POST, handleApiChannelName);
   server.on("/api/crop", HTTP_POST, handleApiCrop);
+  server.on("/api/field", HTTP_POST, handleApiField);
   server.on("/api/recording", HTTP_POST, handleApiRecording);
   server.on("/api/track", HTTP_GET, handleApiTrack);
   server.on("/api/gps-log.csv", HTTP_GET, handleApiGpsLogCsv);
@@ -2160,11 +2641,17 @@ void setup() {
   server.on("/api/main-events.geojson", HTTP_GET, handleApiMainEventsGeoJson);
   server.on("/api/sensor-events.csv", HTTP_GET, handleApiSensorEventsCsv);
   server.on("/api/sensor-events.txt", HTTP_GET, handleApiSensorEventsTxt);
+  server.on("/api/combined.geojson", HTTP_GET, handleApiCombinedGeoJson);
+  server.on("/api/archive", HTTP_GET, handleApiArchive);
+  server.on("/api/archive/download", HTTP_GET, handleApiArchiveDownload);
+  server.on("/api/system-events.log", HTTP_GET, handleApiSystemEvents);
   server.on("/api/gps-log/clear", HTTP_POST, handleApiGpsLogClear);
   server.onNotFound([]() {
     server.send(404, "application/json", "{\"error\":\"not_found\"}");
   });
   server.begin();
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_SECONDS, true);
+  esp_task_wdt_add(nullptr);
 
   Serial.println("HTTP Server gestartet");
   Serial.println("Webseite: http://" + WiFi.softAPIP().toString() + "/");
@@ -2174,7 +2661,12 @@ void setup() {
 void loop() {
   readDigitalInputs();
   pollGnss();
+  updateGnssHealthAndRecording();
   server.handleClient();
+  if (recordingActive && millis() - lastFileFlushMs >= FILE_FLUSH_INTERVAL_MS) {
+    flushPersistentGpsBuffer();
+  }
+  esp_task_wdt_reset();
 
   if (millis() - lastDebugMs > 1000) {
     lastDebugMs = millis();

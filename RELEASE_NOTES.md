@@ -1,5 +1,33 @@
 # Release Notes
 
+## 1.5.0 - 2026-05-31
+
+### Neu
+
+- Fahrtaufzeichnung startet automatisch, sobald der GNSS-Fix drei Sekunden stabil ist.
+- Jede Fahrt erhält eine Fahrt-ID im Format `M01-Bxxxxxx-Fxxxx`.
+- Feldname ist neben der Saat im Webinterface editierbar.
+- GPS- und Sensorlogs werden als Fahrtdateien dauerhaft in LittleFS archiviert.
+- Aktive Sensorereignisse werden beim Stoppen der Aufzeichnung sauber abgeschlossen.
+- Kombinierter GeoJSON-Download `/api/combined.geojson` ergänzt.
+- Archivierte Dateien können über das Webinterface geladen werden.
+- GNSS-Zustände `no_rs485`, `no_fix` und `invalid_data` werden sichtbar unterschieden.
+- GNSS-Warnungen werden nach Aktivierung des Tablet-Tons akustisch signalisiert.
+- Kartenansicht besitzt einen Schalter `Position folgen`.
+- Modulübersicht für `M01` bis `M04` vorbereitet.
+- Task-Watchdog, Boot-Zähler und Reset-Grund ergänzt.
+
+### Geändert
+
+- Seltene Downloads und Wartungsaktionen befinden sich in einem ausklappbaren Bereich.
+- Löschen des Live-Logs erfordert eine Bestätigung und ist während einer Fahrt gesperrt.
+- GPS-Punkte werden für den Flash gepuffert und spätestens alle 30 Sekunden geschrieben.
+
+### Bekannte Einschränkungen
+
+- `M02` bis `M04` sind als spätere Ausbaustufe sichtbar, aber noch nicht über ein zentrales Gateway angebunden.
+- Die EWD108-Modbus-Registerbelegung muss weiterhin am realen GNSS-Modul bestätigt werden.
+
 ## 1.4.0 - 2026-05-31
 
 ### Neu
