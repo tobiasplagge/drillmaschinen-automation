@@ -929,17 +929,19 @@ String htmlPage() {
   <style>
     :root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 0; background: #111827; color: #f9fafb; }
+    * { box-sizing: border-box; }
     main { width: min(1100px, calc(100% - 28px)); margin: 0 auto; padding: 24px 0 34px; }
     h1 { margin: 0 0 8px; font-size: clamp(1.55rem, 5vw, 2.25rem); }
     .meta { color: #9ca3af; margin-bottom: 18px; }
     .connection { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 14px; color: #d1d5db; font-size: .94rem; }
+    .connection span { min-width: 0; overflow-wrap: anywhere; }
     .connection strong { color: #f9fafb; }
     .connection-dot { width: 13px; height: 13px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 10px #22c55e; display: inline-block; margin-right: 6px; vertical-align: -1px; }
     .connection.offline .connection-dot { background: #ef4444; box-shadow: 0 0 12px #ef4444; }
     .connection.stale .connection-dot { background: #facc15; box-shadow: 0 0 10px #facc15; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
-    .card { border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; }
-    .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+    .card { min-width: 0; border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; }
+    .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .name { min-width: 0; font-weight: 800; font-size: 1.08rem; overflow-wrap: anywhere; }
     .channel { color: #9ca3af; font-size: .85rem; margin-top: 2px; }
     .main-state { display: flex; align-items: center; gap: 10px; }
@@ -953,9 +955,10 @@ String htmlPage() {
     .pill.main { background: #dc2626; color: #fef2f2; }
     .pill.ok { background: #16a34a; color: #f0fdf4; }
     .pill.pending { background: #ca8a04; color: #fffbeb; }
-    .panel { border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; margin-bottom: 14px; }
+    .panel { min-width: 0; border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; margin-bottom: 14px; }
     .panel h2 { margin: 0 0 10px; font-size: 1rem; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .actions > * { max-width: 100%; }
     .field-row { display: grid; grid-template-columns: minmax(130px, 1fr) auto; gap: 8px; margin-bottom: 12px; }
     input, select { min-width: 0; height: 40px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #f9fafb; padding: 0 10px; font: inherit; }
     button, .link-button { border: 0; border-radius: 6px; background: #2563eb; color: white; padding: 9px 12px; font: inherit; font-weight: 750; text-decoration: none; cursor: pointer; }
@@ -964,6 +967,7 @@ String htmlPage() {
     button:disabled { opacity: .45; cursor: default; }
     .gps-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 14px; margin-top: 12px; color: #d1d5db; font-size: .92rem; }
     .gps-meta strong { color: #f9fafb; }
+    .gps-meta > div { min-width: 0; overflow-wrap: anywhere; }
     .track-wrap { position: relative; overflow: hidden; min-height: 280px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
     #trackCanvas { display: block; width: 100%; height: 360px; }
     #topoMap { width: 100%; height: 520px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
@@ -983,6 +987,17 @@ String htmlPage() {
     dt { color: #9ca3af; }
     dd { margin: 0; text-align: right; font-weight: 650; overflow-wrap: anywhere; }
     .error { min-height: 1.4em; color: #fca5a5; margin-top: 14px; }
+    @media (max-width: 520px) {
+      main { width: min(100% - 20px, 1100px); padding-top: 16px; }
+      .grid { grid-template-columns: 1fr; }
+      .field-row { grid-template-columns: 1fr; }
+      .connection { display: grid; grid-template-columns: 1fr 1fr; }
+      .connection > span:last-child { grid-column: 1 / -1; }
+      .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .actions > * { display: flex; min-width: 0; width: 100%; align-items: center; justify-content: center; overflow-wrap: anywhere; text-align: center; }
+      .gps-meta { grid-template-columns: 1fr; }
+      #topoMap, #trackCanvas { height: 430px; }
+    }
   </style>
 </head>
 <body>
