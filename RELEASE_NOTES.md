@@ -4,8 +4,9 @@
 
 ### Neu
 
-- Offline-Live-Fahrt im Webinterface ergänzt.
-- Fahrspur wird ohne Internetverbindung auf einem lokalen Raster dargestellt.
+- Reiter `Überwachung` und `Karte` im Webinterface ergänzt.
+- Topografische Online-Karte mit OpenTopoMap im Karten-Reiter ergänzt.
+- Fahrspur wird bei fehlendem Internet weiterhin auf einem lokalen Raster dargestellt.
 - Aktuelle GNSS-Position wird als grüner Punkt angezeigt.
 - Erkannte Hauptsignal-Störungen werden als rote Marker dargestellt.
 - Neuer Endpoint `/api/track` für eine kompakte Live-Ansicht.

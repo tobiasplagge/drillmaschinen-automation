@@ -966,6 +966,12 @@ String htmlPage() {
     .gps-meta strong { color: #f9fafb; }
     .track-wrap { position: relative; overflow: hidden; min-height: 280px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
     #trackCanvas { display: block; width: 100%; height: 360px; }
+    #topoMap { width: 100%; height: 520px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
+    .tab-button { background: #374151; }
+    .tab-button.active { background: #2563eb; }
+    .hidden { display: none !important; }
+    .map-status { margin: 0 0 10px; color: #d1d5db; font-size: .9rem; }
     .track-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; color: #d1d5db; font-size: .88rem; }
     .legend-key { display: inline-flex; align-items: center; gap: 6px; }
     .legend-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; background: #16a34a; }
@@ -990,7 +996,11 @@ String htmlPage() {
       <span>Letzter Kontakt: <strong id="lastContact">-</strong></span>
       <span>ESP Temperatur: <strong id="espTemp">-</strong></span>
     </div>
-    <section class="panel">
+    <nav class="tabs" aria-label="Ansicht">
+      <button id="monitoringTab" class="tab-button active" type="button">Überwachung</button>
+      <button id="mapTab" class="tab-button" type="button">Karte</button>
+    </nav>
+    <section class="panel monitoring-view">
       <h2>Fahrtaufzeichnung</h2>
       <div class="actions">
         <button id="gpsStart" type="button">Aufzeichnen</button>
@@ -1020,9 +1030,11 @@ String htmlPage() {
         <div>RS485: <strong id="gnssRs485">-</strong></div>
       </div>
     </section>
-    <section class="panel">
+    <section id="mapView" class="panel hidden">
       <h2>Live-Fahrt</h2>
-      <div class="track-wrap">
+      <p id="mapStatus" class="map-status">Topografische Karte wird beim Öffnen geladen.</p>
+      <div id="topoMap" class="hidden"></div>
+      <div id="trackFallback" class="track-wrap">
         <canvas id="trackCanvas"></canvas>
       </div>
       <div class="track-legend">
@@ -1032,7 +1044,7 @@ String htmlPage() {
         <span id="trackInfo">Warte auf GNSS-Daten</span>
       </div>
     </section>
-    <section class="panel">
+    <section class="panel monitoring-view">
       <h2>Saat</h2>
       <div class="field-row">
         <input id="cropInput" list="cropSuggestions" maxlength="23" value="Weizen">
@@ -1052,7 +1064,7 @@ String htmlPage() {
         <div>Aktuell: <strong id="cropCurrent">-</strong></div>
       </div>
     </section>
-    <div id="grid" class="grid"></div>
+    <div id="grid" class="grid monitoring-view"></div>
     <div id="error" class="error"></div>
   </main>
   <script>
@@ -1074,6 +1086,12 @@ String htmlPage() {
     let renderingGrid = false;
     let trackBusy = false;
     let lastTrackData = { points: [], events: [], current: null };
+    let topoMap = null;
+    let topoRoute = null;
+    let topoCurrent = null;
+    let topoEvents = null;
+    let leafletLoading = false;
+    let topoFitted = false;
     const openDetailChannels = new Set();
 
     function escapeHtml(value) {
@@ -1266,6 +1284,96 @@ String htmlPage() {
       }
     }
 
+    function showMapFallback(message) {
+      document.getElementById('mapStatus').textContent = message;
+      document.getElementById('topoMap').classList.add('hidden');
+      document.getElementById('trackFallback').classList.remove('hidden');
+      drawTrack();
+    }
+
+    function updateTopoMap(data = lastTrackData) {
+      if (!topoMap || !window.L) return;
+      const route = (data.points || []).map(point => [Number(point.latitude), Number(point.longitude)]);
+      topoRoute.setLatLngs(route);
+      topoEvents.clearLayers();
+      (data.events || []).forEach(event => {
+        L.circleMarker([Number(event.latitude), Number(event.longitude)], {
+          radius: 7, color: '#fff', weight: 2, fillColor: '#dc2626', fillOpacity: 1
+        }).bindPopup(`Sensor ${event.channel}: Erkannt`).addTo(topoEvents);
+      });
+      if (data.current?.fix) {
+        const current = [Number(data.current.latitude), Number(data.current.longitude)];
+        topoCurrent.setLatLng(current).setStyle({ opacity: 1, fillOpacity: 1 });
+        if (!topoFitted) {
+          if (route.length > 1) topoMap.fitBounds(topoRoute.getBounds(), { padding: [28, 28] });
+          else topoMap.setView(current, 17);
+          topoFitted = true;
+        } else {
+          topoMap.panTo(current, { animate: true });
+        }
+      }
+      document.getElementById('mapStatus').textContent = 'OpenTopoMap online · Live-Spur aktiv';
+    }
+
+    function createTopoMap() {
+      if (topoMap || !window.L) return;
+      const target = document.getElementById('topoMap');
+      target.classList.remove('hidden');
+      document.getElementById('trackFallback').classList.add('hidden');
+      topoMap = L.map('topoMap').setView([51.0, 10.0], 6);
+      const tiles = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+        maxZoom: 17,
+        attribution: 'Kartendaten: © OpenStreetMap-Mitwirkende, SRTM | Darstellung: © OpenTopoMap (CC-BY-SA)'
+      });
+      tiles.on('tileerror', () => {
+        document.getElementById('mapStatus').textContent = 'Kartenkacheln nicht erreichbar · Raster-Fallback verfügbar';
+      });
+      tiles.addTo(topoMap);
+      topoRoute = L.polyline([], { color: '#2563eb', weight: 4 }).addTo(topoMap);
+      topoEvents = L.layerGroup().addTo(topoMap);
+      topoCurrent = L.circleMarker([51.0, 10.0], {
+        radius: 8, color: '#fff', weight: 2, fillColor: '#16a34a', fillOpacity: 0, opacity: 0
+      }).addTo(topoMap);
+      setTimeout(() => topoMap.invalidateSize(), 0);
+      updateTopoMap();
+    }
+
+    function loadTopoMap() {
+      if (topoMap) {
+        setTimeout(() => topoMap.invalidateSize(), 0);
+        updateTopoMap();
+        return;
+      }
+      if (window.L) {
+        createTopoMap();
+        return;
+      }
+      if (leafletLoading) return;
+      leafletLoading = true;
+      document.getElementById('mapStatus').textContent = 'Lade topografische Online-Karte …';
+      const css = document.createElement('link');
+      css.rel = 'stylesheet';
+      css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+      document.head.appendChild(css);
+      const script = document.createElement('script');
+      script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+      script.onload = () => { leafletLoading = false; createTopoMap(); };
+      script.onerror = () => { leafletLoading = false; showMapFallback('Kein Internet · lokale Rasteransicht aktiv'); };
+      document.head.appendChild(script);
+    }
+
+    function selectView(view) {
+      const showMap = view === 'map';
+      document.querySelectorAll('.monitoring-view').forEach(element => element.classList.toggle('hidden', showMap));
+      document.getElementById('mapView').classList.toggle('hidden', !showMap);
+      document.getElementById('monitoringTab').classList.toggle('active', !showMap);
+      document.getElementById('mapTab').classList.toggle('active', showMap);
+      if (showMap) {
+        loadTopoMap();
+        refreshTrack();
+      }
+    }
+
     function drawTrack(data = lastTrackData) {
       const canvas = document.getElementById('trackCanvas');
       const rect = canvas.getBoundingClientRect();
@@ -1384,6 +1492,7 @@ String htmlPage() {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         lastTrackData = await res.json();
         drawTrack();
+        updateTopoMap();
       } catch (err) {
         document.getElementById('trackInfo').textContent = 'Live-Fahrt nicht erreichbar';
       } finally {
@@ -1496,6 +1605,8 @@ String htmlPage() {
     document.getElementById('cropSave').addEventListener('click', saveCrop);
     document.getElementById('alarmEnable').addEventListener('click', enableAlarm);
     document.getElementById('alarmAck').addEventListener('click', acknowledgeAlarm);
+    document.getElementById('monitoringTab').addEventListener('click', () => selectView('monitoring'));
+    document.getElementById('mapTab').addEventListener('click', () => selectView('map'));
     window.addEventListener('pagehide', () => {
       pageActive = false;
     });

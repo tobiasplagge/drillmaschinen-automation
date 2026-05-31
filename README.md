@@ -89,21 +89,24 @@ Downloads im Webinterface:
 - Hauptsignal-Log als GeoJSON
 - Sensorlog als CSV und TXT mit Start, Ende, Dauer, Kanal und GPS-Bezug
 
-### Offline-Live-Fahrt
+### Live-Fahrt und Karten-Reiter
 
-Die Webseite zeigt die aktuelle Fahrt direkt im Browser an. Dafuer ist keine
-Internetverbindung und kein externer Kartendienst notwendig. Die Ansicht nutzt
-ein lokales Raster mit Nordpfeil und Massstab:
+Die Webseite besitzt die Reiter `Ueberwachung` und `Karte`. Im Karten-Reiter
+wird bei vorhandener Internetverbindung eine topografische OpenTopoMap-Karte
+geladen. Darueber zeichnet der Browser die Live-Fahrt:
 
 - blaue Linie: bisherige Fahrspur
 - gruener Punkt: aktuelle GNSS-Position
 - rote Marker: erkannte Hauptsignal-Stoerungen
 
+Falls OpenTopoMap oder die Internetverbindung nicht erreichbar sind, bleibt
+eine lokale Rasteransicht mit Nordpfeil und Massstab als Fallback verfuegbar.
+Die Sensorueberwachung und Datenaufzeichnung funktionieren unabhaengig von der
+Online-Karte weiter.
+
 Fuer die Live-Ansicht liefert `/api/track` maximal die letzten 1.200 Spurpunkte
 und 128 Stoerungsmarker. Die vollstaendigen Logs bleiben separat als CSV und
-GeoJSON verfuegbar. Eine topografische Hintergrundkarte ist offline nicht
-enthalten; sie kann spaeter in einer Tablet-App ueber lokale Kartenpakete
-ergaenzt werden.
+GeoJSON verfuegbar.
 
 Bekannter Stand: Das EWD108-GN05(485) ist vorbereitet, muss aber am echten
 Modul noch gegen die tatsaechliche Registerbelegung getestet werden. Die
