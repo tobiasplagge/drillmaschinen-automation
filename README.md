@@ -89,6 +89,22 @@ Downloads im Webinterface:
 - Hauptsignal-Log als GeoJSON
 - Sensorlog als CSV und TXT mit Start, Ende, Dauer, Kanal und GPS-Bezug
 
+### Offline-Live-Fahrt
+
+Die Webseite zeigt die aktuelle Fahrt direkt im Browser an. Dafuer ist keine
+Internetverbindung und kein externer Kartendienst notwendig. Die Ansicht nutzt
+ein lokales Raster mit Nordpfeil und Massstab:
+
+- blaue Linie: bisherige Fahrspur
+- gruener Punkt: aktuelle GNSS-Position
+- rote Marker: erkannte Hauptsignal-Stoerungen
+
+Fuer die Live-Ansicht liefert `/api/track` maximal die letzten 1.200 Spurpunkte
+und 128 Stoerungsmarker. Die vollstaendigen Logs bleiben separat als CSV und
+GeoJSON verfuegbar. Eine topografische Hintergrundkarte ist offline nicht
+enthalten; sie kann spaeter in einer Tablet-App ueber lokale Kartenpakete
+ergaenzt werden.
+
 Bekannter Stand: Das EWD108-GN05(485) ist vorbereitet, muss aber am echten
 Modul noch gegen die tatsaechliche Registerbelegung getestet werden. Die
 Firmware scannt die Modbus-Holding-Register ab Register `0x0000` nach einem
@@ -275,6 +291,7 @@ Weitere Endpunkte:
 | `/api/status` | aktueller Kanal-, Alarm-, Temperatur- und Logstatus |
 | `/api/crop` | Saatgut/Feldfrucht speichern |
 | `/api/recording` | Fahrtaufzeichnung starten/stoppen |
+| `/api/track` | kompakte Live-Fahrspur mit aktueller Position und Stoerungsmarkern |
 | `/api/gps-log.csv` | Fahrtaufzeichnung als CSV herunterladen |
 | `/api/gps-log.geojson` | Fahrtaufzeichnung als GeoJSON herunterladen |
 | `/api/main-events.csv` | Hauptsignal-Ereignisse als CSV herunterladen |

@@ -1,5 +1,16 @@
 # Release Notes
 
+## 1.4.0 - 2026-05-31
+
+### Neu
+
+- Offline-Live-Fahrt im Webinterface ergänzt.
+- Fahrspur wird ohne Internetverbindung auf einem lokalen Raster dargestellt.
+- Aktuelle GNSS-Position wird als grüner Punkt angezeigt.
+- Erkannte Hauptsignal-Störungen werden als rote Marker dargestellt.
+- Neuer Endpoint `/api/track` für eine kompakte Live-Ansicht.
+- Live-Ansicht ist auf 1.200 Spurpunkte und 128 Störungsmarker begrenzt; vollständige Downloads bleiben erhalten.
+
 ## 1.3.1 - 2026-05-25
 
 ### Neu

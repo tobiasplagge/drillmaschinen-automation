@@ -14,7 +14,7 @@ static const char *AP_PASSWORD = "12345678";
 
 static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
-static const char *FIRMWARE_VERSION = "1.3.1";
+static const char *FIRMWARE_VERSION = "1.4.0";
 
 static constexpr uint8_t CHANNEL_COUNT = 8;
 static constexpr uint8_t CHANNEL_NAME_LENGTH = 24;
@@ -25,6 +25,8 @@ static constexpr uint32_t GNSS_POLL_INTERVAL_MS = 1000;
 static constexpr uint16_t GPS_LOG_TARGET_CAPACITY = 5000;
 static constexpr uint16_t MAIN_EVENT_LOG_CAPACITY = 512;
 static constexpr uint16_t SENSOR_EVENT_LOG_CAPACITY = 512;
+static constexpr uint16_t LIVE_TRACK_MAX_POINTS = 1200;
+static constexpr uint16_t LIVE_TRACK_MAX_EVENTS = 128;
 
 // Waveshare wiki: DI1..DI8 are GPIO4..GPIO11.
 static constexpr uint8_t DI_PINS[CHANNEL_COUNT] = {4, 5, 6, 7, 8, 9, 10, 11};
@@ -962,6 +964,13 @@ String htmlPage() {
     button:disabled { opacity: .45; cursor: default; }
     .gps-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 14px; margin-top: 12px; color: #d1d5db; font-size: .92rem; }
     .gps-meta strong { color: #f9fafb; }
+    .track-wrap { position: relative; overflow: hidden; min-height: 280px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
+    #trackCanvas { display: block; width: 100%; height: 360px; }
+    .track-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; color: #d1d5db; font-size: .88rem; }
+    .legend-key { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; background: #16a34a; }
+    .legend-dot.route { background: #2563eb; }
+    .legend-dot.alert { background: #dc2626; }
     details { margin-top: 10px; border-top: 1px solid #374151; padding-top: 10px; }
     summary { color: #d1d5db; cursor: pointer; font-weight: 700; }
     dl { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 0; font-size: .92rem; }
@@ -1012,6 +1021,18 @@ String htmlPage() {
       </div>
     </section>
     <section class="panel">
+      <h2>Live-Fahrt</h2>
+      <div class="track-wrap">
+        <canvas id="trackCanvas"></canvas>
+      </div>
+      <div class="track-legend">
+        <span class="legend-key"><span class="legend-dot"></span>Aktuelle Position</span>
+        <span class="legend-key"><span class="legend-dot route"></span>Fahrspur</span>
+        <span class="legend-key"><span class="legend-dot alert"></span>Sensor erkannt</span>
+        <span id="trackInfo">Warte auf GNSS-Daten</span>
+      </div>
+    </section>
+    <section class="panel">
       <h2>Saat</h2>
       <div class="field-row">
         <input id="cropInput" list="cropSuggestions" maxlength="23" value="Weizen">
@@ -1051,6 +1072,8 @@ String htmlPage() {
     let lastSuccessfulContactMs = 0;
     let connectionTimer = null;
     let renderingGrid = false;
+    let trackBusy = false;
+    let lastTrackData = { points: [], events: [], current: null };
     const openDetailChannels = new Set();
 
     function escapeHtml(value) {
@@ -1243,6 +1266,102 @@ String htmlPage() {
       }
     }
 
+    function drawTrack(data = lastTrackData) {
+      const canvas = document.getElementById('trackCanvas');
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(320, Math.round(rect.width));
+      const height = Math.max(280, Math.round(rect.height));
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = '#e5e7eb';
+      ctx.fillRect(0, 0, width, height);
+
+      const positions = [...(data.points || [])];
+      if (data.current?.fix) positions.push(data.current);
+      (data.events || []).forEach(event => positions.push(event));
+      if (!positions.length) {
+        ctx.fillStyle = '#4b5563';
+        ctx.font = '600 15px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText('Noch keine GNSS-Position vorhanden', width / 2, height / 2);
+        document.getElementById('trackInfo').textContent = 'Warte auf GNSS-Daten';
+        return;
+      }
+
+      const refLat = positions.reduce((sum, point) => sum + Number(point.latitude), 0) / positions.length;
+      const refLon = positions.reduce((sum, point) => sum + Number(point.longitude), 0) / positions.length;
+      const metersPerLat = 111320;
+      const metersPerLon = 111320 * Math.cos(refLat * Math.PI / 180);
+      const local = point => ({ x: (Number(point.longitude) - refLon) * metersPerLon, y: (Number(point.latitude) - refLat) * metersPerLat });
+      const localPositions = positions.map(local);
+      let minX = Math.min(...localPositions.map(point => point.x));
+      let maxX = Math.max(...localPositions.map(point => point.x));
+      let minY = Math.min(...localPositions.map(point => point.y));
+      let maxY = Math.max(...localPositions.map(point => point.y));
+      const minSpan = 60;
+      if (maxX - minX < minSpan) { const pad = (minSpan - maxX + minX) / 2; minX -= pad; maxX += pad; }
+      if (maxY - minY < minSpan) { const pad = (minSpan - maxY + minY) / 2; minY -= pad; maxY += pad; }
+      const margin = 30;
+      const scale = Math.min((width - margin * 2) / (maxX - minX), (height - margin * 2) / (maxY - minY));
+      const toCanvas = point => {
+        const value = local(point);
+        return { x: margin + (value.x - minX) * scale, y: height - margin - (value.y - minY) * scale };
+      };
+      const gridMeters = scale > 5 ? 10 : (scale > 1 ? 25 : 50);
+      ctx.strokeStyle = '#cbd5e1';
+      ctx.lineWidth = 1;
+      for (let x = Math.floor(minX / gridMeters) * gridMeters; x <= maxX; x += gridMeters) {
+        const px = margin + (x - minX) * scale;
+        ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, height); ctx.stroke();
+      }
+      for (let y = Math.floor(minY / gridMeters) * gridMeters; y <= maxY; y += gridMeters) {
+        const py = height - margin - (y - minY) * scale;
+        ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(width, py); ctx.stroke();
+      }
+
+      const route = data.points || [];
+      if (route.length > 1) {
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        route.forEach((point, index) => {
+          const pos = toCanvas(point);
+          if (index === 0) ctx.moveTo(pos.x, pos.y);
+          else ctx.lineTo(pos.x, pos.y);
+        });
+        ctx.stroke();
+      }
+      (data.events || []).forEach(event => {
+        const pos = toCanvas(event);
+        ctx.fillStyle = '#dc2626';
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, 6, 0, Math.PI * 2); ctx.fill();
+      });
+      if (data.current?.fix) {
+        const pos = toCanvas(data.current);
+        ctx.fillStyle = '#16a34a';
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, 7, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      }
+      ctx.fillStyle = '#111827';
+      ctx.font = '700 13px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText('N', width - 22, 22);
+      ctx.beginPath(); ctx.moveTo(width - 22, 28); ctx.lineTo(width - 28, 40); ctx.lineTo(width - 16, 40); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#111827';
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(18, height - 18); ctx.lineTo(18 + gridMeters * scale, height - 18); ctx.stroke();
+      ctx.fillStyle = '#111827';
+      ctx.textAlign = 'left';
+      ctx.font = '600 12px system-ui';
+      ctx.fillText(`${gridMeters} m`, 18, height - 24);
+      document.getElementById('trackInfo').textContent = `${route.length} Spurpunkte · ${(data.events || []).length} Sensor-Marker`;
+    }
+
     async function fetchWithTimeout(url, options = {}, timeoutMs = 2500) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1254,6 +1373,21 @@ String htmlPage() {
         });
       } finally {
         clearTimeout(timer);
+      }
+    }
+
+    async function refreshTrack() {
+      if (trackBusy || !pageActive) return;
+      trackBusy = true;
+      try {
+        const res = await fetchWithTimeout('/api/track');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        lastTrackData = await res.json();
+        drawTrack();
+      } catch (err) {
+        document.getElementById('trackInfo').textContent = 'Live-Fahrt nicht erreichbar';
+      } finally {
+        trackBusy = false;
       }
     }
 
@@ -1390,8 +1524,11 @@ String htmlPage() {
       }
     }, true);
     refresh();
+    refreshTrack();
+    window.addEventListener('resize', () => drawTrack());
     connectionTimer = setInterval(updateLastContact, 1000);
     setInterval(refresh, 1000);
+    setInterval(refreshTrack, 3000);
   </script>
 </body>
 </html>
@@ -1496,6 +1633,62 @@ void handleApiRecording() {
 
   String json;
   serializeJson(response, json);
+  server.send(200, "application/json", json);
+}
+
+void handleApiTrack() {
+  String json;
+  const uint16_t pointCount = min<uint16_t>(gpsLogCount, LIVE_TRACK_MAX_POINTS);
+  const uint16_t eventCount = min<uint16_t>(mainEventCount, LIVE_TRACK_MAX_EVENTS);
+  json.reserve(256 + pointCount * 64 + eventCount * 72);
+  json += "{\"current\":{\"fix\":";
+  json += gnss.fix ? "true" : "false";
+  json += ",\"latitude\":";
+  json += String(gnss.latitude, 7);
+  json += ",\"longitude\":";
+  json += String(gnss.longitude, 7);
+  json += ",\"main_mask\":";
+  json += static_cast<unsigned int>(mainSignalMask());
+  json += "},\"points\":[";
+
+  const uint16_t firstPoint = gpsLogCount - pointCount;
+  for (uint16_t i = 0; i < pointCount; i++) {
+    if (i > 0) {
+      json += ",";
+    }
+    const GpsLogEntry &entry = gpsLogAt(firstPoint + i);
+    json += "{\"latitude\":";
+    json += String(entry.latitude, 7);
+    json += ",\"longitude\":";
+    json += String(entry.longitude, 7);
+    json += ",\"main_mask\":";
+    json += static_cast<unsigned int>(entry.mainMask);
+    json += "}";
+  }
+
+  json += "],\"events\":[";
+  bool firstEvent = true;
+  const uint16_t firstEventIndex = mainEventCount - eventCount;
+  for (uint16_t i = 0; i < eventCount; i++) {
+    const MainSignalEvent &event = mainEventAt(firstEventIndex + i);
+    if (!event.detected || !event.hasGps) {
+      continue;
+    }
+    if (!firstEvent) {
+      json += ",";
+    }
+    firstEvent = false;
+    json += "{\"latitude\":";
+    json += String(event.latitude, 7);
+    json += ",\"longitude\":";
+    json += String(event.longitude, 7);
+    json += ",\"channel\":";
+    json += static_cast<unsigned int>(event.channel);
+    json += "}";
+  }
+
+  json += "]}";
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
@@ -1834,6 +2027,7 @@ void setup() {
   server.on("/api/channel-name", HTTP_POST, handleApiChannelName);
   server.on("/api/crop", HTTP_POST, handleApiCrop);
   server.on("/api/recording", HTTP_POST, handleApiRecording);
+  server.on("/api/track", HTTP_GET, handleApiTrack);
   server.on("/api/gps-log.csv", HTTP_GET, handleApiGpsLogCsv);
   server.on("/api/gps-log.geojson", HTTP_GET, handleApiGpsLogGeoJson);
   server.on("/api/main-events.csv", HTTP_GET, handleApiMainEventsCsv);
