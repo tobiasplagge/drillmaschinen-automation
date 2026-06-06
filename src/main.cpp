@@ -19,13 +19,28 @@ static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
 static const char *FIRMWARE_VERSION = "1.5.0";
 static const char *MODULE_ID = "M01";
+static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
+// Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
+// Häufige Varianten sind /ISAPI/Streaming/channels/101/httpPreview für Mainstream
+// oder /ISAPI/Streaming/channels/102/httpPreview für Substream.
+static const char *HIKVISION_CAMERA_STREAM_URL = "http://192.168.4.20/ISAPI/Streaming/channels/102/httpPreview";
+static const char *HIKVISION_CAMERA_NAME = "Hikvision Kamera";
 
 static constexpr uint8_t CHANNEL_COUNT = 8;
+static constexpr uint8_t SEED_CHANNEL_COUNT = 6;
+static constexpr uint8_t HIDDEN_CHANNEL = 7;
+static constexpr uint8_t ROTATION_CHANNEL = 8;
 static constexpr uint8_t CHANNEL_NAME_LENGTH = 24;
 static constexpr uint8_t CROP_NAME_LENGTH = 24;
 static constexpr uint8_t FIELD_NAME_LENGTH = 32;
 static constexpr uint8_t TRIP_ID_LENGTH = 48;
-static constexpr uint32_t MAIN_SIGNAL_HOLD_MS = 1500;
+static constexpr uint32_t DEFAULT_MAIN_SIGNAL_HOLD_MS = 1500;
+static constexpr uint32_t MIN_MAIN_SIGNAL_HOLD_MS = 300;
+static constexpr uint32_t MAX_MAIN_SIGNAL_HOLD_MS = 10000;
+static constexpr uint32_t SIGNAL_READY_TIMEOUT_MS = 10000;
+static constexpr uint32_t RED_SIGNAL_HOLD_MS = 15000;
+static constexpr uint32_t ROTATION_PULSE_TIMEOUT_MS = 3000;
+static constexpr uint8_t ROTATION_PULSES_PER_REV = 1;
 static constexpr uint32_t GPS_LOG_INTERVAL_MS = 3000;
 static constexpr uint32_t GNSS_POLL_INTERVAL_MS = 1000;
 static constexpr uint32_t GNSS_STALE_MS = 10000;
@@ -69,6 +84,7 @@ static constexpr uint8_t GNSS_MODBUS_FUNCTION_READ_HOLDING = 0x03;
 static constexpr bool DO_ACTIVE_HIGH = true;
 static constexpr bool INPUT_ACTIVE_HIGH = false;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
+static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
 
 WebServer server(80);
 Preferences preferences;
@@ -78,13 +94,18 @@ struct ChannelState {
   bool inputRaw = false;
   bool active = false;
   bool mainSignal = false;
+  bool latchedAlarm = false;
   bool output = false;
   const char *status = "none";
   uint32_t changes = 0;
+  uint32_t detectionCount = 0;
   uint32_t lastChangeMs = 0;
+  uint32_t lastDetectionMs = 0;
+  uint32_t pulseIntervalMs = 0;
   uint32_t activeSinceMs = 0;
   uint32_t mainSignalChanges = 0;
   uint32_t lastMainSignalChangeMs = 0;
+  uint8_t signalQualityPct = 0;
 };
 
 ChannelState channels[CHANNEL_COUNT];
@@ -163,7 +184,7 @@ char channelNames[CHANNEL_COUNT][CHANNEL_NAME_LENGTH] = {
     "Kanal 5",
     "Kanal 6",
     "Kanal 7",
-    "Kanal 8",
+    "Rotation",
 };
 char cropName[CROP_NAME_LENGTH] = "Weizen";
 char fieldName[FIELD_NAME_LENGTH] = "Feld";
@@ -172,9 +193,11 @@ char tripGpsPath[64] = "";
 char tripSensorPath[64] = "";
 char tripMetaPath[64] = "";
 uint8_t tcaOutputState = 0x00;
+bool doExpanderReady = false;
 uint32_t lastDebugMs = 0;
 uint32_t bootCounter = 0;
 uint32_t tripCounter = 0;
+uint32_t mainSignalHoldMs = DEFAULT_MAIN_SIGNAL_HOLD_MS;
 const char *resetReason = "unknown";
 bool filesystemReady = false;
 bool autoStartEnabled = true;
@@ -211,6 +234,31 @@ uint8_t sensorActiveStartMainMask[CHANNEL_COUNT] = {};
 
 void startRecording(const char *source);
 void stopRecording(const char *source);
+
+bool isSeedChannel(uint8_t channelIndex) {
+  return channelIndex < SEED_CHANNEL_COUNT;
+}
+
+bool isHiddenChannel(uint8_t channelIndex) {
+  return channelIndex == HIDDEN_CHANNEL - 1;
+}
+
+bool isRotationChannel(uint8_t channelIndex) {
+  return channelIndex == ROTATION_CHANNEL - 1;
+}
+
+bool rotationMoving(uint32_t now) {
+  const ChannelState &rotation = channels[ROTATION_CHANNEL - 1];
+  return rotation.lastDetectionMs > 0 && now - rotation.lastDetectionMs <= ROTATION_PULSE_TIMEOUT_MS;
+}
+
+float rotationRpm(uint32_t now) {
+  const ChannelState &rotation = channels[ROTATION_CHANNEL - 1];
+  if (!rotationMoving(now) || rotation.pulseIntervalMs == 0 || ROTATION_PULSES_PER_REV == 0) {
+    return 0.0f;
+  }
+  return 60000.0f / (static_cast<float>(rotation.pulseIntervalMs) * static_cast<float>(ROTATION_PULSES_PER_REV));
+}
 
 uint8_t liveSignalMask() {
   uint8_t mask = 0;
@@ -360,6 +408,11 @@ void loadFieldName() {
   sanitizeFieldName(fieldName);
 }
 
+void loadSensitivity() {
+  mainSignalHoldMs = preferences.getUInt("hold_ms", DEFAULT_MAIN_SIGNAL_HOLD_MS);
+  mainSignalHoldMs = constrain(mainSignalHoldMs, MIN_MAIN_SIGNAL_HOLD_MS, MAX_MAIN_SIGNAL_HOLD_MS);
+}
+
 bool saveChannelName(uint8_t channelIndex, const String &name) {
   if (channelIndex >= CHANNEL_COUNT) {
     return false;
@@ -384,6 +437,11 @@ void saveFieldName(const String &name) {
   name.toCharArray(fieldName, FIELD_NAME_LENGTH);
   sanitizeFieldName(fieldName);
   preferences.putString("field", fieldName);
+}
+
+void saveSensitivity(uint32_t holdMs) {
+  mainSignalHoldMs = constrain(holdMs, MIN_MAIN_SIGNAL_HOLD_MS, MAX_MAIN_SIGNAL_HOLD_MS);
+  preferences.putUInt("hold_ms", mainSignalHoldMs);
 }
 
 void initGpsLog() {
@@ -1011,7 +1069,10 @@ bool setDigitalOutput(uint8_t channelIndex, bool on) {
   }
 
   const bool ok = tcaWrite(TCA9554_OUTPUT_REG, tcaOutputState);
-  channels[channelIndex].output = on;
+  doExpanderReady = ok;
+  if (ok) {
+    channels[channelIndex].output = on;
+  }
   return ok;
 }
 
@@ -1024,7 +1085,8 @@ void initDigitalOutputs() {
   tcaWrite(TCA9554_CONFIG_REG, 0x00); // all 8 expander pins as outputs
 
   uint8_t readback = 0;
-  if (tcaRead(TCA9554_OUTPUT_REG, readback)) {
+  doExpanderReady = tcaRead(TCA9554_OUTPUT_REG, readback);
+  if (doExpanderReady) {
     Serial.printf("TCA9554 DO expander ok, output register=0x%02X\n", readback);
   } else {
     Serial.println("WARNUNG: TCA9554 DO expander nicht erreichbar");
@@ -1037,6 +1099,8 @@ void initDigitalInputs() {
     channels[i].inputRaw = digitalRead(DI_PINS[i]) == HIGH;
     channels[i].active = INPUT_ACTIVE_HIGH ? channels[i].inputRaw : !channels[i].inputRaw;
     channels[i].activeSinceMs = channels[i].active ? millis() : 0;
+    channels[i].lastDetectionMs = channels[i].active ? millis() : 0;
+    channels[i].signalQualityPct = channels[i].active ? 1 : 0;
     channels[i].mainSignal = false;
     channels[i].status = "none";
   }
@@ -1051,6 +1115,13 @@ void readDigitalInputs() {
 
     if (active != channels[i].active) {
       channels[i].changes++;
+      if (active) {
+        if (channels[i].lastDetectionMs > 0) {
+          channels[i].pulseIntervalMs = now - channels[i].lastDetectionMs;
+        }
+        channels[i].detectionCount++;
+        channels[i].lastDetectionMs = now;
+      }
       channels[i].lastChangeMs = now;
       channels[i].activeSinceMs = active ? now : 0;
     }
@@ -1058,13 +1129,21 @@ void readDigitalInputs() {
     channels[i].inputRaw = raw;
     channels[i].active = active;
 
-    const bool mainSignal = active && channels[i].activeSinceMs > 0 && (now - channels[i].activeSinceMs >= MAIN_SIGNAL_HOLD_MS);
+    const bool seedChannel = isSeedChannel(i);
+    const bool mainSignal = seedChannel && active && channels[i].activeSinceMs > 0 && (now - channels[i].activeSinceMs >= RED_SIGNAL_HOLD_MS);
+    if (seedChannel && active) {
+      const uint32_t activeMs = channels[i].activeSinceMs > 0 ? now - channels[i].activeSinceMs : 0;
+      channels[i].signalQualityPct = static_cast<uint8_t>(constrain((activeMs * 100UL) / max<uint32_t>(mainSignalHoldMs, 1), 1UL, 100UL));
+    } else if (channels[i].lastDetectionMs == 0 || now - channels[i].lastDetectionMs > SIGNAL_READY_TIMEOUT_MS) {
+      channels[i].signalQualityPct = 0;
+    }
     if (mainSignal != channels[i].mainSignal) {
       channels[i].mainSignal = mainSignal;
       channels[i].mainSignalChanges++;
       channels[i].lastMainSignalChangeMs = now;
       appendMainSignalEvent(i, mainSignal);
       if (mainSignal) {
+        channels[i].latchedAlarm = true;
         startSensorTriggerEvent(i);
       } else {
         finishSensorTriggerEvent(i);
@@ -1072,17 +1151,20 @@ void readDigitalInputs() {
     } else {
       channels[i].mainSignal = mainSignal;
     }
-    channels[i].status = mainSignal ? "red" : "none";
+    channels[i].status = isRotationChannel(i) ? (rotationMoving(now) ? "rotating" : "stopped") : (mainSignal ? "red" : "none");
 
-    const bool outputOn = MIRROR_RED_TO_OUTPUT && mainSignal;
-    if (channels[i].output != outputOn) {
-      setDigitalOutput(i, outputOn);
+    if (seedChannel && i != LIGHT_OUTPUT_CHANNEL - 1) {
+      const bool outputOn = MIRROR_RED_TO_OUTPUT && mainSignal;
+      if (channels[i].output != outputOn) {
+        setDigitalOutput(i, outputOn);
+      }
     }
   }
 }
 
 String statusJson() {
   JsonDocument doc;
+  const uint32_t now = millis();
   doc["device_id"] = DEVICE_ID;
   doc["device_name"] = DEVICE_NAME;
   doc["firmware_version"] = FIRMWARE_VERSION;
@@ -1097,17 +1179,24 @@ String statusJson() {
   doc["filesystem_total_bytes"] = filesystemReady ? LittleFS.totalBytes() : 0;
   doc["boot_counter"] = bootCounter;
   doc["reset_reason"] = resetReason;
-  doc["uptime_ms"] = millis();
+  doc["uptime_ms"] = now;
   doc["wifi_ap_ssid"] = AP_SSID;
   doc["ip"] = WiFi.softAPIP().toString();
   doc["web_url"] = "http://" + WiFi.softAPIP().toString() + "/";
-  doc["main_signal_hold_ms"] = MAIN_SIGNAL_HOLD_MS;
+  doc["main_signal_hold_ms"] = mainSignalHoldMs;
+  doc["quality_signal_hold_ms"] = mainSignalHoldMs;
+  doc["red_signal_hold_ms"] = RED_SIGNAL_HOLD_MS;
+  doc["light_channel"] = LIGHT_OUTPUT_CHANNEL;
+  doc["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
+  doc["light_switchable"] = doExpanderReady;
+  doc["camera_name"] = HIKVISION_CAMERA_NAME;
+  doc["camera_stream_url"] = HIKVISION_CAMERA_STREAM_URL;
   doc["gps_log_interval_ms"] = GPS_LOG_INTERVAL_MS;
   doc["recording_active"] = recordingActive;
   doc["gps_log_count"] = gpsLogCount;
   doc["gps_log_total"] = gpsLogTotal;
   doc["gps_log_capacity"] = gpsLogCapacity;
-  doc["last_gps_log_age_ms"] = lastGpsLogMs > 0 ? static_cast<int32_t>(millis() - lastGpsLogMs) : -1;
+  doc["last_gps_log_age_ms"] = lastGpsLogMs > 0 ? static_cast<int32_t>(now - lastGpsLogMs) : -1;
   doc["main_event_count"] = mainEventCount;
   doc["main_event_total"] = mainEventTotal;
   doc["main_event_capacity"] = MAIN_EVENT_LOG_CAPACITY;
@@ -1131,7 +1220,7 @@ String statusJson() {
   gnssJson["speed_mps"] = gnss.speedMps;
   gnssJson["heading_deg"] = gnss.headingDeg;
   gnssJson["satellites"] = gnss.satellites;
-  gnssJson["last_fix_age_ms"] = gnss.lastFixMs > 0 ? static_cast<int32_t>(millis() - gnss.lastFixMs) : -1;
+  gnssJson["last_fix_age_ms"] = gnss.lastFixMs > 0 ? static_cast<int32_t>(now - gnss.lastFixMs) : -1;
   gnssJson["poll_count"] = gnss.pollCount;
   gnssJson["ok_count"] = gnss.okCount;
   gnssJson["error_count"] = gnss.errorCount;
@@ -1151,20 +1240,39 @@ String statusJson() {
     module["prepared"] = i != 1;
   }
 
+  JsonObject rotationJson = doc["rotation"].to<JsonObject>();
+  rotationJson["channel"] = ROTATION_CHANNEL;
+  rotationJson["status"] = rotationMoving(now) ? "Dreht" : "Dreht nicht";
+  rotationJson["moving"] = rotationMoving(now);
+  rotationJson["rpm"] = rotationRpm(now);
+  rotationJson["pulse_count"] = channels[ROTATION_CHANNEL - 1].detectionCount;
+  rotationJson["pulse_interval_ms"] = channels[ROTATION_CHANNEL - 1].pulseIntervalMs;
+  rotationJson["last_pulse_age_ms"] = channels[ROTATION_CHANNEL - 1].lastDetectionMs > 0 ? static_cast<int32_t>(now - channels[ROTATION_CHANNEL - 1].lastDetectionMs) : -1;
+  rotationJson["timeout_ms"] = ROTATION_PULSE_TIMEOUT_MS;
+
   JsonArray array = doc["channels"].to<JsonArray>();
-  const uint32_t now = millis();
   for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
     JsonObject ch = array.add<JsonObject>();
     ch["channel"] = i + 1;
     ch["name"] = channelNames[i];
+    ch["hidden"] = isHiddenChannel(i);
+    ch["seed_channel"] = isSeedChannel(i);
+    ch["rotation_channel"] = isRotationChannel(i);
     ch["di_gpio"] = DI_PINS[i];
     ch["input_raw"] = channels[i].inputRaw;
     ch["active"] = channels[i].active;
     ch["live_active"] = channels[i].active;
     ch["main_signal"] = channels[i].mainSignal;
+    ch["latched_alarm"] = channels[i].latchedAlarm;
     ch["status"] = channels[i].status;
     ch["output"] = channels[i].output;
     ch["changes"] = channels[i].changes;
+    ch["detection_count"] = channels[i].detectionCount;
+    ch["pulse_interval_ms"] = channels[i].pulseIntervalMs;
+    ch["rotation_moving"] = isRotationChannel(i) ? rotationMoving(now) : false;
+    ch["rotation_rpm"] = isRotationChannel(i) ? rotationRpm(now) : 0.0f;
+    ch["signal_quality_pct"] = channels[i].signalQualityPct;
+    ch["last_detection_age_ms"] = channels[i].lastDetectionMs > 0 ? static_cast<int32_t>(now - channels[i].lastDetectionMs) : -1;
     ch["active_ms"] = channels[i].activeSinceMs > 0 && channels[i].active ? static_cast<int32_t>(now - channels[i].activeSinceMs) : 0;
     ch["main_signal_changes"] = channels[i].mainSignalChanges;
     ch["last_change_age_ms"] = channels[i].lastChangeMs > 0 ? static_cast<int32_t>(now - channels[i].lastChangeMs) : -1;
@@ -1199,6 +1307,26 @@ String htmlPage() {
     .connection.stale .connection-dot { background: #facc15; box-shadow: 0 0 10px #facc15; }
     .warning { border: 1px solid #f59e0b; border-radius: 6px; background: #78350f; color: #fef3c7; padding: 10px 12px; margin-bottom: 14px; font-weight: 750; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+    .bar-grid { display: grid; grid-template-columns: repeat(8, minmax(72px, 1fr)); gap: 10px; }
+    .bar-card { min-width: 0; border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 10px; display: grid; justify-items: center; gap: 8px; }
+    .bar-card.latched { border-color: #ef4444; box-shadow: 0 0 0 2px rgba(239,68,68,.85), 0 0 18px rgba(239,68,68,.45); }
+    .bar-label { width: 100%; min-height: 2.8em; color: #f9fafb; font-weight: 800; font-size: .86rem; text-align: center; overflow-wrap: anywhere; display: flex; align-items: center; justify-content: center; }
+    .bar-channel { color: #9ca3af; font-size: .78rem; }
+    .status-bar { position: relative; overflow: hidden; width: min(100%, 42px); height: clamp(140px, 34vh, 360px); border-radius: 6px; background: #f59e0b; border: 1px solid rgba(255,255,255,.18); box-shadow: inset 0 0 0 1px rgba(17,24,39,.45), 0 0 16px rgba(245,158,11,.45); }
+    .status-bar.signal { background: #f9fafb; box-shadow: inset 0 0 0 1px rgba(17,24,39,.35), 0 0 18px rgba(249,250,251,.55); }
+    .status-bar.stopped { background: #991b1b; box-shadow: inset 0 0 0 1px rgba(17,24,39,.35), 0 0 18px rgba(239,68,68,.55); }
+    .bar-fill { position: absolute; inset: auto 0 0; height: var(--level, 0%); min-height: 0; background: #22c55e; box-shadow: 0 0 20px rgba(34,197,94,.8); transition: height .2s ease, background .2s ease; }
+    .bar-fill.red { height: 100%; background: #ef4444; box-shadow: 0 0 24px rgba(239,68,68,.9); }
+    .bar-fill.yellow { background: #84cc16; box-shadow: 0 0 18px rgba(132,204,22,.75); }
+    .status-text { font-size: .8rem; font-weight: 800; color: #d1d5db; text-align: center; min-height: 1.2em; }
+    .rotation-line { color: #9ca3af; font-size: .76rem; font-weight: 750; text-align: center; min-height: 1.2em; }
+    .rotation-line.on { color: #bbf7d0; }
+    .rotation-line.off { color: #fecaca; }
+    .camera-panel { margin-top: 14px; }
+    .camera-panel summary { cursor: pointer; font-weight: 850; color: #f9fafb; }
+    .camera-frame { margin-top: 12px; border: 1px solid #374151; border-radius: 8px; overflow: hidden; background: #020617; aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center; }
+    .camera-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .camera-meta { margin-top: 8px; color: #9ca3af; font-size: .86rem; overflow-wrap: anywhere; }
     .card { min-width: 0; border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; }
     .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .name { min-width: 0; font-weight: 800; font-size: 1.08rem; overflow-wrap: anywhere; }
@@ -1209,6 +1337,10 @@ String htmlPage() {
     .dot.green { background: #22c55e; box-shadow: 0 0 20px #22c55e; }
     .dot.yellow { background: #facc15; box-shadow: 0 0 16px #facc15; }
     .dot.none { background: #facc15; }
+    .pillar { width: 20px; height: 64px; border-radius: 6px; background: #facc15; box-shadow: 0 0 10px #facc15; display: inline-block; margin-right: 12px; }
+    .pillar.red { background: #ef4444; box-shadow: 0 0 16px #ef4444; }
+    .pillar.green { background: #16a34a; box-shadow: 0 0 16px #16a34a; }
+    .pillar.yellow { background: #facc15; box-shadow: 0 0 12px #facc15; }
     .pill { display: inline-block; min-width: 44px; padding: 2px 7px; border-radius: 999px; background: #374151; color: #d1d5db; font-size: .82rem; font-weight: 800; text-align: center; }
     .pill.on { background: #16a34a; color: #f0fdf4; }
     .pill.main { background: #dc2626; color: #fef2f2; }
@@ -1221,9 +1353,18 @@ String htmlPage() {
     .tools-details { margin-top: 12px; }
     .archive-list { margin-top: 10px; display: grid; gap: 6px; font-size: .88rem; }
     .archive-list a { color: #bfdbfe; overflow-wrap: anywhere; }
+    .crop-chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+    .crop-chip { background: #374151; color: #f9fafb; padding: 7px 10px; border-radius: 6px; }
+    .crop-chip.active { background: #16a34a; }
+    .suggestion-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 5px 0; }
     .module-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
     .module { border: 1px solid #4b5563; border-radius: 6px; padding: 9px; color: #9ca3af; }
     .module.online { border-color: #16a34a; color: #dcfce7; }
+    .settings-only { display: none; }
+    .settings-active .settings-only { display: block; }
+    .sensor-table { display: grid; gap: 8px; }
+    .sensor-row { display: grid; grid-template-columns: minmax(100px, 1fr) repeat(5, minmax(70px, auto)); gap: 8px; align-items: center; border: 1px solid #374151; border-radius: 6px; padding: 8px; color: #d1d5db; font-size: .88rem; }
+    .sensor-row strong { color: #f9fafb; overflow-wrap: anywhere; }
     .field-row { display: grid; grid-template-columns: minmax(130px, 1fr) auto; gap: 8px; margin-bottom: 12px; }
     input, select { min-width: 0; height: 40px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #f9fafb; padding: 0 10px; font: inherit; }
     button, .link-button { border: 0; border-radius: 6px; background: #2563eb; color: white; padding: 9px 12px; font: inherit; font-weight: 750; text-decoration: none; cursor: pointer; }
@@ -1236,9 +1377,13 @@ String htmlPage() {
     .track-wrap { position: relative; overflow: hidden; min-height: 280px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
     #trackCanvas { display: block; width: 100%; height: 360px; }
     #topoMap { width: 100%; height: 520px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
-    .tabs { display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
     .tab-button { background: #374151; }
     .tab-button.active { background: #2563eb; }
+    .nav-action { background: #4b5563; }
+    .nav-action.light-on { background: #16a34a; color: #f0fdf4; }
+    .nav-action.light-off { background: #991b1b; color: #fef2f2; }
+    .nav-action.light-unknown { background: #f59e0b; color: #111827; }
     .hidden { display: none !important; }
     .map-status { margin: 0 0 10px; color: #d1d5db; font-size: .9rem; }
     .track-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; color: #d1d5db; font-size: .88rem; }
@@ -1255,13 +1400,16 @@ String htmlPage() {
     @media (max-width: 520px) {
       main { width: min(100% - 20px, 1100px); padding-top: 16px; }
       .grid { grid-template-columns: 1fr; }
+      .bar-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .status-bar { width: 34px; height: 180px; }
+      .bar-label { font-size: .78rem; }
       .field-row { grid-template-columns: 1fr; }
       .connection { display: grid; grid-template-columns: 1fr 1fr; }
-      .connection > span:last-child { grid-column: 1 / -1; }
       .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .actions > * { display: flex; min-width: 0; width: 100%; align-items: center; justify-content: center; overflow-wrap: anywhere; text-align: center; }
       .gps-meta { grid-template-columns: 1fr; }
       .module-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .sensor-row { grid-template-columns: 1fr 1fr; }
       #topoMap, #trackCanvas { height: 430px; }
     }
   </style>
@@ -1272,23 +1420,23 @@ String htmlPage() {
     <div class="meta">
       <span id="ip">IP: -</span> · <span id="version">Version: -</span> · <span id="updated">-</span>
     </div>
+    <div id="debugOverlay" class="warning hidden" style="display:none;margin-bottom:10px;font-size:.9rem;"></div>
     <div id="connection" class="connection">
-      <span><span class="connection-dot"></span><strong id="connectionState">Verbunden</strong></span>
-      <span>Letzter Kontakt: <strong id="lastContact">-</strong></span>
+      <span>Kontakt: <span class="connection-dot"></span><strong id="connectionState">OK</strong></span>
       <span>ESP Temperatur: <strong id="espTemp">-</strong></span>
     </div>
     <div id="gnssWarning" class="warning hidden"></div>
     <nav class="tabs" aria-label="Ansicht">
       <button id="monitoringTab" class="tab-button active" type="button">Überwachung</button>
       <button id="mapTab" class="tab-button" type="button">Karte</button>
+      <button id="lightOn" class="nav-action light-unknown" type="button">Licht</button>
+      <button id="alarmAck" class="nav-action secondary" type="button">Alarm quittieren</button>
+      <button id="settingsTab" class="tab-button" type="button">Einstellungen</button>
     </nav>
-    <section class="panel monitoring-view">
-      <h2>Fahrtaufzeichnung</h2>
+    <section class="panel settings-only">
+      <h2>Überblick</h2>
       <div class="actions">
-        <button id="gpsStart" type="button">Aufzeichnen</button>
-        <button id="gpsStop" class="secondary" type="button" disabled>Aufzeichnung Stop</button>
         <button id="alarmEnable" class="secondary" type="button">Ton aktivieren</button>
-        <button id="alarmAck" class="secondary" type="button">Alarm quittieren</button>
       </div>
       <details class="tools-details">
         <summary>Dateien und Wartung</summary>
@@ -1306,20 +1454,10 @@ String htmlPage() {
         <div id="archiveList" class="archive-list"></div>
       </details>
       <div class="gps-meta">
-        <div>Aufzeichnung: <strong id="gpsStatus">Aus</strong></div>
-        <div>Fahrt-ID: <strong id="tripId">-</strong></div>
-        <div>GNSS Fix: <strong id="gnssFix">-</strong></div>
-        <div>GNSS Quelle: <strong id="gnssSource">-</strong></div>
+        <div>Sensor-Status: <strong id="sensorStatus">-</strong></div>
+        <div>Letzter Kontakt: <strong id="lastContactMini">-</strong></div>
+        <div>GPS-Signal: <strong id="gnssFix">-</strong></div>
         <div>Alarm: <strong id="alarmStatus">Aus</strong></div>
-        <div>Punkte: <strong id="gpsCount">0</strong></div>
-        <div>Hauptsignal-Log: <strong id="mainEventCount">0</strong></div>
-        <div>Sensorlog: <strong id="sensorEventCount">0</strong></div>
-        <div>Letzter Punkt: <strong id="gpsLast">-</strong></div>
-        <div>Position: <strong id="gpsPosition">-</strong></div>
-        <div>Genauigkeit: <strong id="gpsAccuracy">-</strong></div>
-        <div>Satelliten: <strong id="gpsSatellites">-</strong></div>
-        <div>RS485: <strong id="gnssRs485">-</strong></div>
-        <div>Flash-Archiv: <strong id="filesystem">-</strong></div>
       </div>
     </section>
     <section id="mapView" class="panel hidden">
@@ -1337,7 +1475,7 @@ String htmlPage() {
         <span id="trackInfo">Warte auf GNSS-Daten</span>
       </div>
     </section>
-    <section class="panel monitoring-view">
+    <section class="panel settings-only">
       <h2>Saat</h2>
       <div class="field-row">
         <input id="fieldInput" maxlength="31" value="Feld" placeholder="Feldname">
@@ -1345,28 +1483,91 @@ String htmlPage() {
       </div>
       <div class="field-row">
         <input id="cropInput" list="cropSuggestions" maxlength="23" value="Weizen">
-        <datalist id="cropSuggestions">
-          <option value="Weizen"></option>
-          <option value="Gerste"></option>
-          <option value="Raps"></option>
-          <option value="Senf"></option>
-          <option value="Mais"></option>
-          <option value="Gras"></option>
-          <option value="Kleegras"></option>
-          <option value="Zwischenfrucht"></option>
-        </datalist>
+        <datalist id="cropSuggestions"></datalist>
         <button id="cropSave" type="button">Speichern</button>
       </div>
+      <div id="cropQuickList" class="crop-chip-row"></div>
       <div class="gps-meta">
         <div>Aktuell: <strong id="cropCurrent">-</strong></div>
         <div>Feld: <strong id="fieldCurrent">-</strong></div>
       </div>
     </section>
-    <section class="panel monitoring-view">
+    <section id="settingsView" class="panel hidden">
+      <h2>Fehleranalyse & Einstellungen</h2>
+      <div class="settings-only">
+        <h3>Kanaldetails</h3>
+        <div id="sensorDetailsGrid" class="sensor-table"></div>
+      </div>
+      <div class="field-row">
+        <div style="min-width:0;">
+          <h3>Empfindlichkeit</h3>
+          <div class="field-row">
+            <input id="sensitivityInput" type="number" min="300" max="10000" step="100" value="1500">
+            <button id="sensitivitySave" type="button">Speichern</button>
+          </div>
+          <div class="gps-meta">
+            <div>Signalpegel 100 % bei: <strong id="sensitivityCurrent">-</strong></div>
+            <div>Rot/Alarm ab: <strong id="redSignalCurrent">-</strong></div>
+          </div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div style="min-width:0;">
+          <h3>GNSS Diagnose</h3>
+          <pre id="gnssDebug" style="white-space:pre-wrap; font-size:.85rem; color:#d1d5db;"></pre>
+        </div>
+      </div>
+      <div class="field-row">
+        <div style="min-width:0;">
+          <h3>Saat-Vorschläge verwalten</h3>
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
+            <input id="cropAddInput" placeholder="Neue Saat hinzufügen" style="flex:1; height:36px;" />
+            <button id="cropAddBtn" class="secondary" type="button">Hinzufügen</button>
+          </div>
+          <div id="cropSuggestionsList" style="color:#d1d5db;font-size:.95rem;"></div>
+        </div>
+      </div>
+      <details>
+        <summary>Dateien und Logs</summary>
+        <div class="actions">
+          <a class="link-button secondary" href="/api/gps-log.csv">CSV</a>
+          <a class="link-button secondary" href="/api/gps-log.geojson">GeoJSON</a>
+          <a class="link-button secondary" href="/api/combined.geojson">Route + Sensoren</a>
+          <a class="link-button secondary" href="/api/main-events.csv">Hauptsignale CSV</a>
+          <a class="link-button secondary" href="/api/sensor-events.csv">Sensorlog CSV</a>
+          <a class="link-button secondary" href="/api/sensor-events.txt">Sensorlog TXT</a>
+          <a class="link-button secondary" href="/api/system-events.log">Neustart-Log</a>
+        </div>
+      </details>
+    </section>
+    <section class="panel settings-only">
       <h2>Module</h2>
       <div id="modules" class="module-grid"></div>
     </section>
-    <div id="grid" class="grid monitoring-view"></div>
+    <div class="hidden" aria-hidden="true">
+      <button id="gpsStart" type="button">Aufzeichnen</button>
+      <button id="gpsStop" type="button">Aufzeichnung Stop</button>
+      <span id="gpsStatus"></span>
+      <span id="tripId"></span>
+      <span id="gnssSource"></span>
+      <span id="gpsCount"></span>
+      <span id="mainEventCount"></span>
+      <span id="sensorEventCount"></span>
+      <span id="gpsLast"></span>
+      <span id="gpsPosition"></span>
+      <span id="gpsAccuracy"></span>
+      <span id="gpsSatellites"></span>
+      <span id="gnssRs485"></span>
+      <span id="filesystem"></span>
+    </div>
+    <div id="grid" class="bar-grid monitoring-view"></div>
+    <details id="cameraPanel" class="panel monitoring-view camera-panel">
+      <summary><span id="cameraTitle">Hikvision Kamera</span></summary>
+      <div class="camera-frame">
+        <img id="cameraImage" alt="Kamerabild" loading="lazy">
+      </div>
+      <div id="cameraUrl" class="camera-meta">Kamera noch nicht geladen.</div>
+    </details>
     <div id="error" class="error"></div>
   </main>
   <script>
@@ -1388,6 +1589,9 @@ String htmlPage() {
     let lastSuccessfulContactMs = 0;
     let connectionTimer = null;
     let renderingGrid = false;
+    let lightOnState = false;
+    let lightSwitchable = false;
+    let cameraStreamUrl = '';
     let trackBusy = false;
     let lastTrackData = { points: [], events: [], current: null };
     let topoMap = null;
@@ -1400,44 +1604,85 @@ String htmlPage() {
     const openDetailChannels = new Set();
 
     function escapeHtml(value) {
-      return String(value ?? '').replace(/[&<>"']/g, c => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-      }[c]));
+      var safe = (value !== undefined && value !== null) ? String(value) : '';
+      return safe.replace(/[&<>"']/g, function(c) {
+        return ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'})[c];
+      });
     }
 
-    function card(ch) {
+    function visibleChannels(channels) {
+      return (channels || []).filter(ch => !ch.hidden && ch.channel !== 7);
+    }
+
+    function formatRpm(value) {
+      const rpm = Number(value || 0);
+      if (!Number.isFinite(rpm) || rpm <= 0) return '0 U/min';
+      return rpm >= 10 ? rpm.toFixed(0) + ' U/min' : rpm.toFixed(1) + ' U/min';
+    }
+
+    function card(ch, rotation) {
+      if (ch.rotation_channel) {
+        const name = escapeHtml(ch.name || 'Rotation');
+        const moving = Boolean(rotation && rotation.moving);
+        const rpm = formatRpm(rotation ? rotation.rpm : ch.rotation_rpm);
+        return `
+          <div class="bar-card" data-channel="${ch.channel}" aria-label="${name}: ${moving ? 'Dreht' : 'Dreht nicht'}">
+            <div class="bar-channel">K${ch.channel}</div>
+            <div class="status-bar ${moving ? 'signal' : 'stopped'}" aria-hidden="true">
+              <div class="bar-fill" style="--level:${moving ? 100 : 0}%"></div>
+            </div>
+            <div class="bar-label">${name}</div>
+            <div class="status-text">${moving ? 'Dreht' : 'Dreht nicht'}</div>
+            <div class="rotation-line ${moving ? 'on' : 'off'}">${rpm}</div>
+          </div>`;
+      }
+
       const name = escapeHtml(ch.name || ('Kanal ' + ch.channel));
-      const detailsOpen = openDetailChannels.has(String(ch.channel)) ? ' open' : '';
+      const rotationMoving = Boolean(rotation && rotation.moving);
+      const rotationText = rotationMoving ? `Dreht · ${formatRpm(rotation.rpm)}` : 'Dreht nicht';
+      const quality = Math.max(0, Math.min(100, Number(ch.signal_quality_pct || 0)));
+      const recentlyDetected = quality > 0;
+      const level = ch.main_signal ? 100 : quality;
       const view = ch.main_signal
-        ? { label: 'Erkannt', pill: 'main', dot: 'red' }
-        : (ch.live_active
-          ? { label: 'Kein Status', pill: 'pending', dot: 'yellow' }
-          : { label: 'OK', pill: 'ok', dot: 'green' });
+        ? { label: 'Dauersignal', fill: 'red' }
+        : (recentlyDetected
+          ? { label: level + ' %', fill: level >= 70 ? 'yellow' : '' }
+          : { label: 'Bereit', fill: '' });
+      const alarmClass = ch.latched_alarm ? ' latched' : '';
       return `
-        <div class="card" data-channel="${ch.channel}">
-          <div class="top">
-            <div>
-              <div class="name">${name}</div>
-              <div class="channel">Kanal ${ch.channel}</div>
-            </div>
-            <div class="main-state">
-              <span class="pill ${view.pill}">${view.label}</span>
-              <div class="dot ${view.dot}"></div>
-            </div>
+        <div class="bar-card${alarmClass}" data-channel="${ch.channel}" aria-label="${name}: ${view.label}">
+          <div class="bar-channel">K${ch.channel}</div>
+          <div class="status-bar ${recentlyDetected || ch.main_signal ? 'signal' : ''}" aria-hidden="true">
+            <div class="bar-fill ${view.fill}" style="--level:${level}%"></div>
           </div>
-          <details${detailsOpen}>
-            <summary>Details</summary>
-            <dl>
-              <dt>Live Signal</dt><dd><span class="pill ${ch.live_active ? 'on' : ''}">${ch.live_active ? 'JA' : 'NEIN'}</span></dd>
-              <dt>Live Zeit</dt><dd>${ch.active_ms || 0} ms</dd>
-              <dt>DI Rohwert</dt><dd>${ch.input_raw ? 'HIGH' : 'LOW'}</dd>
-              <dt>DI GPIO</dt><dd>${ch.di_gpio}</dd>
-              <dt>Output</dt><dd>${ch.output ? 'Ein' : 'Aus'}</dd>
-              <dt>Live Wechsel</dt><dd>${ch.changes}</dd>
-              <dt>Haupt Wechsel</dt><dd>${ch.main_signal_changes}</dd>
-            </dl>
-          </details>
+          <div class="bar-label">${name}</div>
+          <div class="status-text">${view.label}</div>
+          <div class="rotation-line ${rotationMoving ? 'on' : 'off'}">${rotationText}</div>
         </div>`;
+    }
+
+    function sensorDetails(channels) {
+      return visibleChannels(channels).map(ch => `
+        <div class="sensor-row">
+          <strong>${escapeHtml(ch.name || ('Kanal ' + ch.channel))}</strong>
+          <span>Kanal ${ch.channel}</span>
+          <span>Status: ${ch.rotation_channel ? (ch.rotation_moving ? 'Dreht' : 'Dreht nicht') : (ch.main_signal ? 'Dauersignal' : (ch.live_active ? 'Saat erkannt' : 'Bereit'))}</span>
+          <span>Detektionen: ${ch.detection_count || 0}</span>
+          <span>Drehzahl: ${ch.rotation_channel ? formatRpm(ch.rotation_rpm) : '-'}</span>
+          <span>Qualität: ${ch.signal_quality_pct || 0} %</span>
+          <span>Letzte Detektion: ${ch.last_detection_age_ms >= 0 ? ch.last_detection_age_ms + ' ms' : '-'}</span>
+          <span>Live: ${ch.live_active ? 'JA' : 'NEIN'}</span>
+          <span>Livezeit: ${ch.active_ms || 0} ms</span>
+          <span>Haupt: ${ch.main_signal ? 'Erkannt' : 'OK'}</span>
+          <span>Quittierung: ${ch.latched_alarm ? 'offen' : 'OK'}</span>
+          <span>DI ${ch.di_gpio}: ${ch.input_raw ? 'HIGH' : 'LOW'}</span>
+          <span>Output: ${ch.output ? 'Ein' : 'Aus'}</span>
+          <span>Livewechsel: ${ch.changes || 0}</span>
+          <span>Hauptwechsel: ${ch.main_signal_changes || 0}</span>
+          <span>Letzter Livewechsel: ${ch.last_change_age_ms >= 0 ? ch.last_change_age_ms + ' ms' : '-'}</span>
+          <span>Letzter Hauptwechsel: ${ch.last_main_signal_change_age_ms >= 0 ? ch.last_main_signal_change_age_ms + ' ms' : '-'}</span>
+        </div>
+      `).join('');
     }
 
     function playConfirmTone() {
@@ -1516,6 +1761,35 @@ String htmlPage() {
       }
     }
 
+    function updateLightButton() {
+      const button = document.getElementById('lightOn');
+      button.textContent = 'Licht';
+      button.classList.remove('light-on', 'light-off', 'light-unknown');
+      if (!lightSwitchable) {
+        button.classList.add('light-unknown');
+        button.title = 'Lichtausgang nicht schaltbar';
+      } else if (lightOnState) {
+        button.classList.add('light-on');
+        button.title = 'Licht ist eingeschaltet';
+      } else {
+        button.classList.add('light-off');
+        button.title = 'Licht ist ausgeschaltet';
+      }
+    }
+
+    function updateCamera(data) {
+      cameraStreamUrl = data.camera_stream_url || '';
+      document.getElementById('cameraTitle').textContent = data.camera_name || 'Kamera';
+      document.getElementById('cameraUrl').textContent = cameraStreamUrl || 'Keine Kamera-URL konfiguriert.';
+      const panel = document.getElementById('cameraPanel');
+      const image = document.getElementById('cameraImage');
+      if (panel.open && cameraStreamUrl && image.src !== cameraStreamUrl) {
+        image.src = cameraStreamUrl;
+      } else if (!panel.open && image.src) {
+        image.removeAttribute('src');
+      }
+    }
+
     async function enableAlarm() {
       audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
       if (audioContext.state === 'suspended') {
@@ -1528,18 +1802,36 @@ String htmlPage() {
       updateAlarmStatus();
     }
 
-    function acknowledgeAlarm() {
+    async function acknowledgeAlarm() {
+      if (!alarmEnabled) {
+        try {
+          await enableAlarm();
+        } catch (err) {
+          showDebug('Tonfreigabe fehlgeschlagen: ' + err.message);
+        }
+      }
       acknowledgedMainMask = currentMainMask;
       acknowledgedSystemWarning = systemWarningActive;
       stopPulsingAlarm();
       updateAlarmStatus();
+      try {
+        const res = await fetchWithTimeout('/api/alarm/ack', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: '{}'
+        }, 2500);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        refresh();
+      } catch (err) {
+        showDebug('Quittierung fehlgeschlagen: ' + err.message);
+      }
     }
 
     function checkMainSignalAlarms(channels) {
       let mask = 0;
       channels.forEach(ch => {
         const previous = knownMainSignals.get(ch.channel);
-        const current = Boolean(ch.main_signal);
+        const current = Boolean(ch.main_signal || ch.latched_alarm);
         if (current) {
           mask |= 1 << (ch.channel - 1);
         }
@@ -1585,12 +1877,12 @@ String htmlPage() {
       box.classList.remove('offline', 'stale');
       if (state === 'offline') {
         box.classList.add('offline');
-        label.textContent = 'Offline';
+        label.textContent = 'Fehler';
       } else if (state === 'stale') {
         box.classList.add('stale');
-        label.textContent = 'Unsicher';
+        label.textContent = '> 10 s';
       } else {
-        label.textContent = 'Verbunden';
+        label.textContent = 'OK';
       }
       if (detail) {
         label.textContent += ' - ' + detail;
@@ -1598,17 +1890,18 @@ String htmlPage() {
     }
 
     function updateLastContact() {
-      const target = document.getElementById('lastContact');
+      const target = document.getElementById('lastContactMini');
       if (!lastSuccessfulContactMs) {
         target.textContent = '-';
+        setConnectionState('offline');
         return;
       }
       const ageSeconds = Math.round((Date.now() - lastSuccessfulContactMs) / 1000);
       target.textContent = ageSeconds + ' s';
       if (ageSeconds > 10) {
-        setConnectionState('offline');
-      } else if (ageSeconds > 4) {
         setConnectionState('stale');
+      } else {
+        setConnectionState('online');
       }
     }
 
@@ -1629,7 +1922,7 @@ String htmlPage() {
           radius: 7, color: '#fff', weight: 2, fillColor: '#dc2626', fillOpacity: 1
         }).bindPopup(`Sensor ${event.channel}: Erkannt`).addTo(topoEvents);
       });
-      if (data.current?.fix) {
+      if (data.current && data.current.fix) {
         const current = [Number(data.current.latitude), Number(data.current.longitude)];
         topoCurrent.setLatLng(current).setStyle({ opacity: 1, fillOpacity: 1 });
         if (!topoFitted) {
@@ -1702,13 +1995,22 @@ String htmlPage() {
 
     function selectView(view) {
       const showMap = view === 'map';
-      document.querySelectorAll('.monitoring-view').forEach(element => element.classList.toggle('hidden', showMap));
+      const showSettings = view === 'settings';
+      const showMonitoring = !showMap && !showSettings;
+      document.body.classList.toggle('settings-active', showSettings);
+      document.querySelectorAll('.monitoring-view').forEach(element => element.classList.toggle('hidden', !showMonitoring));
       document.getElementById('mapView').classList.toggle('hidden', !showMap);
-      document.getElementById('monitoringTab').classList.toggle('active', !showMap);
+      document.getElementById('settingsView').classList.toggle('hidden', !showSettings);
+      document.getElementById('monitoringTab').classList.toggle('active', showMonitoring);
       document.getElementById('mapTab').classList.toggle('active', showMap);
+      document.getElementById('settingsTab').classList.toggle('active', showSettings);
       if (showMap) {
         loadTopoMap();
         refreshTrack();
+      }
+      if (showSettings) {
+        renderSettings(window.lastStatusData || {});
+        try { loadCropSuggestions(); } catch (e) {}
       }
     }
 
@@ -1726,7 +2028,7 @@ String htmlPage() {
       ctx.fillRect(0, 0, width, height);
 
       const positions = [...(data.points || [])];
-      if (data.current?.fix) positions.push(data.current);
+      if (data.current && data.current.fix) positions.push(data.current);
       (data.events || []).forEach(event => positions.push(event));
       if (!positions.length) {
         ctx.fillStyle = '#4b5563';
@@ -1786,7 +2088,7 @@ String htmlPage() {
         ctx.fillStyle = '#dc2626';
         ctx.beginPath(); ctx.arc(pos.x, pos.y, 6, 0, Math.PI * 2); ctx.fill();
       });
-      if (data.current?.fix) {
+      if (data.current && data.current.fix) {
         const pos = toCanvas(data.current);
         ctx.fillStyle = '#16a34a';
         ctx.strokeStyle = '#fff';
@@ -1845,6 +2147,8 @@ String htmlPage() {
         const res = await fetchWithTimeout('/api/status');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
+        window.lastStatusData = data;
+        window.mainSignalHoldMs = data.quality_signal_hold_ms || data.main_signal_hold_ms || 1500;
         lastSuccessfulContactMs = Date.now();
         setConnectionState('online');
         updateLastContact();
@@ -1855,6 +2159,15 @@ String htmlPage() {
         document.getElementById('espTemp').textContent = Number.isFinite(data.esp_temperature_c) ? data.esp_temperature_c.toFixed(1) + ' °C' : '-';
         document.getElementById('cropCurrent').textContent = data.crop_name || '-';
         document.getElementById('fieldCurrent').textContent = data.field_name || '-';
+        document.getElementById('sensitivityCurrent').textContent = (data.quality_signal_hold_ms || data.main_signal_hold_ms || 0) + ' ms';
+        document.getElementById('redSignalCurrent').textContent = (data.red_signal_hold_ms || 15000) + ' ms';
+        lightOnState = Boolean(data.light_on);
+        lightSwitchable = Boolean(data.light_switchable);
+        updateLightButton();
+        updateCamera(data);
+        if (document.activeElement !== document.getElementById('sensitivityInput')) {
+          document.getElementById('sensitivityInput').value = data.quality_signal_hold_ms || data.main_signal_hold_ms || 1500;
+        }
         document.getElementById('tripId').textContent = data.trip_id || '-';
         document.getElementById('filesystem').textContent = data.filesystem_ready
           ? `${Math.round((data.filesystem_used_bytes || 0) / 1024)} / ${Math.round((data.filesystem_total_bytes || 0) / 1024)} KB`
@@ -1877,22 +2190,38 @@ String htmlPage() {
         document.getElementById('gnssSource').textContent = gnss.source || '-';
         document.getElementById('gpsPosition').textContent = gnss.fix ? `${Number(gnss.latitude).toFixed(6)}, ${Number(gnss.longitude).toFixed(6)}` : '-';
         document.getElementById('gpsAccuracy').textContent = Number.isFinite(gnss.accuracy_m) && gnss.accuracy_m >= 0 ? `${Number(gnss.accuracy_m).toFixed(1)} m` : '-';
-        document.getElementById('gpsSatellites').textContent = gnss.satellites ?? '-';
+        document.getElementById('gpsSatellites').textContent = (gnss.satellites !== undefined && gnss.satellites !== null) ? gnss.satellites : '-';
         document.getElementById('gnssRs485').textContent = `${gnss.last_error || '-'} · OK ${gnss.ok_count || 0} / Fehler ${gnss.error_count || 0}`;
         updateGnssWarning(gnss);
+        // minimal overview fields
+        const channelsList = data.channels || [];
+        const seedChannels = channelsList.filter(c => c.seed_channel);
+        const activeCount = seedChannels.filter(c => c.main_signal).length;
+        const rotation = data.rotation || {};
+        document.getElementById('sensorStatus').textContent = `${activeCount} / ${seedChannels.length} · ${rotation.moving ? 'Dreht' : 'Dreht nicht'}`;
+        document.getElementById('lastContactMini').textContent = '0 s';
+        // populate settings debug
+        try { renderSettings(data); } catch (e) {}
         document.getElementById('modules').innerHTML = (data.modules || []).map(module =>
           `<div class="module ${module.online ? 'online' : ''}"><strong>${escapeHtml(module.id)}</strong><br>${module.online ? 'Lokal online' : 'Vorbereitet'}</div>`
         ).join('');
         checkMainSignalAlarms(data.channels || []);
         const grid = document.getElementById('grid');
+        const shownChannels = visibleChannels(data.channels || []);
         renderingGrid = true;
-        grid.innerHTML = data.channels.map(card).join('');
+        grid.innerHTML = shownChannels.map(ch => card(ch, rotation)).join('');
+        document.getElementById('sensorDetailsGrid').innerHTML = sensorDetails(data.channels || []);
         setTimeout(() => { renderingGrid = false; }, 80);
         document.getElementById('error').textContent = '';
       } catch (err) {
-        setConnectionState('offline', err.message || 'Keine API');
         updateLastContact();
         document.getElementById('error').textContent = 'Keine Verbindung zur API';
+        try {
+          const dbg = document.getElementById('debugOverlay');
+          dbg.style.display = 'block';
+          dbg.textContent = 'Refresh error: ' + (err.message || String(err));
+          dbg.classList.remove('hidden');
+        } catch (e) {}
       } finally {
         refreshBusy = false;
       }
@@ -1950,6 +2279,22 @@ String htmlPage() {
       }
     }
 
+    async function saveSensitivitySetting() {
+      const input = document.getElementById('sensitivityInput');
+      const value = Number(input.value);
+      try {
+        const res = await fetchWithTimeout('/api/sensitivity', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ main_signal_hold_ms: value })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await refresh();
+      } catch (err) {
+        document.getElementById('error').textContent = 'Empfindlichkeit speichern fehlgeschlagen';
+      }
+    }
+
     async function loadArchive() {
       const target = document.getElementById('archiveList');
       target.textContent = 'Archiv wird geladen …';
@@ -1975,8 +2320,104 @@ String htmlPage() {
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         await refresh();
+        await loadCropSuggestions();
       } catch (err) {
         document.getElementById('gpsStatus').textContent = 'Saat speichern fehlgeschlagen';
+      }
+    }
+
+    async function selectCrop(name) {
+      document.getElementById('cropInput').value = name;
+      await saveCrop();
+    }
+
+    function renderSettings(data) {
+      try {
+        const gnss = data.gnss || {};
+        const info = {
+          health: gnss.health,
+          warning: gnss.warning,
+          last_error: gnss.last_error,
+          last_sentence: gnss.last_sentence,
+          raw_preview: gnss.raw_preview,
+          poll_count: gnss.poll_count,
+          ok_count: gnss.ok_count,
+          error_count: gnss.error_count
+        };
+        document.getElementById('gnssDebug').textContent = JSON.stringify(info, null, 2);
+      } catch (e) {
+        document.getElementById('gnssDebug').textContent = 'Nicht verfügbar';
+      }
+    }
+
+    async function loadCropSuggestions() {
+      try {
+        const res = await fetchWithTimeout('/api/crops');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const list = await res.json();
+        const datalist = document.getElementById('cropSuggestions');
+        const suggestions = Array.isArray(list) ? list : [];
+        datalist.innerHTML = suggestions.map(v => `<option value="${escapeHtml(v)}"></option>`).join('');
+        const quick = document.getElementById('cropQuickList');
+        const current = document.getElementById('cropInput').value;
+        quick.innerHTML = suggestions.map(v =>
+          `<button type="button" class="crop-chip ${v === current ? 'active' : ''}" data-name="${escapeHtml(v)}">${escapeHtml(v)}</button>`
+        ).join('');
+        quick.querySelectorAll('.crop-chip').forEach(btn => btn.addEventListener('click', e => {
+          selectCrop(e.currentTarget.getAttribute('data-name'));
+        }));
+        const container = document.getElementById('cropSuggestionsList');
+        container.innerHTML = suggestions.length ? suggestions.map(v => `<div class="suggestion-row"><span>${escapeHtml(v)}</span><button data-name="${escapeHtml(v)}" class="removeCrop secondary">Entfernen</button></div>`).join('') : 'Keine Vorschläge.';
+        container.querySelectorAll('.removeCrop').forEach(btn => btn.addEventListener('click', async e => {
+          const name = e.currentTarget.getAttribute('data-name');
+          try {
+            const r = await fetchWithTimeout('/api/crops', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'remove', name }) });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            await loadCropSuggestions();
+          } catch (err) { document.getElementById('error').textContent = 'Vorschlag entfernen fehlgeschlagen'; }
+        }));
+      } catch (err) {
+        document.getElementById('cropSuggestionsList').textContent = 'Vorschläge nicht erreichbar';
+      }
+    }
+
+    document.getElementById('cropAddBtn').addEventListener('click', async () => {
+      const input = document.getElementById('cropAddInput');
+      const name = input.value.trim();
+      if (!name) return;
+      try {
+        const res = await fetchWithTimeout('/api/crops', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'add', name }) });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        input.value = '';
+        await loadCropSuggestions();
+        document.getElementById('cropInput').value = name;
+        await saveCrop();
+      } catch (err) {
+        document.getElementById('error').textContent = 'Vorschlag hinzufügen fehlgeschlagen';
+      }
+    });
+
+    async function toggleLight() {
+      if (actionBusy) return;
+      actionBusy = true;
+      try {
+        const nextState = !lightOnState;
+        const res = await fetchWithTimeout('/api/output', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel: 1, on: nextState })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        lightOnState = nextState;
+        lightSwitchable = true;
+        updateLightButton();
+        await refresh();
+      } catch (err) {
+        lightSwitchable = false;
+        updateLightButton();
+        document.getElementById('error').textContent = 'Licht schalten fehlgeschlagen';
+      } finally {
+        actionBusy = false;
       }
     }
 
@@ -1985,19 +2426,25 @@ String htmlPage() {
     document.getElementById('gpsClear').addEventListener('click', clearGpsLog);
     document.getElementById('cropSave').addEventListener('click', saveCrop);
     document.getElementById('fieldSave').addEventListener('click', saveField);
+    document.getElementById('sensitivitySave').addEventListener('click', saveSensitivitySetting);
     document.getElementById('archiveRefresh').addEventListener('click', loadArchive);
     document.getElementById('alarmEnable').addEventListener('click', enableAlarm);
     document.getElementById('alarmAck').addEventListener('click', acknowledgeAlarm);
     document.getElementById('monitoringTab').addEventListener('click', () => selectView('monitoring'));
     document.getElementById('mapTab').addEventListener('click', () => selectView('map'));
+    document.getElementById('settingsTab').addEventListener('click', () => selectView('settings'));
+    document.getElementById('lightOn').addEventListener('click', () => toggleLight());
     document.getElementById('mapFollow').addEventListener('click', () => setMapFollow(!followMap));
+    document.getElementById('cameraPanel').addEventListener('toggle', () => updateCamera(window.lastStatusData || {}));
     window.addEventListener('pagehide', () => {
       pageActive = false;
+      document.getElementById('cameraImage').removeAttribute('src');
     });
     document.getElementById('grid').addEventListener('click', event => {
       if (event.target.tagName !== 'SUMMARY') return;
       const details = event.target.closest('details');
-      const channel = event.target.closest('.card')?.dataset.channel;
+      const cardEl = event.target.closest('.card');
+      const channel = cardEl ? cardEl.dataset.channel : null;
       if (!details || !channel) return;
       setTimeout(() => {
         if (details.open) {
@@ -2010,7 +2457,8 @@ String htmlPage() {
     document.getElementById('grid').addEventListener('toggle', event => {
       if (event.target.tagName !== 'DETAILS') return;
       if (renderingGrid) return;
-      const channel = event.target.closest('.card')?.dataset.channel;
+      const cardEl = event.target.closest('.card');
+      const channel = cardEl ? cardEl.dataset.channel : null;
       if (!channel) return;
       if (event.target.open) {
         openDetailChannels.add(channel);
@@ -2019,6 +2467,7 @@ String htmlPage() {
       }
     }, true);
     refresh();
+    loadCropSuggestions();
     refreshTrack();
     window.addEventListener('resize', () => drawTrack());
     connectionTimer = setInterval(updateLastContact, 1000);
@@ -2038,6 +2487,23 @@ void handleRoot() {
 void handleApiStatus() {
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", statusJson());
+}
+
+void handleApiAlarmAck() {
+  uint8_t cleared = 0;
+  for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
+    if (channels[i].latchedAlarm) {
+      channels[i].latchedAlarm = false;
+      cleared++;
+    }
+  }
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["cleared"] = cleared;
+  String json;
+  serializeJson(response, json);
+  server.send(200, "application/json", json);
 }
 
 void handleApiChannelName() {
@@ -2105,6 +2571,107 @@ void handleApiCrop() {
   server.send(200, "application/json", json);
 }
 
+String loadCropSuggestionsJson() {
+  Preferences uiPreferences;
+  uiPreferences.begin("ui", false);
+  String stored = uiPreferences.getString("crop_suggestions", "");
+  uiPreferences.end();
+
+  JsonDocument doc;
+  if (stored.length() == 0 || deserializeJson(doc, stored) || !doc.is<JsonArray>() || doc.size() == 0) {
+    return DEFAULT_CROP_SUGGESTIONS_JSON;
+  }
+  return stored;
+}
+
+String normalizeCropSuggestionName(const String &rawName) {
+  char buffer[CROP_NAME_LENGTH];
+  rawName.toCharArray(buffer, sizeof(buffer));
+  sanitizeCropName(buffer);
+  return String(buffer);
+}
+
+void handleApiCrops() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", loadCropSuggestionsJson());
+}
+
+void handleApiCropsPost() {
+  const String body = server.arg("plain");
+  if (body.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"missing_body\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, body);
+  if (error) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+
+  const String action = doc["action"] | "";
+  const String name = normalizeCropSuggestionName(doc["name"] | "");
+  if (name.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"missing_name\"}");
+    return;
+  }
+
+  String stored = loadCropSuggestionsJson();
+  JsonDocument arrDoc;
+  if (deserializeJson(arrDoc, stored) || !arrDoc.is<JsonArray>()) {
+    deserializeJson(arrDoc, DEFAULT_CROP_SUGGESTIONS_JSON);
+  }
+  JsonArray arr = arrDoc.as<JsonArray>();
+
+  bool changed = false;
+  if (action == "add") {
+    bool exists = false;
+    for (JsonVariant value : arr) {
+      if (String(value.as<const char *>()) == name) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists) {
+      arr.add(name);
+      changed = true;
+    }
+  } else if (action == "remove") {
+    JsonDocument newDoc;
+    JsonArray newArr = newDoc.to<JsonArray>();
+    for (JsonVariant value : arr) {
+      const String existing = String(value.as<const char *>());
+      if (existing != name) {
+        newArr.add(existing);
+      }
+    }
+    String out;
+    serializeJson(newDoc, out);
+    Preferences uiPreferences;
+    uiPreferences.begin("ui", false);
+    uiPreferences.putString("crop_suggestions", out);
+    uiPreferences.end();
+    server.send(200, "application/json", out);
+    return;
+  } else {
+    server.send(400, "application/json", "{\"error\":\"invalid_action\"}");
+    return;
+  }
+
+  String out;
+  if (changed) {
+    serializeJson(arr, out);
+    Preferences uiPreferences;
+    uiPreferences.begin("ui", false);
+    uiPreferences.putString("crop_suggestions", out);
+    uiPreferences.end();
+  } else {
+    out = stored;
+  }
+  server.send(200, "application/json", out);
+}
+
 void handleApiField() {
   const String body = server.arg("plain");
   JsonDocument doc;
@@ -2119,6 +2686,30 @@ void handleApiField() {
   }
   saveFieldName(name);
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiSensitivity() {
+  const String body = server.arg("plain");
+  JsonDocument doc;
+  if (body.length() == 0 || deserializeJson(doc, body)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_body\"}");
+    return;
+  }
+  const uint32_t holdMs = doc["main_signal_hold_ms"] | 0;
+  if (holdMs == 0) {
+    server.send(400, "application/json", "{\"error\":\"invalid_sensitivity\"}");
+    return;
+  }
+  saveSensitivity(holdMs);
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["main_signal_hold_ms"] = mainSignalHoldMs;
+  response["quality_signal_hold_ms"] = mainSignalHoldMs;
+  response["red_signal_hold_ms"] = RED_SIGNAL_HOLD_MS;
+  String json;
+  serializeJson(response, json);
+  server.send(200, "application/json", json);
 }
 
 void handleApiRecording() {
@@ -2150,6 +2741,41 @@ void handleApiRecording() {
   String json;
   serializeJson(response, json);
   server.send(200, "application/json", json);
+}
+
+void handleApiOutput() {
+  const String body = server.arg("plain");
+  if (body.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"missing_body\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, body);
+  if (error) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+
+  const int channel = doc["channel"] | 1;
+  const bool on = doc["on"] | false;
+  if (channel < 1 || channel > CHANNEL_COUNT) {
+    server.send(400, "application/json", "{\"error\":\"invalid_channel\"}");
+    return;
+  }
+
+  const bool ok = setDigitalOutput(static_cast<uint8_t>(channel - 1), on);
+  JsonDocument resp;
+  resp["ok"] = ok;
+  resp["channel"] = channel;
+  resp["output"] = channels[channel - 1].output;
+  resp["switchable"] = doExpanderReady;
+  if (channel == LIGHT_OUTPUT_CHANNEL) {
+    resp["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
+  }
+  String out;
+  serializeJson(resp, out);
+  server.send(ok ? 200 : 500, "application/json", out);
 }
 
 void handleApiCombinedGeoJson() {
@@ -2617,6 +3243,7 @@ void setup() {
   loadChannelNames();
   loadCropName();
   loadFieldName();
+  loadSensitivity();
   bootCounter = preferences.getUInt("boot_counter", 0) + 1;
   tripCounter = preferences.getUInt("trip_counter", 0);
   preferences.putUInt("boot_counter", bootCounter);
@@ -2630,10 +3257,13 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/alarm/ack", HTTP_POST, handleApiAlarmAck);
   server.on("/api/channel-name", HTTP_POST, handleApiChannelName);
   server.on("/api/crop", HTTP_POST, handleApiCrop);
   server.on("/api/field", HTTP_POST, handleApiField);
+  server.on("/api/sensitivity", HTTP_POST, handleApiSensitivity);
   server.on("/api/recording", HTTP_POST, handleApiRecording);
+  server.on("/api/output", HTTP_POST, handleApiOutput);
   server.on("/api/track", HTTP_GET, handleApiTrack);
   server.on("/api/gps-log.csv", HTTP_GET, handleApiGpsLogCsv);
   server.on("/api/gps-log.geojson", HTTP_GET, handleApiGpsLogGeoJson);
@@ -2646,6 +3276,8 @@ void setup() {
   server.on("/api/archive/download", HTTP_GET, handleApiArchiveDownload);
   server.on("/api/system-events.log", HTTP_GET, handleApiSystemEvents);
   server.on("/api/gps-log/clear", HTTP_POST, handleApiGpsLogClear);
+  server.on("/api/crops", HTTP_GET, handleApiCrops);
+  server.on("/api/crops", HTTP_POST, handleApiCropsPost);
   server.onNotFound([]() {
     server.send(404, "application/json", "{\"error\":\"not_found\"}");
   });

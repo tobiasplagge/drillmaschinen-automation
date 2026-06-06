@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../esp32-ld2410-Drillmaschine"
+		},
+		{
+			"name": "waveshare_esp32_s3_poe_8di8do_Drillmaschine",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
