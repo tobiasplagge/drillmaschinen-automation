@@ -1,73 +1,172 @@
-# Drillmaschinen-Automation
+# Drillmaschinenueberwachung M01
 
-Firmware-Projekte für die Automatisierung und Steuerung von Drillmaschinen mit verschiedenen ESP32-basierten Hardwareplattformen.
+Firmware fuer das Waveshare ESP32-S3-POE-ETH-8DI-8DO Board zur
+Ueberwachung einer Drillmaschine.
 
-## 📋 Projektübersicht
+Aktuelle Firmware-Version: **2.0.0**
 
-Dieses Repository enthält zwei Kontrollvarianten:
+## Kurzueberblick
 
-### 1. **Waveshare ESP32-S3-POE-8DI-8DO** 
+Das Modul stellt einen eigenen WLAN-Access-Point bereit, liest acht digitale
+Eingaenge ein, schaltet Ausgaenge ueber den TCA9554-I/O-Expander, zeichnet
+Fahrten mit einem RS485-GNSS-Modul auf und zeigt ein Hikvision-Kamerabild ueber
+den W5500-LAN-Port an.
 
-Ethernet-basierte Steuerung mit 8 digitalen Eingängen und 8 digitalen Ausgängen.
+Die Webseite laeuft lokal auf dem ESP32:
 
-**Features:**
-- ✅ 8 digitale Eingänge (DI1..DI8) auf GPIO4-11
-- ✅ 8 digitale Ausgänge (DO1..DO8) via I2C-IO-Expander (TCA9554)
-- ✅ Kanalnamen im Webinterface bearbeitbar und im ESP32 gespeichert
-- ✅ Drillmaschinenüberwachung mit Live-Status und Hauptsignal je Kanal
-- ✅ Webinterface und REST-API über lokalen HTTP-Server
-- ✅ Fahrtaufzeichnung mit Ebyte EWD108-GN05(485) per RS485/Modbus RTU
-- ✅ Ereignislog für Hauptsignale mit GPS-Koordinaten, sofern verfügbar
-- ✅ Alarmton auf Tablet/Smartphone mit Quittierung
-- ✅ Hikvision-Kamera über LAN/W5500 mit Substream-Livebild und Verbindungstest
-- ✅ WLAN Access Point Fallback
-- ✅ ArduinoJson Verarbeitung
-
-**WLAN-Zugang:**
-```
+```text
 SSID: Drillmaschine-M01
 Passwort: 12345678
 Webseite: http://192.168.4.1/
 API: http://192.168.4.1/api/status
 ```
 
-Hinweis zur SSID: `M01` steht fuer `Modul 01`. Wenn spaeter mehrere
-Waveshare-Module an der Maschine verwendet werden, koennen sie fortlaufend
-benannt werden, z. B. `Drillmaschine-M01`, `Drillmaschine-M02`,
-`Drillmaschine-M03` und `Drillmaschine-M04`.
+## Funktionen
 
-Die Kanalnamen koennen direkt im Webinterface geaendert werden. Nach `OK`
-speichert der ESP32 den Namen im internen NVS-Speicher; `/api/status` liefert
-ihn pro Kanal als Feld `name` mit.
+- 8 digitale Eingaenge `DI1..DI8` auf `GPIO4..GPIO11`
+- 8 digitale Ausgaenge ueber TCA9554, I2C-Adresse `0x20`
+- Kanalnamen im Webinterface editierbar und im NVS gespeichert
+- Hauptsignal-Erkennung mit konfigurierbarer Empfindlichkeit
+- Alarmton im Tablet-/Smartphone-Browser mit Quittierung
+- Lichtausgang direkt auf der Mainpage schaltbar
+- Fahrtaufzeichnung mit Ebyte EWD108-GN05(485) per RS485/Modbus RTU
+- Auto-Start der Fahrtaufzeichnung nach stabilem GNSS-Fix
+- Fahrtarchiv in LittleFS
+- CSV-, TXT- und GeoJSON-Downloads
+- Live-Kartenansicht mit OpenTopoMap und lokalem Canvas-Fallback
+- Hikvision-Kamera ueber W5500-LAN mit Substream/Mainstream-Umschalter
+- Kamera-Proxy im ESP32, damit Browser im ESP32-WLAN das LAN-Kamerabild sieht
+- Kamera-IP, Benutzer und Passwort im Webinterface einstellbar
+- Kamera-Verbindungstest ueber Ethernet
+- Boot-Zaehler, Reset-Grund, Systemlog und Task-Watchdog
 
-Die Bearbeitung der Kanalnamen ist im normalen Statusbereich ausgeblendet und
-kann ueber die Detailansicht geoeffnet werden. Die Webseite zeigt ausserdem die
-Firmware-Version und die interne ESP32-Temperatur an.
+## Bedienung
 
-### Fahrtaufzeichnung und GNSS
+### Mainpage
+
+Die Mainpage zeigt:
+
+- Kontaktstatus und ESP32-Temperatur
+- Firmware-Version
+- Licht-Schalter
+- Ton-Aktivierung
+- Alarm-Quittierung
+- Sensoruebersicht
+- GNSS-/Aufzeichnungsstatus
+- Kamerabereich
+
+Der Alarmton muss im Browser einmal mit **Ton aktivieren** freigeschaltet
+werden. Danach startet er automatisch, wenn ein Hauptsignal in den Zustand
+`Erkannt` wechselt. Mit **Alarm quittieren** wird der aktuelle Alarm
+stummgeschaltet.
+
+Wenn der Kamerastream offen ist, pausiert die Webseite die zyklischen
+API-Refreshes. Der Kontaktstatus zeigt dann **Kamera aktiv** mit gruen
+blinkendem Punkt. Dadurch wird der ESP32-Webserver nicht durch parallele
+Stream- und API-Verbindungen ueberlastet.
+
+### Einstellungen
+
+Im Reiter **Einstellungen** koennen gesetzt werden:
+
+- Kamera-IP
+- Kamera-Benutzer
+- Kamera-Passwort
+- Sensor-Empfindlichkeit
+- Saat-Vorschlaege
+- Kanalnamen in den Kanaldetails
+
+Der Button **Verbindung testen** prueft die Kamera ueber den W5500-LAN-Port.
+Eine typische Ausgabe ist:
+
+```text
+Substream 102 ueber ethernet: HTTP 200, MJPEG erkannt
+Mainstream 101 ueber ethernet: HTTP 200, kein MJPEG
+```
+
+Das Passwort wird gespeichert, aber nicht ueber `/api/status` an den Browser
+zurueckgegeben. Beim Aendern der Kameradaten muss es neu eingetragen werden.
+
+## Kamera
+
+Standardwerte nach frischem Flash:
+
+```text
+IP: 192.168.4.20
+Benutzer: admin
+Passwort: Administrator01
+```
+
+Die Hikvision-Kamera haengt direkt am LAN-Port des ESP32/W5500. Der Browser ist
+im WLAN des ESP32 und kann die Kamera nicht direkt erreichen. Deshalb stellt
+die Firmware Proxy-Endpunkte bereit:
+
+```text
+/camera/substream
+/camera/mainstream
+```
+
+Der Substream sollte auf MJPEG gestellt sein. Mainstream `101` liefert bei
+vielen Hikvision-Kameras H.264/H.265 oder XML und kann dann im Browser-`img`
+nicht als Livebild angezeigt werden. Der Substream `102` ist der stabile
+Standard fuer das Webinterface.
+
+Hikvision-Pfade:
+
+```text
+Mainstream: /ISAPI/Streaming/channels/101/httpPreview
+Substream:  /ISAPI/Streaming/channels/102/httpPreview
+```
+
+## Netzwerk
+
+### WLAN
+
+Der ESP32 stellt einen Access Point bereit:
+
+```text
+ESP32 WLAN-IP: 192.168.4.1
+SSID:          Drillmaschine-M01
+Passwort:      12345678
+```
+
+### Ethernet/W5500
+
+Der LAN-Port wird fuer die Kamera verwendet:
+
+```text
+ESP32 Ethernet-IP: 192.168.4.10
+Kamera-IP:         192.168.4.20
+Subnetz:           255.255.255.0
+Gateway:           192.168.4.1
+```
+
+W5500-Pinbelegung:
+
+| Funktion | GPIO |
+|----------|------|
+| INT | GPIO12 |
+| MOSI | GPIO13 |
+| MISO | GPIO14 |
+| SCLK | GPIO15 |
+| CS | GPIO16 |
+| RST | GPIO39 |
+
+## GNSS und Fahrtaufzeichnung
 
 Die Fahrtaufzeichnung nutzt ein Ebyte EWD108-GN05(485) GNSS-Modul am
-RS485-Anschluss des Waveshare-Boards. Der ESP32 liest die Position direkt per
-Modbus RTU aus; Tablet-/Smartphone-GPS wird nicht mehr verwendet.
+RS485-Anschluss.
 
-Werkseinstellung des EWD108-GN05(485):
+Werkseinstellung:
 
-- Modbus-Adresse: `1`
-- Baudrate: `9600`
-- Format: `8N1`
-- Versorgung: `5-24 V DC`
+```text
+Modbus-Adresse: 1
+Baudrate:       9600
+Format:         8N1
+Versorgung:     5-24 V DC
+```
 
-Anschluss:
-
-| EWD108-GN05(485) | Waveshare |
-|------------------|-----------|
-| V+ | 5-24 V Versorgung |
-| GND / V- | GND |
-| RS485 A | RS485 A |
-| RS485 B | RS485 B |
-| Antenne | SMA-Antenne nach oben/aussen montieren |
-
-Firmware-Pins fuer den internen RS485-UART:
+RS485-Pins:
 
 | Funktion | GPIO |
 |----------|------|
@@ -75,123 +174,56 @@ Firmware-Pins fuer den internen RS485-UART:
 | RS485 TX | GPIO17 |
 | RS485 DE/RE | GPIO21 |
 
-Aufgezeichnet werden:
+Die Firmware scannt Holding-Register ab `0x0000` ueber 96 Register nach
+NMEA-RMC/GGA-Daten. Falls das reale Modul NMEA an anderer Stelle bereitstellt,
+muessen `GNSS_SCAN_START_REGISTER` und `GNSS_SCAN_REGISTER_COUNT` in
+`src/main.cpp` angepasst werden.
 
-- GPS-Punkte fuer die Fahrspur
-- aktuelles Saatgut/Feldfrucht
-- Live- und Hauptsignalmaske der 8 Kanaele
-- Hauptsignal-Ereignisse mit GPS-Position, wenn zum Zeitpunkt der Stoerung eine Position bekannt ist
+Automatik:
 
-Downloads im Webinterface:
+- Sobald ein GNSS-Fix mindestens 3 Sekunden stabil ist, startet die
+  Fahrtaufzeichnung automatisch.
+- Eine manuell gestoppte Fahrt wird erst nach erneutem GNSS-Fix wieder
+  automatisch gestartet.
+- GPS-Schreibzugriffe werden gepuffert und spaetestens alle 30 Sekunden in
+  LittleFS geschrieben.
 
-- Fahrtaufzeichnung als CSV
-- Fahrtaufzeichnung als GeoJSON fuer Google Maps / My Maps
-- kombinierte Route und Sensorereignisse als GeoJSON
-- Hauptsignal-Log als CSV
-- Hauptsignal-Log als GeoJSON
-- Sensorlog als CSV und TXT mit Start, Ende, Dauer, Kanal und GPS-Bezug
+## Dateien und Logs
 
-### Fahrtarchiv und Bedienablauf
+Jede Fahrt erhaelt eine ID im Format:
 
-Sobald der GNSS-Fix mindestens drei Sekunden stabil ist, startet die
-Fahrtaufzeichnung automatisch. Eine manuell gestoppte Fahrt startet erst nach
-einem erneuten GNSS-Fix wieder automatisch. Der Fahrer kann die Aufzeichnung
-weiterhin manuell starten und stoppen.
+```text
+M01-B000012-F0007
+```
 
-Jede Fahrt erhaelt eine eindeutige Fahrt-ID, zum Beispiel
-`M01-B000012-F0007`. Neben der Saat kann ein Feldname eingegeben werden. GPS-
-und Sensorlogs werden zusaetzlich zum Live-Ringpuffer als Fahrtdateien in
-LittleFS gespeichert. GPS-Schreibzugriffe werden gepuffert und spaetestens alle
-30 Sekunden geschrieben. Bei einem unerwarteten Neustart koennen dadurch nur
-die letzten Sekunden fehlen.
+Im Webinterface unter **Dateien und Wartung** stehen bereit:
 
-Im Webinterface liegen Downloads, Archiv und das Loeschen des Live-Logs unter
-`Dateien und Wartung`. Archivierte Fahrtdateien bleiben beim Loeschen des
-Live-Logs erhalten. Waehrend einer aktiven Aufzeichnung ist das Loeschen
-gesperrt.
+- GPS-Log CSV
+- GPS-Log GeoJSON
+- kombinierte Route und Sensorereignisse GeoJSON
+- Hauptsignal-Ereignisse CSV
+- Sensorlog CSV
+- Sensorlog TXT
+- Neustart-Log
+- Fahrtarchiv
 
-### Live-Fahrt und Karten-Reiter
+Das Loeschen des Live-Logs ist waehrend einer aktiven Aufzeichnung gesperrt.
+Archivierte Fahrtdateien bleiben dabei erhalten.
 
-Die Webseite besitzt die Reiter `Ueberwachung` und `Karte`. Im Karten-Reiter
-wird bei vorhandener Internetverbindung eine topografische OpenTopoMap-Karte
-geladen. Darueber zeichnet der Browser die Live-Fahrt:
+## Hardware
 
-- blaue Linie: bisherige Fahrspur
-- gruener Punkt: aktuelle GNSS-Position
-- rote Marker: erkannte Hauptsignal-Stoerungen
+| Komponente | Wert |
+|------------|------|
+| Board | Waveshare ESP32-S3-POE-ETH-8DI-8DO |
+| CPU | ESP32-S3, 240 MHz |
+| RAM | 8 MB PSRAM |
+| Flash | 16 MB |
+| Ethernet | W5500 ueber SPI |
+| DO-Expander | TCA9554, I2C `0x20` |
+| GNSS | Ebyte EWD108-GN05(485) |
+| Kamera | Hikvision HTTP/MJPEG Preview |
 
-Falls OpenTopoMap oder die Internetverbindung nicht erreichbar sind, bleibt
-eine lokale Rasteransicht mit Nordpfeil und Massstab als Fallback verfuegbar.
-Die Sensorueberwachung und Datenaufzeichnung funktionieren unabhaengig von der
-Online-Karte weiter.
-
-Mit `Position folgen` kann das automatische Zentrieren der Karte ausgeschaltet
-werden. Das geschieht ebenfalls automatisch, sobald die Karte manuell
-verschoben oder gezoomt wird.
-
-Fuer die Live-Ansicht liefert `/api/track` maximal die letzten 1.200 Spurpunkte
-und 128 Stoerungsmarker. Die vollstaendigen Logs bleiben separat als CSV und
-GeoJSON verfuegbar.
-
-Bekannter Stand: Das EWD108-GN05(485) ist vorbereitet, muss aber am echten
-Modul noch gegen die tatsaechliche Registerbelegung getestet werden. Die
-Firmware scannt die Modbus-Holding-Register ab Register `0x0000` nach einem
-NMEA-RMC/GGA-Satz. Falls das Modul die NMEA-Zeichenkette an einem anderen
-Registerbereich ablegt, muessen `GNSS_SCAN_START_REGISTER` und
-`GNSS_SCAN_REGISTER_COUNT` oben in `src/main.cpp` angepasst werden. Die
-Maschinenueberwachung der Kanaele funktioniert unabhaengig davon weiter.
-
-Die Oberflaeche unterscheidet drei GNSS-Fehlerbilder:
-
-- `no_rs485`: das RS485-GNSS-Modul antwortet nicht
-- `no_fix`: das Modul antwortet, hat aber keinen Satelliten-Fix
-- `invalid_data`: Daten kommen an, lassen sich aber nicht auswerten
-
-### Mehrere Module
-
-Die Oberflaeche ist fuer `M01` bis `M04` vorbereitet. In der aktuellen Version
-ist `M01` das lokale Waveshare-Modul; `M02` bis `M04` werden als vorbereitet
-angezeigt. Fuer eine gemeinsame Live-Ansicht aller vier Module wird spaeter ein
-zentrales Gateway oder eine Tablet-App benoetigt. Vier getrennte WLAN-Hotspots
-koennen nicht gleichzeitig direkt im Browser zusammengefuehrt werden.
-
-### Schutzbeschaltung an der Landmaschine
-
-Fuer einen produktiven Einbau an der Maschine sollte die Versorgung nicht
-ungeschuetzt direkt aus dem Bordnetz kommen. Empfohlen sind:
-
-- eigene Sicherung nahe am Abgriff
-- Verpolschutz
-- TVS-Diode gegen Spannungsspitzen
-- geeigneter Automotive-DC/DC-Wandler fuer die Versorgung
-- gemeinsamer, sauber gefuehrter Massepunkt
-- geschirmte oder verdrillte Leitungen fuer RS485
-- 120-Ohm-Abschluss am RS485-Bus nur an den beiden Busenden
-- Zugentlastung und vibrationsfeste Steckverbinder
-
-Die Firmware protokolliert Boot-Zaehlung und Reset-Grund in
-`/system-events.log`. Das Protokoll ist unter `Dateien und Wartung` als
-`Neustart-Log` downloadbar. Ein Task-Watchdog startet den Controller neu, falls
-die Hauptschleife dauerhaft blockiert.
-
-### Alarmton
-
-Der Alarmton wird im Browser auf dem Tablet oder Smartphone abgespielt. Er muss
-einmal ueber `Ton aktivieren` freigeschaltet werden. Wenn ein Kanal den Status
-`Erkannt` erreicht, startet ein pulsierender Ton. Mit `Alarm quittieren` wird
-der Ton fuer die aktuell anliegenden Stoerungen stummgeschaltet. Neue
-Stoerungen loesen den Alarm erneut aus; wenn alle Kanaele wieder `OK` sind,
-wird die Quittierung automatisch zurueckgesetzt.
-
-**Hardware:**
-- **Board:** Waveshare ESP32-S3-POE-ETH-8DI-8DO
-- **Prozessor:** ESP32-S3 (240 MHz Dual-Core)
-- **RAM:** 8 MB PSRAM
-- **Flash:** 16 MB (QIO OPI Mode)
-- **Ethernet:** W5500 über SPI (PoE)
-- **I/O Expander:** TCA9554 (I2C 0x20)
-
-**Pinbelegung:**
+I/O-Pins:
 
 | Funktion | GPIO | Bemerkung |
 |----------|------|-----------|
@@ -203,88 +235,121 @@ wird die Quittierung automatisch zurueckgesetzt.
 | DI6 | GPIO9 | Digital Input 6 |
 | DI7 | GPIO10 | Digital Input 7 |
 | DI8 | GPIO11 | Digital Input 8 |
-| DO1..DO8 | I2C | via TCA9554 I/O-Expander |
-| I2C SDA | GPIO42 | Serial Data |
-| I2C SCL | GPIO41 | Serial Clock |
-| CAN TX | GPIO2 | CAN Bus TX |
-| CAN RX | GPIO3 | CAN Bus RX |
-| RS485 TX | GPIO17 | RS485 Transmit |
-| RS485 RX | GPIO18 | RS485 Receive |
-| RS485 RTS | GPIO21 | RS485 Request to Send |
+| DO1..DO8 | I2C | via TCA9554 |
+| I2C SDA | GPIO42 | TCA9554 |
+| I2C SCL | GPIO41 | TCA9554 |
+| RS485 TX | GPIO17 | GNSS |
+| RS485 RX | GPIO18 | GNSS |
+| RS485 DE/RE | GPIO21 | GNSS |
+| W5500 INT | GPIO12 | Ethernet |
+| W5500 MOSI | GPIO13 | Ethernet |
+| W5500 MISO | GPIO14 | Ethernet |
+| W5500 SCLK | GPIO15 | Ethernet |
+| W5500 CS | GPIO16 | Ethernet |
+| W5500 RST | GPIO39 | Ethernet |
 
-**Logik (src/main.cpp):**
-```cpp
-DI aktiv, aber kuerzer als 1,5 s → Status Kein Status
-DI aktiv ab 1,5 s                → Status Erkannt / Hauptsignal
-DI inaktiv                       → Status OK
+## Signal-Logik
+
+```text
+DI inaktiv                       -> Status OK
+DI aktiv, aber kuerzer als 1,5 s -> Status Kein Status
+DI aktiv ab 1,5 s                -> Status Erkannt / Hauptsignal
 ```
 
-Konfigurierbar via:
+Konfiguration in `src/main.cpp`:
+
 ```cpp
 static constexpr bool DO_ACTIVE_HIGH = true;
 static constexpr bool INPUT_ACTIVE_HIGH = false;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
+static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
 ```
 
-### 2. **ESP32 LD2410 Radar** 
+## API
 
-Radar-basierte Präsenzerkennung mit LD2410 Sensor.
+Basis:
 
-**Features:**
-- ✅ LD2410 24-GHz-Radarmodul
-- ✅ Präsenzerkennung
-- ✅ Bewegungserfassung
-- ✅ Entfernungsmessung
-- ✅ UART/Seriell-Interface
+```text
+http://192.168.4.1
+```
 
----
+| Endpoint | Methode | Beschreibung |
+|----------|---------|--------------|
+| `/api/status` | GET | Gesamtstatus, GNSS, Kamera, Logs, Kanaele |
+| `/api/camera-test` | GET | Kamera-Verbindung ueber Ethernet testen |
+| `/api/camera-settings` | POST | Kamera-IP, Benutzer, Passwort speichern |
+| `/camera/substream` | GET | Kamera-Substream ueber ESP32-Proxy |
+| `/camera/mainstream` | GET | Kamera-Mainstream ueber ESP32-Proxy |
+| `/api/alarm/ack` | POST | Alarm quittieren |
+| `/api/channel-name` | POST | Kanalnamen speichern |
+| `/api/crop` | POST | Saat speichern |
+| `/api/field` | POST | Feldname speichern |
+| `/api/sensitivity` | POST | Hauptsignal-Haltezeit speichern |
+| `/api/recording` | POST | Aufzeichnung starten/stoppen |
+| `/api/output` | POST | Ausgang schalten |
+| `/api/track` | GET | kompakte Live-Fahrt |
+| `/api/gps-log.csv` | GET | GPS-Live-Log als CSV |
+| `/api/gps-log.geojson` | GET | GPS-Live-Log als GeoJSON |
+| `/api/main-events.csv` | GET | Hauptsignal-Ereignisse als CSV |
+| `/api/main-events.geojson` | GET | Hauptsignal-Ereignisse als GeoJSON |
+| `/api/sensor-events.csv` | GET | Sensorereignisse als CSV |
+| `/api/sensor-events.txt` | GET | Sensorereignisse als Text |
+| `/api/combined.geojson` | GET | Route und Sensorereignisse kombiniert |
+| `/api/archive` | GET | archivierte Fahrtdateien listen |
+| `/api/archive/download` | GET | archivierte Datei herunterladen |
+| `/api/system-events.log` | GET | Neustart-Log herunterladen |
+| `/api/gps-log/clear` | POST | Live-Log loeschen |
+| `/api/crops` | GET/POST | Saat-Vorschlaege lesen/aendern |
 
-## 🚀 Installation & Setup
+Beispiele:
 
-### Voraussetzungen
+```bash
+curl http://192.168.4.1/api/status
 
-- [PlatformIO](https://platformio.org/) CLI oder VS Code Extension
-- Python 3.8+
+curl -X POST http://192.168.4.1/api/camera-settings \
+  -H 'Content-Type: application/json' \
+  -d '{"host":"192.168.4.20","username":"admin","password":"Administrator01"}'
+
+curl -X POST http://192.168.4.1/api/sensitivity \
+  -H 'Content-Type: application/json' \
+  -d '{"main_signal_hold_ms":1500}'
+```
+
+## Build und Upload
+
+Voraussetzungen:
+
+- PlatformIO CLI oder VS Code PlatformIO Extension
 - Git
-- USB-zu-UART Adapter (bei Bedarf)
+- USB-Kabel mit Datenleitungen
 
-### Projekt klonen
-
-```bash
-git clone https://github.com/tobiasplagge/drillmaschinen-automation.git
-cd drillmaschinen-automation
-```
-
-### Build
+Build:
 
 ```bash
-# Waveshare Projekt
-cd waveshare_esp32_s3_poe_8di8do_Drillmaschine
 platformio run -e waveshare_esp32_s3_poe_8di8do
-
-# LD2410 Projekt
-cd ../esp32-ld2410-Drillmaschine
-platformio run -e esp32_s3_poe_8di8do
 ```
 
-### Upload
+Upload:
 
 ```bash
-cd waveshare_esp32_s3_poe_8di8do_Drillmaschine
 platformio run -e waveshare_esp32_s3_poe_8di8do --target upload
 ```
 
-### Serial Monitor
+Serieller Monitor:
 
 ```bash
 platformio device monitor
 ```
 
----
+Lokaler PlatformIO-Pfad auf macOS kann zum Beispiel sein:
 
-## ⚙️ Konfiguration
+```bash
+~/.platformio/penv/bin/pio run
+```
 
-### platformio.ini - Waveshare Board
+## PlatformIO-Konfiguration
+
+Wichtige Einstellungen aus `platformio.ini`:
 
 ```ini
 [env:waveshare_esp32_s3_poe_8di8do]
@@ -292,182 +357,98 @@ platform = espressif32
 board = esp32-s3-devkitm-1
 framework = arduino
 
-monitor_speed = 115200
-upload_speed = 115200
-
 board_build.flash_size = 16MB
 board_build.psram_type = opi
 board_build.arduino.memory_type = qio_opi
-board_build.f_flash = 80000000L
-board_build.flash_mode = qio
-
-build_flags =
-  -DARDUINO_USB_CDC_ON_BOOT=1
-  -DBOARD_HAS_PSRAM
-  -DCORE_DEBUG_LEVEL=3
 
 lib_deps =
   bblanchon/ArduinoJson@^7.4.2
+  arduino-libraries/Ethernet@^2.0.2
 ```
 
-### Build-Flags
+## Troubleshooting
 
-| Flag | Beschreibung |
-|------|-------------|
-| `ARDUINO_USB_CDC_ON_BOOT=1` | USB CDC bei Boot aktivieren |
-| `BOARD_HAS_PSRAM` | Externes PSRAM aktivieren |
-| `CORE_DEBUG_LEVEL=3` | Debug-Level (0-5) |
+### Kamera zeigt kein Bild
 
----
+- In den Einstellungen **Verbindung testen** ausfuehren.
+- Substream muss `HTTP 200, MJPEG erkannt` melden.
+- Hikvision-Substream `102` auf MJPEG stellen.
+- Kamera-IP, Benutzer und Passwort pruefen.
+- Kamera muss am W5500-LAN-Port erreichbar sein.
+- Wenn Mainstream `kein MJPEG` meldet, ist das fuer viele Hikvision-Kameras
+  normal. Substream verwenden.
 
-## 📡 API-Referenz
+### Kamera aktiv, aber API pausiert
 
-### Status abrufen
-
-```bash
-curl http://192.168.4.1/api/status
-```
-
-**Response:**
-```json
-{
-  "di": [0, 1, 0, 1, 0, 0, 1, 0],
-  "do": [0, 1, 0, 1, 0, 0, 1, 0],
-  "timestamp": 1234567890
-}
-```
-
-Hinweis: Seit die Fahrtaufzeichnung ueber das RS485-GNSS-Modul laeuft, wird
-kein Browser-GPS mehr benoetigt. Deshalb nutzt die Firmware wieder HTTP, weil
-das auf dem ESP32 stabiler laeuft als ein Self-Signed-HTTPS-Server:
-
-```bash
-curl http://192.168.4.1/api/status
-```
-
-Weitere Endpunkte:
-
-| Endpoint | Beschreibung |
-|----------|--------------|
-| `/api/status` | aktueller Kanal-, Alarm-, Temperatur- und Logstatus |
-| `/api/crop` | Saatgut/Feldfrucht speichern |
-| `/api/recording` | Fahrtaufzeichnung starten/stoppen |
-| `/api/track` | kompakte Live-Fahrspur mit aktueller Position und Stoerungsmarkern |
-| `/api/gps-log.csv` | Fahrtaufzeichnung als CSV herunterladen |
-| `/api/gps-log.geojson` | Fahrtaufzeichnung als GeoJSON herunterladen |
-| `/api/main-events.csv` | Hauptsignal-Ereignisse als CSV herunterladen |
-| `/api/main-events.geojson` | Hauptsignal-Ereignisse als GeoJSON herunterladen |
-| `/api/sensor-events.csv` | abgeschlossene Sensor-Ausloesungen mit Dauer als CSV herunterladen |
-| `/api/sensor-events.txt` | abgeschlossene Sensor-Ausloesungen als lesbares Textfile herunterladen |
-
----
-
-## 📦 Abhängigkeiten
-
-- **ArduinoJson** v7.4.2+ – JSON-Verarbeitung und REST-API
-
----
-
-## 📁 Projektstruktur
-
-```
-drillmaschinen-automation/
-├── waveshare_esp32_s3_poe_8di8do_Drillmaschine/
-│   ├── src/
-│   │   └── main.cpp              # Hauptprogramm Waveshare
-│   ├── include/
-│   ├── lib/
-│   ├── platformio.ini
-│   ├── README.md
-│   └── RELEASE_NOTES.md
-├── esp32-ld2410-Drillmaschine/
-│   ├── src/
-│   │   └── main.cpp              # Hauptprogramm LD2410
-│   ├── include/
-│   ├── lib/
-│   ├── platformio.ini
-│   └── README.md
-└── README.md                     # Dieses Dokument
-```
-
----
-
-## 🔧 Entwicklung & Debug
-
-### Debug-Level erhöhen
-
-```ini
-[env:waveshare_esp32_s3_poe_8di8do]
-build_flags = 
-  -DCORE_DEBUG_LEVEL=4
-```
-
-**Debug-Level:**
-- 0: Keine Ausgabe
-- 1: Fehler
-- 2: Fehler + Warnungen
-- 3: Fehler + Warnungen + Info
-- 4: Verbose
-- 5: Very Verbose
-
----
-
-## 🐛 Troubleshooting
-
-### USB wird nicht erkannt
-
-1. Treiber installieren: `pip install esptool`
-2. Verfügbare Ports auflisten: `platformio device list`
-3. Board zurücksetzen: Boot-Button halten → Reset drücken
-
-### WLAN funktioniert nicht
-
-- Access Point mit SSID `Drillmaschine-M01` suchen
-- Passwort: `12345678`
-- In der Konsole Fehler überprüfen
+Das ist beabsichtigt. Der ESP32-Webserver kann den Kamerastream und die
+zyklischen API-Refreshes nicht beliebig parallel bedienen. Bei offenem
+Kamerabild zeigt die Webseite **Kamera aktiv** und pausiert die API-Abfragen.
 
 ### GNSS/Fahrtaufzeichnung funktioniert nicht
 
-- EWD108-GN05(485) mit 5-24 V versorgen
-- RS485 A/B pruefen; bei keiner Antwort A/B testweise tauschen
-- Werkseinstellung pruefen: Adresse `1`, `9600 8N1`
-- Antenne nach oben/aussen montieren
-- PPS-LED am EWD108 pruefen: bei Fix blinkt sie laut Hersteller einmal pro Sekunde
-- Im Webinterface auf `GNSS Fix`, `RS485` und Fehlerzaehler achten
-- Bekannter Stand: Registerbereich muss am echten Modul noch verifiziert werden
+- EWD108-GN05(485) mit 5-24 V versorgen.
+- RS485 A/B pruefen; bei keiner Antwort A/B testweise tauschen.
+- Modbus-Adresse `1`, `9600 8N1` pruefen.
+- Antenne nach oben/aussen montieren.
+- PPS-LED am GNSS-Modul pruefen.
+- Im Webinterface auf `GNSS Fix`, `RS485` und Fehlerzaehler achten.
 
-### I2C-Fehler (TCA9554)
+### WLAN funktioniert nicht
 
-- GPIO41 (SCL) und GPIO42 (SDA) überprüfen
-- I2C-Adresse `0x20` mit `i2cdetect` überprüfen
-- Pullup-Widerstände überprüfen (4,7kΩ empfohlen)
+- Access Point `Drillmaschine-M01` suchen.
+- Passwort `12345678` verwenden.
+- Seriellen Monitor pruefen.
 
-### Upload schlägt fehl
+### I2C-Ausgaenge funktionieren nicht
 
-- USB-Kabel überprüfen
-- Board in Bootloader-Modus versetzen
-- ESP32 Tool neu installieren: `pip install esptool --upgrade`
+- GPIO41/GPIO42 pruefen.
+- TCA9554-Adresse `0x20` pruefen.
+- Pullups auf SDA/SCL pruefen.
+- Versorgung und Masseverbindung pruefen.
 
----
+### Upload schlaegt fehl
 
-## 📚 Weitere Ressourcen
+- USB-Kabel pruefen.
+- Bootloader-Modus verwenden.
+- Port in PlatformIO pruefen.
+- `platformio device list` ausfuehren.
 
-- [PlatformIO Dokumentation](https://docs.platformio.org/)
-- [ESP32 Arduino Core](https://github.com/espressif/arduino-esp32)
-- [Waveshare ESP32-S3-POE Wiki](https://www.waveshare.com/wiki/ESP32-S3-POE-ETH-8DI-8DO)
-- [LD2410 Präsenzsensor](https://www.seeedstudio.com/LD2410-Human-Presence-Sensor-p-5643.html)
-- [ArduinoJson Dokumentation](https://arduinojson.org/)
+## Einbauhinweise
 
----
+Fuer den produktiven Einbau an der Landmaschine empfohlen:
 
-## 📝 Lizenz
+- eigene Sicherung nahe am Abgriff
+- Verpolschutz
+- TVS-Diode gegen Spannungsspitzen
+- Automotive-DC/DC-Wandler
+- gemeinsamer sauberer Massepunkt
+- geschirmte oder verdrillte Leitungen fuer RS485
+- 120-Ohm-RS485-Abschluss nur an den Busenden
+- Zugentlastung und vibrationsfeste Steckverbinder
 
-MIT License
+## Projektdateien
 
-## 👤 Autor
+```text
+.
+├── platformio.ini
+├── README.md
+├── RELEASE_NOTES.md
+├── src/
+│   └── main.cpp
+├── include/
+├── lib/
+└── test/
+```
+
+## Weitere Ressourcen
+
+- PlatformIO Dokumentation: https://docs.platformio.org/
+- ESP32 Arduino Core: https://github.com/espressif/arduino-esp32
+- Waveshare ESP32-S3-POE-ETH-8DI-8DO Wiki: https://www.waveshare.com/wiki/ESP32-S3-POE-ETH-8DI-8DO
+- ArduinoJson: https://arduinojson.org/
+
+## Autor
 
 Tobias Plagge
 
----
-
-**Zuletzt aktualisiert:** 25. Mai 2026
+Letzte Aktualisierung: 7. Juni 2026
