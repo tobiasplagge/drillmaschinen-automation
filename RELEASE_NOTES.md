@@ -1,5 +1,22 @@
 # Release Notes
 
+## 2.0.0 - 2026-06-07
+
+### Neu
+
+- Hikvision-Kameraeinbindung mit Mainstream-/Substream-Umschaltung ergänzt.
+- W5500-Ethernet-Port initialisiert; Kamera wird über den LAN-Port angesprochen.
+- Kamera-Stream-Proxy ergänzt, damit das Webinterface den LAN-Kamerastream über den ESP32 anzeigen kann.
+- Kamera-Verbindungstest in den Einstellungen ergänzt.
+- Kamera-IP, Benutzer und Passwort sind im Webinterface einstellbar und werden persistent gespeichert.
+- Tablet-/Smartphone-Ton kann direkt auf der Mainpage aktiviert werden.
+
+### Geändert
+
+- Kamera-Livebild pausiert die zyklischen API-Abfragen, damit der ESP32-Webserver nicht durch parallele Requests blockiert wird.
+- Bei aktivem Kamerabild zeigt der Kontaktstatus `Kamera aktiv` mit grün blinkendem Punkt.
+- Der Kamera-Test prüft nur noch die relevanten Ethernet-HTTP-Verbindungen.
+
 ## 1.5.0 - 2026-05-31
 
 ### Neu

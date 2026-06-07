@@ -1,10 +1,13 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <Ethernet.h>
 #include <LittleFS.h>
 #include <Preferences.h>
+#include <SPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <base64.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
@@ -15,16 +18,37 @@
 static const char *AP_SSID = "Drillmaschine-M01";
 static const char *AP_PASSWORD = "12345678";
 
+// Waveshare W5500 Ethernet: INT GPIO12, MOSI GPIO13, MISO GPIO14,
+// SCLK GPIO15, CS GPIO16, RST GPIO39.
+static constexpr uint8_t ETH_INT_PIN = 12;
+static constexpr uint8_t ETH_MOSI_PIN = 13;
+static constexpr uint8_t ETH_MISO_PIN = 14;
+static constexpr uint8_t ETH_SCLK_PIN = 15;
+static constexpr uint8_t ETH_CS_PIN = 16;
+static constexpr uint8_t ETH_RST_PIN = 39;
+static byte ETH_MAC[6] = {0x02, 0x57, 0x53, 0x33, 0x44, 0x01};
+static const IPAddress ETHERNET_IP(192, 168, 4, 10);
+static const IPAddress ETHERNET_DNS(192, 168, 4, 1);
+static const IPAddress ETHERNET_GATEWAY(192, 168, 4, 1);
+static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
+
 static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
-static const char *FIRMWARE_VERSION = "1.5.0";
+static const char *FIRMWARE_VERSION = "2.0.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
 // Häufige Varianten sind /ISAPI/Streaming/channels/101/httpPreview für Mainstream
 // oder /ISAPI/Streaming/channels/102/httpPreview für Substream.
-static const char *HIKVISION_CAMERA_STREAM_URL = "http://192.168.4.20/ISAPI/Streaming/channels/102/httpPreview";
+static const char *HIKVISION_CAMERA_MAIN_STREAM_PATH = "/ISAPI/Streaming/channels/101/httpPreview";
+static const char *HIKVISION_CAMERA_SUB_STREAM_PATH = "/ISAPI/Streaming/channels/102/httpPreview";
+static const char *CAMERA_PROXY_MAIN_STREAM_URL = "/camera/mainstream";
+static const char *CAMERA_PROXY_SUB_STREAM_URL = "/camera/substream";
 static const char *HIKVISION_CAMERA_NAME = "Hikvision Kamera";
+static constexpr uint16_t HIKVISION_CAMERA_TEST_TIMEOUT_MS = 1500;
+static constexpr uint8_t CAMERA_HOST_LENGTH = 32;
+static constexpr uint8_t CAMERA_USERNAME_LENGTH = 32;
+static constexpr uint8_t CAMERA_PASSWORD_LENGTH = 48;
 
 static constexpr uint8_t CHANNEL_COUNT = 8;
 static constexpr uint8_t SEED_CHANNEL_COUNT = 6;
@@ -89,6 +113,7 @@ static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
 WebServer server(80);
 Preferences preferences;
 HardwareSerial gnssSerial(1);
+bool ethernetReady = false;
 
 struct ChannelState {
   bool inputRaw = false;
@@ -188,6 +213,9 @@ char channelNames[CHANNEL_COUNT][CHANNEL_NAME_LENGTH] = {
 };
 char cropName[CROP_NAME_LENGTH] = "Weizen";
 char fieldName[FIELD_NAME_LENGTH] = "Feld";
+char cameraHost[CAMERA_HOST_LENGTH] = "192.168.4.20";
+char cameraUsername[CAMERA_USERNAME_LENGTH] = "admin";
+char cameraPassword[CAMERA_PASSWORD_LENGTH] = "Administrator01";
 char tripId[TRIP_ID_LENGTH] = "-";
 char tripGpsPath[64] = "";
 char tripSensorPath[64] = "";
@@ -408,6 +436,35 @@ void loadFieldName() {
   sanitizeFieldName(fieldName);
 }
 
+void sanitizeCameraValue(char *value, size_t maxLength) {
+  value[maxLength - 1] = '\0';
+  String cleaned(value);
+  cleaned.trim();
+  cleaned.replace("\r", "");
+  cleaned.replace("\n", "");
+  cleaned.toCharArray(value, maxLength);
+}
+
+void loadCameraSettings() {
+  String stored = preferences.getString("cam_host", "");
+  if (stored.length() > 0) {
+    stored.toCharArray(cameraHost, CAMERA_HOST_LENGTH);
+  }
+  sanitizeCameraValue(cameraHost, CAMERA_HOST_LENGTH);
+
+  stored = preferences.getString("cam_user", "");
+  if (stored.length() > 0) {
+    stored.toCharArray(cameraUsername, CAMERA_USERNAME_LENGTH);
+  }
+  sanitizeCameraValue(cameraUsername, CAMERA_USERNAME_LENGTH);
+
+  stored = preferences.getString("cam_pass", "");
+  if (stored.length() > 0) {
+    stored.toCharArray(cameraPassword, CAMERA_PASSWORD_LENGTH);
+  }
+  sanitizeCameraValue(cameraPassword, CAMERA_PASSWORD_LENGTH);
+}
+
 void loadSensitivity() {
   mainSignalHoldMs = preferences.getUInt("hold_ms", DEFAULT_MAIN_SIGNAL_HOLD_MS);
   mainSignalHoldMs = constrain(mainSignalHoldMs, MIN_MAIN_SIGNAL_HOLD_MS, MAX_MAIN_SIGNAL_HOLD_MS);
@@ -437,6 +494,22 @@ void saveFieldName(const String &name) {
   name.toCharArray(fieldName, FIELD_NAME_LENGTH);
   sanitizeFieldName(fieldName);
   preferences.putString("field", fieldName);
+}
+
+void saveCameraSettings(const String &host, const String &username, const String &password) {
+  host.toCharArray(cameraHost, CAMERA_HOST_LENGTH);
+  username.toCharArray(cameraUsername, CAMERA_USERNAME_LENGTH);
+  password.toCharArray(cameraPassword, CAMERA_PASSWORD_LENGTH);
+  sanitizeCameraValue(cameraHost, CAMERA_HOST_LENGTH);
+  sanitizeCameraValue(cameraUsername, CAMERA_USERNAME_LENGTH);
+  sanitizeCameraValue(cameraPassword, CAMERA_PASSWORD_LENGTH);
+  preferences.putString("cam_host", cameraHost);
+  preferences.putString("cam_user", cameraUsername);
+  preferences.putString("cam_pass", cameraPassword);
+}
+
+String cameraAuthHeader() {
+  return "Basic " + base64::encode(String(cameraUsername) + ":" + String(cameraPassword));
 }
 
 void saveSensitivity(uint32_t holdMs) {
@@ -1183,6 +1256,9 @@ String statusJson() {
   doc["wifi_ap_ssid"] = AP_SSID;
   doc["ip"] = WiFi.softAPIP().toString();
   doc["web_url"] = "http://" + WiFi.softAPIP().toString() + "/";
+  doc["ethernet_ready"] = ethernetReady;
+  doc["ethernet_ip"] = ethernetReady ? Ethernet.localIP().toString() : "";
+  doc["ethernet_link"] = Ethernet.linkStatus() == LinkON;
   doc["main_signal_hold_ms"] = mainSignalHoldMs;
   doc["quality_signal_hold_ms"] = mainSignalHoldMs;
   doc["red_signal_hold_ms"] = RED_SIGNAL_HOLD_MS;
@@ -1190,7 +1266,11 @@ String statusJson() {
   doc["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
   doc["light_switchable"] = doExpanderReady;
   doc["camera_name"] = HIKVISION_CAMERA_NAME;
-  doc["camera_stream_url"] = HIKVISION_CAMERA_STREAM_URL;
+  doc["camera_stream_url"] = CAMERA_PROXY_SUB_STREAM_URL;
+  doc["camera_main_stream_url"] = CAMERA_PROXY_MAIN_STREAM_URL;
+  doc["camera_sub_stream_url"] = CAMERA_PROXY_SUB_STREAM_URL;
+  doc["camera_host"] = cameraHost;
+  doc["camera_username"] = cameraUsername;
   doc["gps_log_interval_ms"] = GPS_LOG_INTERVAL_MS;
   doc["recording_active"] = recordingActive;
   doc["gps_log_count"] = gpsLogCount;
@@ -1305,6 +1385,8 @@ String htmlPage() {
     .connection-dot { width: 13px; height: 13px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 10px #22c55e; display: inline-block; margin-right: 6px; vertical-align: -1px; }
     .connection.offline .connection-dot { background: #ef4444; box-shadow: 0 0 12px #ef4444; }
     .connection.stale .connection-dot { background: #facc15; box-shadow: 0 0 10px #facc15; }
+    .connection.camera .connection-dot { background: #22c55e; box-shadow: 0 0 10px #22c55e; animation: cameraPulse 1.1s ease-in-out infinite; }
+    @keyframes cameraPulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.15); } }
     .warning { border: 1px solid #f59e0b; border-radius: 6px; background: #78350f; color: #fef3c7; padding: 10px 12px; margin-bottom: 14px; font-weight: 750; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
     .bar-grid { display: grid; grid-template-columns: repeat(8, minmax(72px, 1fr)); gap: 10px; }
@@ -1324,6 +1406,9 @@ String htmlPage() {
     .rotation-line.off { color: #fecaca; }
     .camera-panel { margin-top: 14px; }
     .camera-panel summary { cursor: pointer; font-weight: 850; color: #f9fafb; }
+    .camera-controls { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .camera-stream-button { background: #374151; min-width: 96px; }
+    .camera-stream-button.active { background: #2563eb; }
     .camera-frame { margin-top: 12px; border: 1px solid #374151; border-radius: 8px; overflow: hidden; background: #020617; aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center; }
     .camera-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
     .camera-meta { margin-top: 8px; color: #9ca3af; font-size: .86rem; overflow-wrap: anywhere; }
@@ -1357,6 +1442,10 @@ String htmlPage() {
     .crop-chip { background: #374151; color: #f9fafb; padding: 7px 10px; border-radius: 6px; }
     .crop-chip.active { background: #16a34a; }
     .suggestion-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 5px 0; }
+    .camera-test-status { margin-top: 8px; color: #d1d5db; font-size: .9rem; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .camera-test-status.ok { color: #bbf7d0; }
+    .camera-test-status.warn { color: #fde68a; }
+    .camera-test-status.fail { color: #fecaca; }
     .module-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
     .module { border: 1px solid #4b5563; border-radius: 6px; padding: 9px; color: #9ca3af; }
     .module.online { border-color: #16a34a; color: #dcfce7; }
@@ -1430,14 +1519,12 @@ String htmlPage() {
       <button id="monitoringTab" class="tab-button active" type="button">Überwachung</button>
       <button id="mapTab" class="tab-button" type="button">Karte</button>
       <button id="lightOn" class="nav-action light-unknown" type="button">Licht</button>
+      <button id="alarmEnable" class="nav-action secondary" type="button">Ton aktivieren</button>
       <button id="alarmAck" class="nav-action secondary" type="button">Alarm quittieren</button>
       <button id="settingsTab" class="tab-button" type="button">Einstellungen</button>
     </nav>
     <section class="panel settings-only">
       <h2>Überblick</h2>
-      <div class="actions">
-        <button id="alarmEnable" class="secondary" type="button">Ton aktivieren</button>
-      </div>
       <details class="tools-details">
         <summary>Dateien und Wartung</summary>
         <div class="actions">
@@ -1494,6 +1581,23 @@ String htmlPage() {
     </section>
     <section id="settingsView" class="panel hidden">
       <h2>Fehleranalyse & Einstellungen</h2>
+      <div class="field-row">
+        <div style="min-width:0;">
+          <h3>Kamera</h3>
+          <div class="field-row">
+            <button id="cameraTest" class="secondary" type="button">Verbindung testen</button>
+          </div>
+          <div class="field-row">
+            <input id="cameraHostInput" maxlength="31" placeholder="Kamera-IP">
+            <input id="cameraUserInput" maxlength="31" placeholder="Benutzer">
+          </div>
+          <div class="field-row">
+            <input id="cameraPasswordInput" type="password" maxlength="47" placeholder="Passwort">
+            <button id="cameraSave" type="button">Kamera speichern</button>
+          </div>
+          <div id="cameraTestStatus" class="camera-test-status">Noch nicht getestet.</div>
+        </div>
+      </div>
       <div class="settings-only">
         <h3>Kanaldetails</h3>
         <div id="sensorDetailsGrid" class="sensor-table"></div>
@@ -1563,6 +1667,10 @@ String htmlPage() {
     <div id="grid" class="bar-grid monitoring-view"></div>
     <details id="cameraPanel" class="panel monitoring-view camera-panel">
       <summary><span id="cameraTitle">Hikvision Kamera</span></summary>
+      <div class="camera-controls">
+        <button id="cameraSubStream" class="camera-stream-button active" type="button">Substream</button>
+        <button id="cameraMainStream" class="camera-stream-button" type="button">Mainstream</button>
+      </div>
       <div class="camera-frame">
         <img id="cameraImage" alt="Kamerabild" loading="lazy">
       </div>
@@ -1592,6 +1700,7 @@ String htmlPage() {
     let lightOnState = false;
     let lightSwitchable = false;
     let cameraStreamUrl = '';
+    let cameraStreamMode = localStorage.getItem('cameraStreamMode') === 'main' ? 'main' : 'sub';
     let trackBusy = false;
     let lastTrackData = { points: [], events: [], current: null };
     let topoMap = null;
@@ -1777,13 +1886,23 @@ String htmlPage() {
       }
     }
 
+    function setCameraStreamMode(mode) {
+      cameraStreamMode = mode === 'main' ? 'main' : 'sub';
+      localStorage.setItem('cameraStreamMode', cameraStreamMode);
+      updateCamera(window.lastStatusData || {});
+    }
+
     function updateCamera(data) {
-      cameraStreamUrl = data.camera_stream_url || '';
+      const mainUrl = data.camera_main_stream_url || '';
+      const subUrl = data.camera_sub_stream_url || data.camera_stream_url || '';
+      cameraStreamUrl = cameraStreamMode === 'main' ? mainUrl : subUrl;
       document.getElementById('cameraTitle').textContent = data.camera_name || 'Kamera';
       document.getElementById('cameraUrl').textContent = cameraStreamUrl || 'Keine Kamera-URL konfiguriert.';
+      document.getElementById('cameraSubStream').classList.toggle('active', cameraStreamMode === 'sub');
+      document.getElementById('cameraMainStream').classList.toggle('active', cameraStreamMode === 'main');
       const panel = document.getElementById('cameraPanel');
       const image = document.getElementById('cameraImage');
-      if (panel.open && cameraStreamUrl && image.src !== cameraStreamUrl) {
+      if (panel.open && cameraStreamUrl && image.getAttribute('src') !== cameraStreamUrl) {
         image.src = cameraStreamUrl;
       } else if (!panel.open && image.src) {
         image.removeAttribute('src');
@@ -1871,16 +1990,33 @@ String htmlPage() {
       syncAlarm();
     }
 
+    function isCameraStreamOpen() {
+      const panel = document.getElementById('cameraPanel');
+      const image = document.getElementById('cameraImage');
+      return Boolean(panel && panel.open && image && image.getAttribute('src'));
+    }
+
+    function hideDebugOverlay() {
+      const dbg = document.getElementById('debugOverlay');
+      if (!dbg) return;
+      dbg.textContent = '';
+      dbg.style.display = 'none';
+      dbg.classList.add('hidden');
+    }
+
     function setConnectionState(state, detail) {
       const box = document.getElementById('connection');
       const label = document.getElementById('connectionState');
-      box.classList.remove('offline', 'stale');
+      box.classList.remove('offline', 'stale', 'camera');
       if (state === 'offline') {
         box.classList.add('offline');
         label.textContent = 'Fehler';
       } else if (state === 'stale') {
         box.classList.add('stale');
         label.textContent = '> 10 s';
+      } else if (state === 'camera') {
+        box.classList.add('camera');
+        label.textContent = 'Kamera aktiv';
       } else {
         label.textContent = 'OK';
       }
@@ -1891,6 +2027,11 @@ String htmlPage() {
 
     function updateLastContact() {
       const target = document.getElementById('lastContactMini');
+      if (isCameraStreamOpen()) {
+        target.textContent = 'Kamera';
+        setConnectionState('camera');
+        return;
+      }
       if (!lastSuccessfulContactMs) {
         target.textContent = '-';
         setConnectionState('offline');
@@ -2126,6 +2267,7 @@ String htmlPage() {
 
     async function refreshTrack() {
       if (trackBusy || !pageActive) return;
+      if (isCameraStreamOpen()) return;
       trackBusy = true;
       try {
         const res = await fetchWithTimeout('/api/track');
@@ -2142,6 +2284,12 @@ String htmlPage() {
 
     async function refresh() {
       if (refreshBusy || !pageActive) return;
+      if (isCameraStreamOpen()) {
+        document.getElementById('error').textContent = '';
+        hideDebugOverlay();
+        updateLastContact();
+        return;
+      }
       refreshBusy = true;
       try {
         const res = await fetchWithTimeout('/api/status');
@@ -2178,6 +2326,15 @@ String htmlPage() {
         if (document.activeElement !== document.getElementById('fieldInput')) {
           document.getElementById('fieldInput').value = data.field_name || '';
         }
+        if (document.activeElement !== document.getElementById('cameraHostInput')) {
+          document.getElementById('cameraHostInput').value = data.camera_host || '';
+        }
+        if (document.activeElement !== document.getElementById('cameraUserInput')) {
+          document.getElementById('cameraUserInput').value = data.camera_username || '';
+        }
+        if (!document.getElementById('cameraPasswordInput').value) {
+          document.getElementById('cameraPasswordInput').placeholder = 'Passwort gespeichert';
+        }
         document.getElementById('gpsCount').textContent = `${data.gps_log_count || 0} / ${data.gps_log_capacity || 0}`;
         document.getElementById('mainEventCount').textContent = `${data.main_event_count || 0} / ${data.main_event_capacity || 0}`;
         document.getElementById('sensorEventCount').textContent = `${data.sensor_event_count || 0} / ${data.sensor_event_capacity || 0}`;
@@ -2213,7 +2370,14 @@ String htmlPage() {
         document.getElementById('sensorDetailsGrid').innerHTML = sensorDetails(data.channels || []);
         setTimeout(() => { renderingGrid = false; }, 80);
         document.getElementById('error').textContent = '';
+        hideDebugOverlay();
       } catch (err) {
+        if (isCameraStreamOpen()) {
+          document.getElementById('error').textContent = '';
+          hideDebugOverlay();
+          updateLastContact();
+          return;
+        }
         updateLastContact();
         document.getElementById('error').textContent = 'Keine Verbindung zur API';
         try {
@@ -2292,6 +2456,65 @@ String htmlPage() {
         await refresh();
       } catch (err) {
         document.getElementById('error').textContent = 'Empfindlichkeit speichern fehlgeschlagen';
+      }
+    }
+
+    async function testCameraConnection() {
+      const button = document.getElementById('cameraTest');
+      const target = document.getElementById('cameraTestStatus');
+      button.disabled = true;
+      target.className = 'camera-test-status';
+      target.textContent = 'Kamera wird getestet ...';
+      try {
+        const res = await fetchWithTimeout('/api/camera-test', {}, 12000);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const items = [data.substream, data.mainstream].filter(Boolean);
+        const hasOk = items.some(item => item.stream_ok);
+        const hasReachable = items.some(item => item.reachable);
+        target.className = 'camera-test-status ' + (hasOk ? 'ok' : hasReachable ? 'warn' : 'fail');
+        target.textContent = items.map(item => {
+          const label = item.label || 'Stream';
+          const iface = item.interface ? ` über ${item.interface}` : '';
+          const status = item.reachable
+            ? `HTTP ${item.http_code}${item.stream_ok ? ', MJPEG erkannt' : ', kein MJPEG'}`
+            : `nicht erreichbar (${item.error || 'Timeout'})`;
+          const contentType = item.content_type ? `\n  Typ: ${item.content_type}` : '';
+          return `${label}${iface}: ${status}${contentType}`;
+        }).join('\n');
+      } catch (err) {
+        target.className = 'camera-test-status fail';
+        target.textContent = `Kameratest fehlgeschlagen (${err.message || 'Timeout'})`;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function saveCameraSettings() {
+      const host = document.getElementById('cameraHostInput').value.trim();
+      const username = document.getElementById('cameraUserInput').value.trim();
+      const passwordInput = document.getElementById('cameraPasswordInput');
+      const password = passwordInput.value.trim();
+      if (!host || !username || !password) {
+        document.getElementById('cameraTestStatus').className = 'camera-test-status fail';
+        document.getElementById('cameraTestStatus').textContent = 'Kamera-IP, Benutzer und Passwort eintragen.';
+        return;
+      }
+      try {
+        const res = await fetchWithTimeout('/api/camera-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ host, username, password })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        passwordInput.value = '';
+        passwordInput.placeholder = 'Passwort gespeichert';
+        document.getElementById('cameraTestStatus').className = 'camera-test-status ok';
+        document.getElementById('cameraTestStatus').textContent = 'Kameraeinstellungen gespeichert.';
+        await refresh();
+      } catch (err) {
+        document.getElementById('cameraTestStatus').className = 'camera-test-status fail';
+        document.getElementById('cameraTestStatus').textContent = 'Kameraeinstellungen speichern fehlgeschlagen';
       }
     }
 
@@ -2427,6 +2650,8 @@ String htmlPage() {
     document.getElementById('cropSave').addEventListener('click', saveCrop);
     document.getElementById('fieldSave').addEventListener('click', saveField);
     document.getElementById('sensitivitySave').addEventListener('click', saveSensitivitySetting);
+    document.getElementById('cameraSave').addEventListener('click', saveCameraSettings);
+    document.getElementById('cameraTest').addEventListener('click', testCameraConnection);
     document.getElementById('archiveRefresh').addEventListener('click', loadArchive);
     document.getElementById('alarmEnable').addEventListener('click', enableAlarm);
     document.getElementById('alarmAck').addEventListener('click', acknowledgeAlarm);
@@ -2435,7 +2660,18 @@ String htmlPage() {
     document.getElementById('settingsTab').addEventListener('click', () => selectView('settings'));
     document.getElementById('lightOn').addEventListener('click', () => toggleLight());
     document.getElementById('mapFollow').addEventListener('click', () => setMapFollow(!followMap));
-    document.getElementById('cameraPanel').addEventListener('toggle', () => updateCamera(window.lastStatusData || {}));
+    document.getElementById('cameraSubStream').addEventListener('click', () => setCameraStreamMode('sub'));
+    document.getElementById('cameraMainStream').addEventListener('click', () => setCameraStreamMode('main'));
+    document.getElementById('cameraPanel').addEventListener('toggle', event => {
+      updateCamera(window.lastStatusData || {});
+      if (event.currentTarget.open) {
+        document.getElementById('error').textContent = '';
+        hideDebugOverlay();
+        updateLastContact();
+      } else {
+        refresh();
+      }
+    });
     window.addEventListener('pagehide', () => {
       pageActive = false;
       document.getElementById('cameraImage').removeAttribute('src');
@@ -2487,6 +2723,198 @@ void handleRoot() {
 void handleApiStatus() {
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", statusJson());
+}
+
+void addCameraTestResult(JsonObject target, const char *label, const char *path) {
+  const uint32_t startMs = millis();
+  EthernetClient client;
+  client.setTimeout(HIKVISION_CAMERA_TEST_TIMEOUT_MS);
+
+  bool connected = ethernetReady && client.connect(cameraHost, 80);
+  int httpCode = -1;
+  String statusLine;
+  String contentType;
+  String error;
+
+  if (connected) {
+    client.print("GET ");
+    client.print(path);
+    client.print(" HTTP/1.1\r\nHost: ");
+    client.print(cameraHost);
+    client.print("\r\nAuthorization: ");
+    client.print(cameraAuthHeader());
+    client.print("\r\nConnection: close\r\n\r\n");
+
+    String line;
+    bool firstLine = true;
+    bool headersDone = false;
+    while (millis() - startMs < HIKVISION_CAMERA_TEST_TIMEOUT_MS && client.connected() && !headersDone) {
+      while (client.available() && !headersDone) {
+        const char c = static_cast<char>(client.read());
+        if (c == '\r') {
+          continue;
+        }
+        if (c == '\n') {
+          if (firstLine) {
+            statusLine = line;
+            const int firstSpace = statusLine.indexOf(' ');
+            if (firstSpace >= 0 && statusLine.length() >= firstSpace + 4) {
+              httpCode = statusLine.substring(firstSpace + 1, firstSpace + 4).toInt();
+            }
+            firstLine = false;
+          } else if (line.length() == 0) {
+            headersDone = true;
+          } else {
+            String lowerLine = line;
+            lowerLine.toLowerCase();
+            if (lowerLine.startsWith("content-type:")) {
+              contentType = line.substring(line.indexOf(':') + 1);
+              contentType.trim();
+            }
+          }
+          line = "";
+        } else if (line.length() < 160) {
+          line += c;
+        }
+      }
+      if (!headersDone) {
+        delay(5);
+      }
+    }
+
+    if (httpCode < 0) {
+      error = "no_http_header";
+    }
+  } else {
+    error = ethernetReady ? "connect_failed" : "ethernet_not_ready";
+  }
+
+  const uint32_t durationMs = millis() - startMs;
+  client.stop();
+
+  contentType.toLowerCase();
+  const bool reachable = connected && httpCode > 0;
+  const bool streamOk = httpCode == 200 &&
+                        (contentType.indexOf("multipart") >= 0 || contentType.indexOf("image/jpeg") >= 0);
+
+  target["label"] = label;
+  target["interface"] = "ethernet";
+  target["reachable"] = reachable;
+  target["stream_ok"] = streamOk;
+  target["http_code"] = httpCode;
+  target["status_line"] = statusLine;
+  target["content_type"] = contentType;
+  target["duration_ms"] = durationMs;
+  if (error.length() > 0) {
+    target["error"] = error;
+  }
+}
+
+void handleApiCameraTest() {
+  JsonDocument doc;
+  doc["camera_name"] = HIKVISION_CAMERA_NAME;
+  addCameraTestResult(doc["substream"].to<JsonObject>(), "Substream 102", HIKVISION_CAMERA_SUB_STREAM_PATH);
+  addCameraTestResult(doc["mainstream"].to<JsonObject>(), "Mainstream 101", HIKVISION_CAMERA_MAIN_STREAM_PATH);
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleCameraProxy(const char *cameraPath) {
+  if (!ethernetReady) {
+    server.send(503, "text/plain; charset=utf-8", "Ethernet nicht bereit");
+    return;
+  }
+
+  EthernetClient camera;
+  camera.setTimeout(HIKVISION_CAMERA_TEST_TIMEOUT_MS);
+  if (!camera.connect(cameraHost, 80)) {
+    server.send(502, "text/plain; charset=utf-8", "Kamera nicht erreichbar");
+    return;
+  }
+
+  camera.print("GET ");
+  camera.print(cameraPath);
+  camera.print(" HTTP/1.1\r\nHost: ");
+  camera.print(cameraHost);
+  camera.print("\r\nAuthorization: ");
+  camera.print(cameraAuthHeader());
+  camera.print("\r\nConnection: close\r\n\r\n");
+
+  const uint32_t headerStartMs = millis();
+  String line;
+  String statusLine;
+  String contentType = "multipart/x-mixed-replace";
+  int httpCode = -1;
+  bool firstLine = true;
+  bool headersDone = false;
+  while (millis() - headerStartMs < HIKVISION_CAMERA_TEST_TIMEOUT_MS && camera.connected() && !headersDone) {
+    while (camera.available() && !headersDone) {
+      const char c = static_cast<char>(camera.read());
+      if (c == '\r') {
+        continue;
+      }
+      if (c == '\n') {
+        if (firstLine) {
+          statusLine = line;
+          const int firstSpace = statusLine.indexOf(' ');
+          if (firstSpace >= 0 && statusLine.length() >= firstSpace + 4) {
+            httpCode = statusLine.substring(firstSpace + 1, firstSpace + 4).toInt();
+          }
+          firstLine = false;
+        } else if (line.length() == 0) {
+          headersDone = true;
+        } else {
+          String lowerLine = line;
+          lowerLine.toLowerCase();
+          if (lowerLine.startsWith("content-type:")) {
+            contentType = line.substring(line.indexOf(':') + 1);
+            contentType.trim();
+          }
+        }
+        line = "";
+      } else if (line.length() < 200) {
+        line += c;
+      }
+    }
+    if (!headersDone) {
+      delay(5);
+    }
+  }
+
+  if (!headersDone || httpCode != 200) {
+    camera.stop();
+    server.send(502, "text/plain; charset=utf-8", "Kamera Stream Fehler: " + statusLine);
+    return;
+  }
+
+  WiFiClient browser = server.client();
+  browser.print("HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Type: ");
+  browser.print(contentType);
+  browser.print("\r\n\r\n");
+
+  uint8_t buffer[1024];
+  uint32_t lastDataMs = millis();
+  while (browser.connected() && camera.connected()) {
+    const int available = camera.available();
+    if (available > 0) {
+      const size_t count = camera.read(buffer, min(available, static_cast<int>(sizeof(buffer))));
+      if (count > 0) {
+        browser.write(buffer, count);
+        lastDataMs = millis();
+      }
+    } else if (millis() - lastDataMs > 5000) {
+      break;
+    } else {
+      delay(2);
+    }
+    esp_task_wdt_reset();
+  }
+
+  camera.stop();
+  browser.stop();
 }
 
 void handleApiAlarmAck() {
@@ -2707,6 +3135,33 @@ void handleApiSensitivity() {
   response["main_signal_hold_ms"] = mainSignalHoldMs;
   response["quality_signal_hold_ms"] = mainSignalHoldMs;
   response["red_signal_hold_ms"] = RED_SIGNAL_HOLD_MS;
+  String json;
+  serializeJson(response, json);
+  server.send(200, "application/json", json);
+}
+
+void handleApiCameraSettings() {
+  const String body = server.arg("plain");
+  JsonDocument doc;
+  if (body.length() == 0 || deserializeJson(doc, body)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_body\"}");
+    return;
+  }
+
+  const String host = doc["host"] | "";
+  const String username = doc["username"] | "";
+  const String password = doc["password"] | "";
+  if (host.length() == 0 || username.length() == 0 || password.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"invalid_camera_settings\"}");
+    return;
+  }
+
+  saveCameraSettings(host, username, password);
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["camera_host"] = cameraHost;
+  response["camera_username"] = cameraUsername;
   String json;
   serializeJson(response, json);
   server.send(200, "application/json", json);
@@ -3232,6 +3687,32 @@ void startWiFiAccessPoint() {
   Serial.println(WiFi.softAPIP());
 }
 
+void startEthernet() {
+  pinMode(ETH_INT_PIN, INPUT_PULLUP);
+  pinMode(ETH_RST_PIN, OUTPUT);
+  digitalWrite(ETH_RST_PIN, LOW);
+  delay(50);
+  digitalWrite(ETH_RST_PIN, HIGH);
+  delay(200);
+
+  SPI.begin(ETH_SCLK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN, ETH_CS_PIN);
+  Ethernet.init(ETH_CS_PIN);
+  Ethernet.begin(ETH_MAC, ETHERNET_IP, ETHERNET_DNS, ETHERNET_GATEWAY, ETHERNET_SUBNET);
+  delay(200);
+
+  const EthernetHardwareStatus hardware = Ethernet.hardwareStatus();
+  const EthernetLinkStatus link = Ethernet.linkStatus();
+  ethernetReady = hardware != EthernetNoHardware;
+
+  Serial.println("Ethernet W5500 initialisiert");
+  Serial.print("Hardware: ");
+  Serial.println(hardware == EthernetNoHardware ? "nicht gefunden" : "OK");
+  Serial.print("Link: ");
+  Serial.println(link == LinkON ? "ON" : link == LinkOFF ? "OFF" : "UNKNOWN");
+  Serial.print("Ethernet IP: ");
+  Serial.println(Ethernet.localIP());
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -3243,6 +3724,7 @@ void setup() {
   loadChannelNames();
   loadCropName();
   loadFieldName();
+  loadCameraSettings();
   loadSensitivity();
   bootCounter = preferences.getUInt("boot_counter", 0) + 1;
   tripCounter = preferences.getUInt("trip_counter", 0);
@@ -3253,15 +3735,20 @@ void setup() {
   initGnssRs485();
   initDigitalInputs();
   startWiFiAccessPoint();
+  startEthernet();
   initDigitalOutputs();
 
   server.on("/", HTTP_GET, handleRoot);
+  server.on(CAMERA_PROXY_SUB_STREAM_URL, HTTP_GET, []() { handleCameraProxy(HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  server.on(CAMERA_PROXY_MAIN_STREAM_URL, HTTP_GET, []() { handleCameraProxy(HIKVISION_CAMERA_MAIN_STREAM_PATH); });
   server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/camera-test", HTTP_GET, handleApiCameraTest);
   server.on("/api/alarm/ack", HTTP_POST, handleApiAlarmAck);
   server.on("/api/channel-name", HTTP_POST, handleApiChannelName);
   server.on("/api/crop", HTTP_POST, handleApiCrop);
   server.on("/api/field", HTTP_POST, handleApiField);
   server.on("/api/sensitivity", HTTP_POST, handleApiSensitivity);
+  server.on("/api/camera-settings", HTTP_POST, handleApiCameraSettings);
   server.on("/api/recording", HTTP_POST, handleApiRecording);
   server.on("/api/output", HTTP_POST, handleApiOutput);
   server.on("/api/track", HTTP_GET, handleApiTrack);

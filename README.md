@@ -19,6 +19,7 @@ Ethernet-basierte Steuerung mit 8 digitalen Eingängen und 8 digitalen Ausgänge
 - ✅ Fahrtaufzeichnung mit Ebyte EWD108-GN05(485) per RS485/Modbus RTU
 - ✅ Ereignislog für Hauptsignale mit GPS-Koordinaten, sofern verfügbar
 - ✅ Alarmton auf Tablet/Smartphone mit Quittierung
+- ✅ Hikvision-Kamera über LAN/W5500 mit Substream-Livebild und Verbindungstest
 - ✅ WLAN Access Point Fallback
 - ✅ ArduinoJson Verarbeitung
 
