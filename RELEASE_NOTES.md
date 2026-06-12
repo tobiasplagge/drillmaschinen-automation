@@ -1,5 +1,31 @@
 # Release Notes
 
+## 2.1.0 - 2026-06-12
+
+### Neu
+
+- Bis zu vier Hikvision-Kameras koennen konfiguriert und auf der Mainpage angezeigt werden.
+- Nicht konfigurierte Kameras werden automatisch ausgeblendet.
+- Kameraeinstellungen besitzen je Kamera IP-Adresse, Benutzer, Passwort und Verbindungstest.
+- Pneumatikventile auf `DO2..DO5` sind auf der Mainpage als `Sensor 1-6`, `Sensor 7-12`, `Sensor 13-18` und `Sensor 19-24` schaltbar.
+- Einstellungen zeigen eine Systemauslastung mit Heap, PSRAM, LittleFS, Sketch-Flash, Uptime, Reset-Grund und Ethernet-Status.
+- Kartenansicht zeigt GNSS-Signalqualitaet, Position, Genauigkeit/Satelliten und RS485-Status.
+- RS485-/GNSS-Diagnose mit Live-Test, Baudscan, Modbus-Adressscan, Registerscan sowie ASCII- und HEX-Rohdatenvorschau.
+
+### Geaendert
+
+- Ebyte EWD108-GN05(485) wird jetzt anhand der Herstellerregister gelesen: RMC ab Holding-Register `0x0005` ueber `35` Register.
+- NMEA-RMC-Parser akzeptiert kleine Status- und Richtungsbuchstaben aus dem Ebyte-RMC-Datensatz.
+- NMEA-Koordinatenumrechnung korrigiert, damit Werte wie `3046.26769,n` korrekt in Dezimalgrad gewandelt werden.
+- Pneumatikventile `DO2..DO5` werden nicht mehr automatisch durch Hauptsignale gespiegelt.
+- Kamerastreams starten weiterhin mit Substream; Mainstream kann je Kamera umgeschaltet werden.
+
+### Dokumentation
+
+- GNSS-Verdrahtung dokumentiert: GPS `A` auf Waveshare `A`, GPS `B` auf Waveshare `B`.
+- Externe GPS-Versorgung dokumentiert: `12V - / GPS GND` muss mit `GND` des Waveshare verbunden sein.
+- Kamera-Proxy-Endpunkte fuer Kamera 1 bis 4 dokumentiert.
+
 ## 2.0.0 - 2026-06-07
 
 ### Neu

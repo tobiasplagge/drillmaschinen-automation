@@ -3,7 +3,7 @@
 Firmware fuer das Waveshare ESP32-S3-POE-ETH-8DI-8DO Board zur
 Ueberwachung einer Drillmaschine.
 
-Aktuelle Firmware-Version: **2.0.0**
+Aktuelle Firmware-Version: **2.1.0**
 
 ## Kurzueberblick
 
@@ -29,15 +29,18 @@ API: http://192.168.4.1/api/status
 - Hauptsignal-Erkennung mit konfigurierbarer Empfindlichkeit
 - Alarmton im Tablet-/Smartphone-Browser mit Quittierung
 - Lichtausgang direkt auf der Mainpage schaltbar
+- Pneumatikventile auf Ausgang `DO2..DO5` direkt auf der Mainpage schaltbar
 - Fahrtaufzeichnung mit Ebyte EWD108-GN05(485) per RS485/Modbus RTU
 - Auto-Start der Fahrtaufzeichnung nach stabilem GNSS-Fix
 - Fahrtarchiv in LittleFS
 - CSV-, TXT- und GeoJSON-Downloads
-- Live-Kartenansicht mit OpenTopoMap und lokalem Canvas-Fallback
-- Hikvision-Kamera ueber W5500-LAN mit Substream/Mainstream-Umschalter
+- Live-Kartenansicht mit OpenTopoMap, GNSS-Signalqualitaet und lokalem Canvas-Fallback
+- Bis zu vier Hikvision-Kameras ueber W5500-LAN mit Substream/Mainstream-Umschalter
 - Kamera-Proxy im ESP32, damit Browser im ESP32-WLAN das LAN-Kamerabild sieht
 - Kamera-IP, Benutzer und Passwort im Webinterface einstellbar
 - Kamera-Verbindungstest ueber Ethernet
+- RS485-/GNSS-Diagnose mit Bytezaehler, Rohdaten, Baud-, Adress- und Registerscan
+- Systemauslastung mit Heap, PSRAM, LittleFS, Flash, Uptime und Ethernet-Status
 - Boot-Zaehler, Reset-Grund, Systemlog und Task-Watchdog
 
 ## Bedienung
@@ -51,9 +54,10 @@ Die Mainpage zeigt:
 - Licht-Schalter
 - Ton-Aktivierung
 - Alarm-Quittierung
+- Pneumatikventile `Sensor 1-6`, `Sensor 7-12`, `Sensor 13-18`, `Sensor 19-24`
 - Sensoruebersicht
 - GNSS-/Aufzeichnungsstatus
-- Kamerabereich
+- Kamerabereich fuer konfigurierte Kameras
 
 Der Alarmton muss im Browser einmal mit **Ton aktivieren** freigeschaltet
 werden. Danach startet er automatisch, wenn ein Hauptsignal in den Zustand
@@ -72,11 +76,14 @@ Im Reiter **Einstellungen** koennen gesetzt werden:
 - Kamera-IP
 - Kamera-Benutzer
 - Kamera-Passwort
+- RS485-/GNSS-Verbindungstests
+- Systemauslastung
 - Sensor-Empfindlichkeit
 - Saat-Vorschlaege
 - Kanalnamen in den Kanaldetails
 
-Der Button **Verbindung testen** prueft die Kamera ueber den W5500-LAN-Port.
+Der Button **Verbindung testen** prueft die jeweilige Kamera ueber den
+W5500-LAN-Port.
 Eine typische Ausgabe ist:
 
 ```text
@@ -97,13 +104,22 @@ Benutzer: admin
 Passwort: Administrator01
 ```
 
-Die Hikvision-Kamera haengt direkt am LAN-Port des ESP32/W5500. Der Browser ist
-im WLAN des ESP32 und kann die Kamera nicht direkt erreichen. Deshalb stellt
-die Firmware Proxy-Endpunkte bereit:
+Die erste Hikvision-Kamera haengt direkt am LAN-Port des ESP32/W5500. Bis zu
+vier Kameras koennen im Reiter **Einstellungen** angelegt werden. Nicht
+konfigurierte Kameras werden auf der Mainpage ausgeblendet.
+
+Der Browser ist im WLAN des ESP32 und kann die Kamera nicht direkt erreichen.
+Deshalb stellt die Firmware Proxy-Endpunkte bereit:
 
 ```text
-/camera/substream
-/camera/mainstream
+/camera/1/substream
+/camera/1/mainstream
+/camera/2/substream
+/camera/2/mainstream
+/camera/3/substream
+/camera/3/mainstream
+/camera/4/substream
+/camera/4/mainstream
 ```
 
 Der Substream sollte auf MJPEG gestellt sein. Mainstream `101` liefert bei
@@ -174,10 +190,22 @@ RS485-Pins:
 | RS485 TX | GPIO17 |
 | RS485 DE/RE | GPIO21 |
 
-Die Firmware scannt Holding-Register ab `0x0000` ueber 96 Register nach
-NMEA-RMC/GGA-Daten. Falls das reale Modul NMEA an anderer Stelle bereitstellt,
-muessen `GNSS_SCAN_START_REGISTER` und `GNSS_SCAN_REGISTER_COUNT` in
-`src/main.cpp` angepasst werden.
+Verdrahtung:
+
+| GPS-Modul | Waveshare |
+|-----------|-----------|
+| A | A |
+| B | B |
+| 12V - / GND | GND |
+| 12V + | externe 12V-Versorgung |
+
+Das GPS-Modul wird extern mit 12 V versorgt. Der Minuspol der 12V-Quelle muss
+mit `GND` des Waveshare verbunden sein, damit RS485 einen gemeinsamen Bezug hat.
+Bei dem getesteten Modul bleibt `B` auf `B` und `A` auf `A`.
+
+Die Firmware liest den RMC-Datensatz des Ebyte-Moduls aus Holding-Register
+`0x0005` ueber `35` Register (`70` Byte). Das entspricht dem
+Herstellerbeispiel `01 03 00 05 00 23 14 12`.
 
 Automatik:
 
@@ -265,6 +293,9 @@ static constexpr bool MIRROR_RED_TO_OUTPUT = true;
 static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
 ```
 
+`DO2..DO5` sind fuer Pneumatikventile reserviert und werden nicht automatisch
+durch Hauptsignale gespiegelt.
+
 ## API
 
 Basis:
@@ -276,10 +307,13 @@ http://192.168.4.1
 | Endpoint | Methode | Beschreibung |
 |----------|---------|--------------|
 | `/api/status` | GET | Gesamtstatus, GNSS, Kamera, Logs, Kanaele |
-| `/api/camera-test` | GET | Kamera-Verbindung ueber Ethernet testen |
-| `/api/camera-settings` | POST | Kamera-IP, Benutzer, Passwort speichern |
-| `/camera/substream` | GET | Kamera-Substream ueber ESP32-Proxy |
-| `/camera/mainstream` | GET | Kamera-Mainstream ueber ESP32-Proxy |
+| `/api/camera-test?index=0` | GET | Kamera-Verbindung ueber Ethernet testen |
+| `/api/camera-settings` | POST | Kamera-IP, Benutzer, Passwort je Kamera speichern |
+| `/camera/1/substream` bis `/camera/4/substream` | GET | Kamera-Substream ueber ESP32-Proxy |
+| `/camera/1/mainstream` bis `/camera/4/mainstream` | GET | Kamera-Mainstream ueber ESP32-Proxy |
+| `/api/rs485-scan` | GET | RS485-Baud-/Byte-Test |
+| `/api/rs485-address-scan` | GET | Modbus-Adressscan |
+| `/api/rs485-register-scan` | GET | Modbus-Registerscan |
 | `/api/alarm/ack` | POST | Alarm quittieren |
 | `/api/channel-name` | POST | Kanalnamen speichern |
 | `/api/crop` | POST | Saat speichern |
@@ -308,7 +342,7 @@ curl http://192.168.4.1/api/status
 
 curl -X POST http://192.168.4.1/api/camera-settings \
   -H 'Content-Type: application/json' \
-  -d '{"host":"192.168.4.20","username":"admin","password":"Administrator01"}'
+  -d '{"index":0,"host":"192.168.4.20","username":"admin","password":"Administrator01"}'
 
 curl -X POST http://192.168.4.1/api/sensitivity \
   -H 'Content-Type: application/json' \
@@ -387,7 +421,10 @@ Kamerabild zeigt die Webseite **Kamera aktiv** und pausiert die API-Abfragen.
 ### GNSS/Fahrtaufzeichnung funktioniert nicht
 
 - EWD108-GN05(485) mit 5-24 V versorgen.
-- RS485 A/B pruefen; bei keiner Antwort A/B testweise tauschen.
+- RS485 A/B pruefen; beim getesteten Ebyte-Modul ist `B` am GPS-Modul auch `B`
+  am Waveshare.
+- `12V -` der externen GPS-Versorgung muss mit `GND` des Waveshare verbunden
+  sein.
 - Modbus-Adresse `1`, `9600 8N1` pruefen.
 - Antenne nach oben/aussen montieren.
 - PPS-LED am GNSS-Modul pruefen.

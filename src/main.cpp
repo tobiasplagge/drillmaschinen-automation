@@ -34,7 +34,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 
 static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
-static const char *FIRMWARE_VERSION = "2.0.0";
+static const char *FIRMWARE_VERSION = "2.1.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
@@ -42,10 +42,11 @@ static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Rap
 // oder /ISAPI/Streaming/channels/102/httpPreview für Substream.
 static const char *HIKVISION_CAMERA_MAIN_STREAM_PATH = "/ISAPI/Streaming/channels/101/httpPreview";
 static const char *HIKVISION_CAMERA_SUB_STREAM_PATH = "/ISAPI/Streaming/channels/102/httpPreview";
-static const char *CAMERA_PROXY_MAIN_STREAM_URL = "/camera/mainstream";
-static const char *CAMERA_PROXY_SUB_STREAM_URL = "/camera/substream";
+static const char *CAMERA_PROXY_MAIN_STREAM_URL = "/camera/1/mainstream";
+static const char *CAMERA_PROXY_SUB_STREAM_URL = "/camera/1/substream";
 static const char *HIKVISION_CAMERA_NAME = "Hikvision Kamera";
 static constexpr uint16_t HIKVISION_CAMERA_TEST_TIMEOUT_MS = 1500;
+static constexpr uint8_t CAMERA_COUNT = 4;
 static constexpr uint8_t CAMERA_HOST_LENGTH = 32;
 static constexpr uint8_t CAMERA_USERNAME_LENGTH = 32;
 static constexpr uint8_t CAMERA_PASSWORD_LENGTH = 48;
@@ -98,8 +99,9 @@ static constexpr uint8_t GNSS_RS485_TX_PIN = 17;
 static constexpr uint8_t GNSS_RS485_DE_RE_PIN = 21;
 static constexpr uint8_t GNSS_MODBUS_ADDRESS = 1;
 static constexpr uint32_t GNSS_MODBUS_BAUD = 9600;
-static constexpr uint16_t GNSS_SCAN_START_REGISTER = 0x0000;
-static constexpr uint16_t GNSS_SCAN_REGISTER_COUNT = 96;
+static constexpr uint32_t GNSS_BAUD_SCAN_RATES[] = {4800, 9600, 19200, 38400, 57600, 115200};
+static constexpr uint16_t GNSS_SCAN_START_REGISTER = 0x0005;
+static constexpr uint16_t GNSS_SCAN_REGISTER_COUNT = 35;
 static constexpr uint8_t GNSS_MODBUS_FUNCTION_READ_HOLDING = 0x03;
 
 // On this board the digital outputs are controlled through the TCA9554. The
@@ -109,11 +111,21 @@ static constexpr bool DO_ACTIVE_HIGH = true;
 static constexpr bool INPUT_ACTIVE_HIGH = false;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
 static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
+static constexpr uint8_t PNEUMATIC_VALVE_COUNT = 4;
+static constexpr uint8_t PNEUMATIC_VALVE_OUTPUTS[PNEUMATIC_VALVE_COUNT] = {2, 3, 4, 5};
+static const char *PNEUMATIC_VALVE_LABELS[PNEUMATIC_VALVE_COUNT] = {
+    "Sensor 1-6",
+    "Sensor 7-12",
+    "Sensor 13-18",
+    "Sensor 19-24",
+};
 
 WebServer server(80);
 Preferences preferences;
 HardwareSerial gnssSerial(1);
 bool ethernetReady = false;
+char gnssDirectLine[128] = "";
+uint8_t gnssDirectLineLength = 0;
 
 struct ChannelState {
   bool inputRaw = false;
@@ -161,10 +173,13 @@ struct GnssState {
   uint32_t okCount = 0;
   uint32_t errorCount = 0;
   uint32_t lastResponseMs = 0;
+  uint32_t lastByteMs = 0;
+  uint32_t byteCount = 0;
   uint32_t fixAvailableSinceMs = 0;
   char lastError[32] = "not_started";
   char lastSentence[128] = "";
   char rawPreview[96] = "";
+  char rawHexPreview[160] = "";
 };
 
 struct MainSignalEvent {
@@ -213,9 +228,9 @@ char channelNames[CHANNEL_COUNT][CHANNEL_NAME_LENGTH] = {
 };
 char cropName[CROP_NAME_LENGTH] = "Weizen";
 char fieldName[FIELD_NAME_LENGTH] = "Feld";
-char cameraHost[CAMERA_HOST_LENGTH] = "192.168.4.20";
-char cameraUsername[CAMERA_USERNAME_LENGTH] = "admin";
-char cameraPassword[CAMERA_PASSWORD_LENGTH] = "Administrator01";
+char cameraHosts[CAMERA_COUNT][CAMERA_HOST_LENGTH] = {"192.168.4.20", "", "", ""};
+char cameraUsernames[CAMERA_COUNT][CAMERA_USERNAME_LENGTH] = {"admin", "", "", ""};
+char cameraPasswords[CAMERA_COUNT][CAMERA_PASSWORD_LENGTH] = {"Administrator01", "", "", ""};
 char tripId[TRIP_ID_LENGTH] = "-";
 char tripGpsPath[64] = "";
 char tripSensorPath[64] = "";
@@ -269,6 +284,15 @@ bool isSeedChannel(uint8_t channelIndex) {
 
 bool isHiddenChannel(uint8_t channelIndex) {
   return channelIndex == HIDDEN_CHANNEL - 1;
+}
+
+bool isPneumaticValveOutput(uint8_t outputChannel) {
+  for (uint8_t i = 0; i < PNEUMATIC_VALVE_COUNT; i++) {
+    if (PNEUMATIC_VALVE_OUTPUTS[i] == outputChannel) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool isRotationChannel(uint8_t channelIndex) {
@@ -446,23 +470,30 @@ void sanitizeCameraValue(char *value, size_t maxLength) {
 }
 
 void loadCameraSettings() {
-  String stored = preferences.getString("cam_host", "");
-  if (stored.length() > 0) {
-    stored.toCharArray(cameraHost, CAMERA_HOST_LENGTH);
-  }
-  sanitizeCameraValue(cameraHost, CAMERA_HOST_LENGTH);
+  for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+    char key[12];
 
-  stored = preferences.getString("cam_user", "");
-  if (stored.length() > 0) {
-    stored.toCharArray(cameraUsername, CAMERA_USERNAME_LENGTH);
-  }
-  sanitizeCameraValue(cameraUsername, CAMERA_USERNAME_LENGTH);
+    snprintf(key, sizeof(key), "cam%u_host", i + 1);
+    String stored = preferences.getString(key, "");
+    if (stored.length() > 0) {
+      stored.toCharArray(cameraHosts[i], CAMERA_HOST_LENGTH);
+    }
+    sanitizeCameraValue(cameraHosts[i], CAMERA_HOST_LENGTH);
 
-  stored = preferences.getString("cam_pass", "");
-  if (stored.length() > 0) {
-    stored.toCharArray(cameraPassword, CAMERA_PASSWORD_LENGTH);
+    snprintf(key, sizeof(key), "cam%u_user", i + 1);
+    stored = preferences.getString(key, "");
+    if (stored.length() > 0) {
+      stored.toCharArray(cameraUsernames[i], CAMERA_USERNAME_LENGTH);
+    }
+    sanitizeCameraValue(cameraUsernames[i], CAMERA_USERNAME_LENGTH);
+
+    snprintf(key, sizeof(key), "cam%u_pass", i + 1);
+    stored = preferences.getString(key, "");
+    if (stored.length() > 0) {
+      stored.toCharArray(cameraPasswords[i], CAMERA_PASSWORD_LENGTH);
+    }
+    sanitizeCameraValue(cameraPasswords[i], CAMERA_PASSWORD_LENGTH);
   }
-  sanitizeCameraValue(cameraPassword, CAMERA_PASSWORD_LENGTH);
 }
 
 void loadSensitivity() {
@@ -496,20 +527,35 @@ void saveFieldName(const String &name) {
   preferences.putString("field", fieldName);
 }
 
-void saveCameraSettings(const String &host, const String &username, const String &password) {
-  host.toCharArray(cameraHost, CAMERA_HOST_LENGTH);
-  username.toCharArray(cameraUsername, CAMERA_USERNAME_LENGTH);
-  password.toCharArray(cameraPassword, CAMERA_PASSWORD_LENGTH);
-  sanitizeCameraValue(cameraHost, CAMERA_HOST_LENGTH);
-  sanitizeCameraValue(cameraUsername, CAMERA_USERNAME_LENGTH);
-  sanitizeCameraValue(cameraPassword, CAMERA_PASSWORD_LENGTH);
-  preferences.putString("cam_host", cameraHost);
-  preferences.putString("cam_user", cameraUsername);
-  preferences.putString("cam_pass", cameraPassword);
+bool cameraConfigured(uint8_t cameraIndex) {
+  return cameraIndex < CAMERA_COUNT && strlen(cameraHosts[cameraIndex]) > 0;
 }
 
-String cameraAuthHeader() {
-  return "Basic " + base64::encode(String(cameraUsername) + ":" + String(cameraPassword));
+void saveCameraSettings(uint8_t cameraIndex, const String &host, const String &username, const String &password) {
+  if (cameraIndex >= CAMERA_COUNT) {
+    return;
+  }
+  host.toCharArray(cameraHosts[cameraIndex], CAMERA_HOST_LENGTH);
+  username.toCharArray(cameraUsernames[cameraIndex], CAMERA_USERNAME_LENGTH);
+  password.toCharArray(cameraPasswords[cameraIndex], CAMERA_PASSWORD_LENGTH);
+  sanitizeCameraValue(cameraHosts[cameraIndex], CAMERA_HOST_LENGTH);
+  sanitizeCameraValue(cameraUsernames[cameraIndex], CAMERA_USERNAME_LENGTH);
+  sanitizeCameraValue(cameraPasswords[cameraIndex], CAMERA_PASSWORD_LENGTH);
+
+  char key[12];
+  snprintf(key, sizeof(key), "cam%u_host", cameraIndex + 1);
+  preferences.putString(key, cameraHosts[cameraIndex]);
+  snprintf(key, sizeof(key), "cam%u_user", cameraIndex + 1);
+  preferences.putString(key, cameraUsernames[cameraIndex]);
+  snprintf(key, sizeof(key), "cam%u_pass", cameraIndex + 1);
+  preferences.putString(key, cameraPasswords[cameraIndex]);
+}
+
+String cameraAuthHeader(uint8_t cameraIndex) {
+  if (cameraIndex >= CAMERA_COUNT) {
+    return "";
+  }
+  return "Basic " + base64::encode(String(cameraUsernames[cameraIndex]) + ":" + String(cameraPasswords[cameraIndex]));
 }
 
 void saveSensitivity(uint32_t holdMs) {
@@ -641,6 +687,34 @@ void setGnssError(const char *message) {
   gnss.lastError[sizeof(gnss.lastError) - 1] = '\0';
 }
 
+void appendGnssRawPreview(char c) {
+  const size_t length = strnlen(gnss.rawPreview, sizeof(gnss.rawPreview));
+  if (length + 1 < sizeof(gnss.rawPreview)) {
+    gnss.rawPreview[length] = (c >= 32 && c <= 126) ? c : '.';
+    gnss.rawPreview[length + 1] = '\0';
+  } else {
+    memmove(gnss.rawPreview, gnss.rawPreview + 1, sizeof(gnss.rawPreview) - 2);
+    gnss.rawPreview[sizeof(gnss.rawPreview) - 2] = (c >= 32 && c <= 126) ? c : '.';
+    gnss.rawPreview[sizeof(gnss.rawPreview) - 1] = '\0';
+  }
+
+  char hexByte[4];
+  snprintf(hexByte, sizeof(hexByte), "%02X ", static_cast<uint8_t>(c));
+  size_t hexLength = strnlen(gnss.rawHexPreview, sizeof(gnss.rawHexPreview));
+  if (hexLength + 3 >= sizeof(gnss.rawHexPreview)) {
+    memmove(gnss.rawHexPreview, gnss.rawHexPreview + 3, sizeof(gnss.rawHexPreview) - 4);
+    gnss.rawHexPreview[sizeof(gnss.rawHexPreview) - 4] = '\0';
+    hexLength = strnlen(gnss.rawHexPreview, sizeof(gnss.rawHexPreview));
+  }
+  strncat(gnss.rawHexPreview, hexByte, sizeof(gnss.rawHexPreview) - hexLength - 1);
+}
+
+void noteGnssReceivedByte(char c) {
+  gnss.byteCount++;
+  gnss.lastByteMs = millis();
+  appendGnssRawPreview(c);
+}
+
 void initGnssRs485() {
   pinMode(GNSS_RS485_DE_RE_PIN, OUTPUT);
   digitalWrite(GNSS_RS485_DE_RE_PIN, LOW);
@@ -661,7 +735,7 @@ bool readModbusHoldingRegisters(uint16_t startRegister, uint16_t registerCount, 
   }
 
   while (gnssSerial.available()) {
-    gnssSerial.read();
+    noteGnssReceivedByte(static_cast<char>(gnssSerial.read()));
   }
 
   uint8_t request[8];
@@ -688,7 +762,9 @@ bool readModbusHoldingRegisters(uint16_t startRegister, uint16_t registerCount, 
   const uint32_t deadline = millis() + 350;
   while (millis() < deadline && index < expectedLength) {
     while (gnssSerial.available() && index < sizeof(response)) {
-      response[index++] = static_cast<uint8_t>(gnssSerial.read());
+      const char c = static_cast<char>(gnssSerial.read());
+      noteGnssReceivedByte(c);
+      response[index++] = static_cast<uint8_t>(c);
     }
     delay(1);
   }
@@ -735,12 +811,17 @@ double parseNmeaCoordinate(const String &value, const String &hemisphere) {
     return 0;
   }
 
+  String normalizedHemisphere = hemisphere;
+  normalizedHemisphere.toUpperCase();
   const int dotIndex = value.indexOf('.');
-  const int degreeDigits = (dotIndex > 4) ? dotIndex - 2 : value.length() - 2;
+  if (dotIndex < 0 || dotIndex < 3) {
+    return 0;
+  }
+  const int degreeDigits = dotIndex - 2;
   const double degrees = value.substring(0, degreeDigits).toDouble();
   const double minutes = value.substring(degreeDigits).toDouble();
   double decimal = degrees + (minutes / 60.0);
-  if (hemisphere == "S" || hemisphere == "W") {
+  if (normalizedHemisphere == "S" || normalizedHemisphere == "W") {
     decimal = -decimal;
   }
   return decimal;
@@ -769,7 +850,7 @@ bool applyNmeaSentence(const String &sentence) {
   const String type = nmeaField(sentence, 0);
   if (type.endsWith("RMC")) {
     const String valid = nmeaField(sentence, 2);
-    if (valid != "A") {
+    if (!valid.equalsIgnoreCase("A")) {
       gnss.fix = false;
       setGnssError("no_fix");
       return false;
@@ -885,13 +966,80 @@ bool scanPayloadForNmea(const uint8_t *payload, uint8_t byteCount) {
   return false;
 }
 
+bool readDirectNmeaFromRs485() {
+  bool gotGnssData = false;
+  const uint32_t now = millis();
+
+  while (gnssSerial.available()) {
+    const char c = static_cast<char>(gnssSerial.read());
+    noteGnssReceivedByte(c);
+
+    if (c == '$') {
+      gnssDirectLineLength = 0;
+      gnssDirectLine[gnssDirectLineLength++] = c;
+      continue;
+    }
+
+    if (c == '\r' || c == '\n') {
+      if (gnssDirectLineLength == 0) {
+        continue;
+      }
+
+      gnssDirectLine[gnssDirectLineLength] = '\0';
+      String sentence = String(gnssDirectLine);
+      sentence.trim();
+      gnssDirectLineLength = 0;
+
+      if (!sentence.startsWith("$")) {
+        continue;
+      }
+
+      sentence.toCharArray(gnss.rawPreview, sizeof(gnss.rawPreview));
+      gnss.lastResponseMs = now;
+      gnss.seen = true;
+      gotGnssData = true;
+
+      if (applyNmeaSentence(sentence)) {
+        gnss.okCount++;
+      } else if (strcmp(gnss.lastError, "ok") == 0) {
+        setGnssError("nmea_seen");
+      }
+      continue;
+    }
+
+    if (gnssDirectLineLength == 0) {
+      continue;
+    }
+
+    if (gnssDirectLineLength < sizeof(gnssDirectLine) - 1 && c >= 32 && c <= 126) {
+      gnssDirectLine[gnssDirectLineLength++] = c;
+    } else {
+      gnssDirectLineLength = 0;
+      setGnssError("nmea_overflow");
+    }
+  }
+
+  return gotGnssData;
+}
+
 void pollGnss() {
+  const bool directDataSeen = readDirectNmeaFromRs485();
   const uint32_t now = millis();
   if (now - gnss.lastPollMs < GNSS_POLL_INTERVAL_MS) {
     return;
   }
   gnss.lastPollMs = now;
   gnss.pollCount++;
+
+  if (directDataSeen || (gnss.lastByteMs > 0 && now - gnss.lastByteMs < 250)) {
+    if (recordingActive && gnss.fix && now - lastGpsLogMs >= GPS_LOG_INTERVAL_MS) {
+      appendGpsLog(gnss.latitude, gnss.longitude, gnss.accuracyM, gnss.speedMps, gnss.headingDeg, gnss.satellites);
+    }
+    if (!directDataSeen && strcmp(gnss.lastError, "ok") != 0) {
+      setGnssError("raw_rx");
+    }
+    return;
+  }
 
   uint8_t payload[GNSS_SCAN_REGISTER_COUNT * 2] = {};
   uint8_t byteCount = 0;
@@ -915,6 +1063,9 @@ void pollGnss() {
 const char *gnssHealth() {
   const uint32_t now = millis();
   if (gnss.lastResponseMs == 0 || now - gnss.lastResponseMs > GNSS_STALE_MS) {
+    if (gnss.lastByteMs > 0 && now - gnss.lastByteMs <= GNSS_STALE_MS) {
+      return "invalid_data";
+    }
     return "no_rs485";
   }
   if (strcmp(gnss.lastError, "no_nmea") == 0 || strcmp(gnss.lastError, "bad_nmea") == 0 ||
@@ -1226,7 +1377,7 @@ void readDigitalInputs() {
     }
     channels[i].status = isRotationChannel(i) ? (rotationMoving(now) ? "rotating" : "stopped") : (mainSignal ? "red" : "none");
 
-    if (seedChannel && i != LIGHT_OUTPUT_CHANNEL - 1) {
+    if (seedChannel && i != LIGHT_OUTPUT_CHANNEL - 1 && !isPneumaticValveOutput(i + 1)) {
       const bool outputOn = MIRROR_RED_TO_OUTPUT && mainSignal;
       if (channels[i].output != outputOn) {
         setDigitalOutput(i, outputOn);
@@ -1253,6 +1404,13 @@ String statusJson() {
   doc["boot_counter"] = bootCounter;
   doc["reset_reason"] = resetReason;
   doc["uptime_ms"] = now;
+  doc["heap_free_bytes"] = ESP.getFreeHeap();
+  doc["heap_total_bytes"] = ESP.getHeapSize();
+  doc["heap_min_free_bytes"] = ESP.getMinFreeHeap();
+  doc["psram_free_bytes"] = ESP.getFreePsram();
+  doc["psram_total_bytes"] = ESP.getPsramSize();
+  doc["sketch_size_bytes"] = ESP.getSketchSize();
+  doc["sketch_free_space_bytes"] = ESP.getFreeSketchSpace();
   doc["wifi_ap_ssid"] = AP_SSID;
   doc["ip"] = WiFi.softAPIP().toString();
   doc["web_url"] = "http://" + WiFi.softAPIP().toString() + "/";
@@ -1265,12 +1423,34 @@ String statusJson() {
   doc["light_channel"] = LIGHT_OUTPUT_CHANNEL;
   doc["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
   doc["light_switchable"] = doExpanderReady;
+  JsonArray valves = doc["pneumatic_valves"].to<JsonArray>();
+  for (uint8_t i = 0; i < PNEUMATIC_VALVE_COUNT; i++) {
+    const uint8_t outputChannel = PNEUMATIC_VALVE_OUTPUTS[i];
+    JsonObject valve = valves.add<JsonObject>();
+    valve["index"] = i;
+    valve["label"] = PNEUMATIC_VALVE_LABELS[i];
+    valve["output_channel"] = outputChannel;
+    valve["on"] = channels[outputChannel - 1].output;
+    valve["switchable"] = doExpanderReady;
+  }
   doc["camera_name"] = HIKVISION_CAMERA_NAME;
   doc["camera_stream_url"] = CAMERA_PROXY_SUB_STREAM_URL;
   doc["camera_main_stream_url"] = CAMERA_PROXY_MAIN_STREAM_URL;
   doc["camera_sub_stream_url"] = CAMERA_PROXY_SUB_STREAM_URL;
-  doc["camera_host"] = cameraHost;
-  doc["camera_username"] = cameraUsername;
+  doc["camera_host"] = cameraHosts[0];
+  doc["camera_username"] = cameraUsernames[0];
+  JsonArray cameras = doc["cameras"].to<JsonArray>();
+  for (uint8_t i = 0; i < CAMERA_COUNT; i++) {
+    JsonObject camera = cameras.add<JsonObject>();
+    camera["index"] = i;
+    camera["number"] = i + 1;
+    camera["name"] = "Kamera " + String(i + 1);
+    camera["configured"] = cameraConfigured(i);
+    camera["host"] = cameraHosts[i];
+    camera["username"] = cameraUsernames[i];
+    camera["sub_stream_url"] = "/camera/" + String(i + 1) + "/substream";
+    camera["main_stream_url"] = "/camera/" + String(i + 1) + "/mainstream";
+  }
   doc["gps_log_interval_ms"] = GPS_LOG_INTERVAL_MS;
   doc["recording_active"] = recordingActive;
   doc["gps_log_count"] = gpsLogCount;
@@ -1301,12 +1481,15 @@ String statusJson() {
   gnssJson["heading_deg"] = gnss.headingDeg;
   gnssJson["satellites"] = gnss.satellites;
   gnssJson["last_fix_age_ms"] = gnss.lastFixMs > 0 ? static_cast<int32_t>(now - gnss.lastFixMs) : -1;
+  gnssJson["last_byte_age_ms"] = gnss.lastByteMs > 0 ? static_cast<int32_t>(now - gnss.lastByteMs) : -1;
   gnssJson["poll_count"] = gnss.pollCount;
   gnssJson["ok_count"] = gnss.okCount;
   gnssJson["error_count"] = gnss.errorCount;
+  gnssJson["byte_count"] = gnss.byteCount;
   gnssJson["last_error"] = gnss.lastError;
   gnssJson["last_sentence"] = gnss.lastSentence;
   gnssJson["raw_preview"] = gnss.rawPreview;
+  gnssJson["raw_hex_preview"] = gnss.rawHexPreview;
 
   JsonArray modules = doc["modules"].to<JsonArray>();
   for (uint8_t i = 1; i <= 4; i++) {
@@ -1409,6 +1592,9 @@ String htmlPage() {
     .camera-controls { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
     .camera-stream-button { background: #374151; min-width: 96px; }
     .camera-stream-button.active { background: #2563eb; }
+    .camera-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-top: 14px; }
+    .camera-card { border: 1px solid #374151; border-radius: 8px; padding: 10px; background: #111827; }
+    .camera-card h3 { margin: 0; color: #f9fafb; font-size: 1rem; }
     .camera-frame { margin-top: 12px; border: 1px solid #374151; border-radius: 8px; overflow: hidden; background: #020617; aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center; }
     .camera-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
     .camera-meta { margin-top: 8px; color: #9ca3af; font-size: .86rem; overflow-wrap: anywhere; }
@@ -1446,6 +1632,15 @@ String htmlPage() {
     .camera-test-status.ok { color: #bbf7d0; }
     .camera-test-status.warn { color: #fde68a; }
     .camera-test-status.fail { color: #fecaca; }
+    .rs485-test-panel { display: grid; gap: 10px; }
+    .rs485-test-status { border: 1px solid #374151; border-radius: 6px; padding: 9px; color: #d1d5db; background: #111827; overflow-wrap: anywhere; }
+    .rs485-test-status.ok { border-color: #16a34a; color: #bbf7d0; }
+    .rs485-test-status.warn { border-color: #ca8a04; color: #fde68a; }
+    .rs485-test-status.fail { border-color: #dc2626; color: #fecaca; }
+    .rs485-raw { margin: 0; min-height: 54px; white-space: pre-wrap; font-size: .85rem; color: #d1d5db; background: #111827; border: 1px solid #374151; border-radius: 6px; padding: 9px; overflow-wrap: anywhere; }
+    .camera-settings-grid { display: grid; gap: 12px; }
+    .camera-settings-card { border: 1px solid #374151; border-radius: 8px; padding: 10px; background: #111827; }
+    .camera-settings-card h4 { margin: 0 0 8px; color: #f9fafb; }
     .module-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
     .module { border: 1px solid #4b5563; border-radius: 6px; padding: 9px; color: #9ca3af; }
     .module.online { border-color: #16a34a; color: #dcfce7; }
@@ -1453,6 +1648,7 @@ String htmlPage() {
     .settings-active .settings-only { display: block; }
     .sensor-table { display: grid; gap: 8px; }
     .sensor-row { display: grid; grid-template-columns: minmax(100px, 1fr) repeat(5, minmax(70px, auto)); gap: 8px; align-items: center; border: 1px solid #374151; border-radius: 6px; padding: 8px; color: #d1d5db; font-size: .88rem; }
+    .system-row { grid-template-columns: minmax(130px, 1fr) minmax(120px, auto) minmax(80px, auto); }
     .sensor-row strong { color: #f9fafb; overflow-wrap: anywhere; }
     .field-row { display: grid; grid-template-columns: minmax(130px, 1fr) auto; gap: 8px; margin-bottom: 12px; }
     input, select { min-width: 0; height: 40px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #f9fafb; padding: 0 10px; font: inherit; }
@@ -1473,6 +1669,10 @@ String htmlPage() {
     .nav-action.light-on { background: #16a34a; color: #f0fdf4; }
     .nav-action.light-off { background: #991b1b; color: #fef2f2; }
     .nav-action.light-unknown { background: #f59e0b; color: #111827; }
+    .valve-panel { margin-bottom: 14px; }
+    .valve-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
+    .valve-button { background: #374151; }
+    .valve-button.active { background: #16a34a; color: #f0fdf4; }
     .hidden { display: none !important; }
     .map-status { margin: 0 0 10px; color: #d1d5db; font-size: .9rem; }
     .track-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; color: #d1d5db; font-size: .88rem; }
@@ -1551,6 +1751,12 @@ String htmlPage() {
       <h2>Live-Fahrt</h2>
       <p id="mapStatus" class="map-status">Topografische Karte wird beim Öffnen geladen.</p>
       <div class="actions"><button id="mapFollow" class="secondary" type="button">Position folgen: Ein</button></div>
+      <div class="gps-meta">
+        <div>Signalqualität: <strong id="mapGnssQuality">-</strong></div>
+        <div>Position: <strong id="mapGnssPosition">-</strong></div>
+        <div>Genauigkeit: <strong id="mapGnssAccuracy">-</strong></div>
+        <div>RS485: <strong id="mapGnssRs485">-</strong></div>
+      </div>
       <div id="topoMap" class="hidden"></div>
       <div id="trackFallback" class="track-wrap">
         <canvas id="trackCanvas"></canvas>
@@ -1583,24 +1789,19 @@ String htmlPage() {
       <h2>Fehleranalyse & Einstellungen</h2>
       <div class="field-row">
         <div style="min-width:0;">
-          <h3>Kamera</h3>
-          <div class="field-row">
-            <button id="cameraTest" class="secondary" type="button">Verbindung testen</button>
-          </div>
-          <div class="field-row">
-            <input id="cameraHostInput" maxlength="31" placeholder="Kamera-IP">
-            <input id="cameraUserInput" maxlength="31" placeholder="Benutzer">
-          </div>
-          <div class="field-row">
-            <input id="cameraPasswordInput" type="password" maxlength="47" placeholder="Passwort">
-            <button id="cameraSave" type="button">Kamera speichern</button>
-          </div>
-          <div id="cameraTestStatus" class="camera-test-status">Noch nicht getestet.</div>
+          <h3>Kameras</h3>
+          <div id="cameraSettingsGrid" class="camera-settings-grid"></div>
         </div>
       </div>
       <div class="settings-only">
         <h3>Kanaldetails</h3>
         <div id="sensorDetailsGrid" class="sensor-table"></div>
+      </div>
+      <div class="field-row">
+        <div style="min-width:0;">
+          <h3>Systemauslastung</h3>
+          <div id="systemLoadGrid" class="sensor-table"></div>
+        </div>
       </div>
       <div class="field-row">
         <div style="min-width:0;">
@@ -1618,6 +1819,20 @@ String htmlPage() {
       <div class="field-row">
         <div style="min-width:0;">
           <h3>GNSS Diagnose</h3>
+          <div class="rs485-test-panel">
+            <div class="actions">
+              <button id="rs485Test" class="secondary" type="button">RS485 Test starten</button>
+              <button id="rs485BaudScan" class="secondary" type="button">Baudrate scannen</button>
+              <button id="rs485AddressScan" class="secondary" type="button">Adressen scannen</button>
+              <button id="rs485RegisterScan" class="secondary" type="button">Register scannen</button>
+              <span id="rs485TestStatus" class="rs485-test-status">Noch nicht getestet.</span>
+            </div>
+            <div id="rs485TestGrid" class="sensor-table"></div>
+            <strong>Rohdaten ASCII</strong>
+            <pre id="rs485RawPreview" class="rs485-raw">Keine Rohdaten.</pre>
+            <strong>Rohdaten HEX</strong>
+            <pre id="rs485HexPreview" class="rs485-raw">Keine HEX-Daten.</pre>
+          </div>
           <pre id="gnssDebug" style="white-space:pre-wrap; font-size:.85rem; color:#d1d5db;"></pre>
         </div>
       </div>
@@ -1665,17 +1880,11 @@ String htmlPage() {
       <span id="filesystem"></span>
     </div>
     <div id="grid" class="bar-grid monitoring-view"></div>
-    <details id="cameraPanel" class="panel monitoring-view camera-panel">
-      <summary><span id="cameraTitle">Hikvision Kamera</span></summary>
-      <div class="camera-controls">
-        <button id="cameraSubStream" class="camera-stream-button active" type="button">Substream</button>
-        <button id="cameraMainStream" class="camera-stream-button" type="button">Mainstream</button>
-      </div>
-      <div class="camera-frame">
-        <img id="cameraImage" alt="Kamerabild" loading="lazy">
-      </div>
-      <div id="cameraUrl" class="camera-meta">Kamera noch nicht geladen.</div>
-    </details>
+    <section class="panel monitoring-view valve-panel">
+      <h2>Pneumatikventile</h2>
+      <div id="valveActions" class="valve-actions"></div>
+    </section>
+    <div id="cameraGrid" class="camera-grid monitoring-view"></div>
     <div id="error" class="error"></div>
   </main>
   <script>
@@ -1699,8 +1908,7 @@ String htmlPage() {
     let renderingGrid = false;
     let lightOnState = false;
     let lightSwitchable = false;
-    let cameraStreamUrl = '';
-    let cameraStreamMode = localStorage.getItem('cameraStreamMode') === 'main' ? 'main' : 'sub';
+    let cameraStreamModes = JSON.parse(localStorage.getItem('cameraStreamModes') || '{}');
     let trackBusy = false;
     let lastTrackData = { points: [], events: [], current: null };
     let topoMap = null;
@@ -1710,6 +1918,7 @@ String htmlPage() {
     let leafletLoading = false;
     let topoFitted = false;
     let followMap = true;
+    let rs485TestRunning = false;
     const openDetailChannels = new Set();
 
     function escapeHtml(value) {
@@ -1886,25 +2095,116 @@ String htmlPage() {
       }
     }
 
-    function setCameraStreamMode(mode) {
-      cameraStreamMode = mode === 'main' ? 'main' : 'sub';
-      localStorage.setItem('cameraStreamMode', cameraStreamMode);
+    function updateValveButtons(valves) {
+      const container = document.getElementById('valveActions');
+      container.innerHTML = (valves || []).map(valve => `
+        <button class="valve-button ${valve.on ? 'active' : ''}" type="button" data-channel="${valve.output_channel}" data-on="${valve.on ? '1' : '0'}" ${valve.switchable ? '' : 'disabled'}>
+          ${escapeHtml(valve.label || ('Ausgang ' + valve.output_channel))}
+        </button>
+      `).join('');
+      container.querySelectorAll('.valve-button').forEach(button => button.addEventListener('click', () => toggleValve(button)));
+    }
+
+    async function toggleValve(button) {
+      if (actionBusy) return;
+      actionBusy = true;
+      const channel = Number(button.dataset.channel);
+      const nextState = button.dataset.on !== '1';
+      try {
+        const res = await fetchWithTimeout('/api/output', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel, on: nextState })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await refresh();
+      } catch (err) {
+        document.getElementById('error').textContent = 'Pneumatikventil schalten fehlgeschlagen';
+      } finally {
+        actionBusy = false;
+      }
+    }
+
+    function setCameraStreamMode(index, mode) {
+      cameraStreamModes[index] = mode === 'main' ? 'main' : 'sub';
+      localStorage.setItem('cameraStreamModes', JSON.stringify(cameraStreamModes));
       updateCamera(window.lastStatusData || {});
     }
 
+    function renderCameraSettings(cameras) {
+      const container = document.getElementById('cameraSettingsGrid');
+      container.innerHTML = cameras.map(camera => `
+        <div class="camera-settings-card" data-camera-index="${camera.index}">
+          <h4>Kamera ${camera.number}</h4>
+          <div class="field-row">
+            <input class="cameraHostInput" maxlength="31" placeholder="Kamera-IP" value="${escapeHtml(camera.host || '')}">
+            <input class="cameraUserInput" maxlength="31" placeholder="Benutzer" value="${escapeHtml(camera.username || '')}">
+          </div>
+          <div class="field-row">
+            <input class="cameraPasswordInput" type="password" maxlength="47" placeholder="${camera.configured ? 'Passwort gespeichert' : 'Passwort'}">
+            <button class="cameraSave" type="button">Speichern</button>
+          </div>
+          <div class="actions">
+            <button class="cameraTest secondary" type="button">Verbindung testen</button>
+            <button class="cameraClear secondary" type="button">Ausblenden</button>
+          </div>
+          <div class="camera-test-status">Noch nicht getestet.</div>
+        </div>
+      `).join('');
+      container.querySelectorAll('.cameraSave').forEach(button => button.addEventListener('click', event => saveCameraSettings(event.currentTarget.closest('.camera-settings-card'))));
+      container.querySelectorAll('.cameraTest').forEach(button => button.addEventListener('click', event => testCameraConnection(event.currentTarget.closest('.camera-settings-card'))));
+      container.querySelectorAll('.cameraClear').forEach(button => button.addEventListener('click', event => clearCameraSettings(event.currentTarget.closest('.camera-settings-card'))));
+    }
+
     function updateCamera(data) {
-      const mainUrl = data.camera_main_stream_url || '';
-      const subUrl = data.camera_sub_stream_url || data.camera_stream_url || '';
-      cameraStreamUrl = cameraStreamMode === 'main' ? mainUrl : subUrl;
-      document.getElementById('cameraTitle').textContent = data.camera_name || 'Kamera';
-      document.getElementById('cameraUrl').textContent = cameraStreamUrl || 'Keine Kamera-URL konfiguriert.';
-      document.getElementById('cameraSubStream').classList.toggle('active', cameraStreamMode === 'sub');
-      document.getElementById('cameraMainStream').classList.toggle('active', cameraStreamMode === 'main');
-      const panel = document.getElementById('cameraPanel');
-      const image = document.getElementById('cameraImage');
-      if (panel.open && cameraStreamUrl && image.getAttribute('src') !== cameraStreamUrl) {
-        image.src = cameraStreamUrl;
-      } else if (!panel.open && image.src) {
+      const cameras = data.cameras || [];
+      const settingsGrid = document.getElementById('cameraSettingsGrid');
+      if (!settingsGrid.contains(document.activeElement)) {
+        renderCameraSettings(cameras);
+      }
+      const configured = cameras.filter(camera => camera.configured);
+      const container = document.getElementById('cameraGrid');
+      container.innerHTML = configured.length ? configured.map(camera => {
+        const mode = cameraStreamModes[camera.index] === 'main' ? 'main' : 'sub';
+        const streamUrl = mode === 'main' ? camera.main_stream_url : camera.sub_stream_url;
+        return `
+          <details class="panel camera-panel camera-card" data-camera-index="${camera.index}" data-camera-stream-url="${escapeHtml(streamUrl)}">
+            <summary><span>${escapeHtml(camera.name || ('Kamera ' + camera.number))}</span></summary>
+            <div class="camera-controls">
+              <button class="camera-stream-button ${mode === 'sub' ? 'active' : ''}" type="button" data-mode="sub">Substream</button>
+              <button class="camera-stream-button ${mode === 'main' ? 'active' : ''}" type="button" data-mode="main">Mainstream</button>
+            </div>
+            <div class="camera-frame"><img alt="Kamerabild" loading="lazy"></div>
+            <div class="camera-meta">${escapeHtml(streamUrl)}</div>
+          </details>
+        `;
+      }).join('') : '';
+
+      container.querySelectorAll('.camera-stream-button').forEach(button => button.addEventListener('click', event => {
+        const panel = event.currentTarget.closest('.camera-panel');
+        setCameraStreamMode(panel.dataset.cameraIndex, event.currentTarget.dataset.mode);
+      }));
+      container.querySelectorAll('.camera-panel').forEach(panel => {
+        panel.addEventListener('toggle', event => {
+          syncCameraPanel(event.currentTarget);
+          if (event.currentTarget.open) {
+            document.getElementById('error').textContent = '';
+            hideDebugOverlay();
+            updateLastContact();
+          } else {
+            refresh();
+          }
+        });
+        syncCameraPanel(panel);
+      });
+    }
+
+    function syncCameraPanel(panel) {
+      const image = panel.querySelector('img');
+      const streamUrl = panel.dataset.cameraStreamUrl || '';
+      if (panel.open && streamUrl && image.getAttribute('src') !== streamUrl) {
+        image.src = streamUrl;
+      } else if (!panel.open && image.getAttribute('src')) {
         image.removeAttribute('src');
       }
     }
@@ -1990,10 +2290,42 @@ String htmlPage() {
       syncAlarm();
     }
 
+    function gnssQualityText(gnss) {
+      if (!gnss || !gnss.seen) return 'Keine Daten';
+      if (!gnss.fix) return 'Kein Fix';
+      const age = Number(gnss.last_fix_age_ms);
+      if (Number.isFinite(age) && age > 10000) return 'Fix veraltet';
+      const accuracy = Number(gnss.accuracy_m);
+      const satellites = Number(gnss.satellites || 0);
+      if (Number.isFinite(accuracy) && accuracy >= 0) {
+        if (accuracy <= 2) return 'Sehr gut';
+        if (accuracy <= 5) return 'Gut';
+        if (accuracy <= 10) return 'Mittel';
+        return 'Schwach';
+      }
+      if (satellites >= 10) return 'Sehr gut';
+      if (satellites >= 6) return 'Gut';
+      return 'Fix aktiv';
+    }
+
+    function updateMapGnssStatus(gnss) {
+      document.getElementById('mapGnssQuality').textContent = gnssQualityText(gnss);
+      document.getElementById('mapGnssPosition').textContent = gnss && gnss.fix
+        ? `${Number(gnss.latitude).toFixed(6)}, ${Number(gnss.longitude).toFixed(6)}`
+        : '-';
+      document.getElementById('mapGnssAccuracy').textContent = gnss && Number.isFinite(gnss.accuracy_m) && gnss.accuracy_m >= 0
+        ? `${Number(gnss.accuracy_m).toFixed(1)} m`
+        : ((gnss && gnss.satellites) ? `${gnss.satellites} Satelliten` : '-');
+      document.getElementById('mapGnssRs485').textContent = gnss
+        ? `${gnss.last_error || '-'} · ${gnss.last_byte_age_ms >= 0 ? gnss.last_byte_age_ms + ' ms' : 'kein Byte'}`
+        : '-';
+    }
+
     function isCameraStreamOpen() {
-      const panel = document.getElementById('cameraPanel');
-      const image = document.getElementById('cameraImage');
-      return Boolean(panel && panel.open && image && image.getAttribute('src'));
+      return Array.from(document.querySelectorAll('.camera-panel')).some(panel => {
+        const image = panel.querySelector('img');
+        return Boolean(panel.open && image && image.getAttribute('src'));
+      });
     }
 
     function hideDebugOverlay() {
@@ -2265,6 +2597,165 @@ String htmlPage() {
       }
     }
 
+    async function fetchStatusNow() {
+      const res = await fetchWithTimeout('/api/status', {}, 2500);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      window.lastStatusData = data;
+      return data;
+    }
+
+    async function runRs485Test() {
+      if (rs485TestRunning) return;
+      const button = document.getElementById('rs485Test');
+      const status = document.getElementById('rs485TestStatus');
+      rs485TestRunning = true;
+      button.disabled = true;
+      status.className = 'rs485-test-status warn';
+      status.textContent = 'RS485 wird geprüft ...';
+
+      try {
+        let data = await fetchStatusNow();
+        const startBytes = Number((data.gnss || {}).byte_count || 0);
+        updateRs485Diagnostics(data, 0);
+
+        for (let i = 0; i < 4; i++) {
+          await new Promise(resolve => setTimeout(resolve, 900));
+          data = await fetchStatusNow();
+          const delta = Number((data.gnss || {}).byte_count || 0) - startBytes;
+          updateRs485Diagnostics(data, Math.max(0, delta));
+          status.textContent = `RS485 wird geprüft ... ${i + 1}/4`;
+        }
+
+        const gnss = data.gnss || {};
+        const byteDelta = Math.max(0, Number(gnss.byte_count || 0) - startBytes);
+        const diagnosis = rs485Diagnosis(gnss, byteDelta);
+        status.className = `rs485-test-status ${diagnosis.className}`;
+        status.textContent = diagnosis.text;
+      } catch (err) {
+        status.className = 'rs485-test-status fail';
+        status.textContent = 'RS485-Test fehlgeschlagen: API nicht erreichbar.';
+      } finally {
+        rs485TestRunning = false;
+        button.disabled = false;
+      }
+    }
+
+    async function runRs485BaudScan() {
+      if (rs485TestRunning) return;
+      const button = document.getElementById('rs485BaudScan');
+      const status = document.getElementById('rs485TestStatus');
+      const grid = document.getElementById('rs485TestGrid');
+      const raw = document.getElementById('rs485RawPreview');
+      rs485TestRunning = true;
+      button.disabled = true;
+      status.className = 'rs485-test-status warn';
+      status.textContent = 'Baudraten werden gescannt ...';
+
+      try {
+        const res = await fetchWithTimeout('/api/rs485-scan', {}, 14000);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const rows = (data.rates || []).map(item =>
+          renderMetric(`${item.baud} Baud`, `${item.bytes || 0} Bytes`, item.preview || '-')
+        );
+        grid.innerHTML = rows.join('');
+        raw.textContent = data.best_preview || 'Keine Rohdaten.';
+        const liveSeen = Number(data.live_bytes_before || 0) > 0 || Number(data.live_last_byte_age_before_ms) >= 0;
+        if (data.ok) {
+          status.className = 'rs485-test-status warn';
+          status.textContent = `RS485 empfängt Bytes bei ${data.best_baud} Baud. Wenn das nicht ${data.default_baud} Baud ist, muss die GNSS-Baudrate angepasst werden.`;
+        } else if (liveSeen) {
+          status.className = 'rs485-test-status warn';
+          status.textContent = `Live-Empfang sieht RS485-Bytes, der Baudscan konnte sie aber nicht sicher zuordnen. Rohdaten prüfen: Wenn kein $G... sichtbar ist, passt Datenformat/Baudrate noch nicht.`;
+        } else {
+          status.className = 'rs485-test-status fail';
+          status.textContent = `Keine Bytes auf den getesteten Baudraten. RX GPIO${data.rx_pin}, TX GPIO${data.tx_pin}, RTS GPIO${data.rts_pin}.`;
+        }
+      } catch (err) {
+        status.className = 'rs485-test-status fail';
+        status.textContent = 'Baudscan fehlgeschlagen: API nicht erreichbar.';
+      } finally {
+        rs485TestRunning = false;
+        button.disabled = false;
+      }
+    }
+
+    async function runRs485AddressScan() {
+      if (rs485TestRunning) return;
+      const button = document.getElementById('rs485AddressScan');
+      const status = document.getElementById('rs485TestStatus');
+      const grid = document.getElementById('rs485TestGrid');
+      rs485TestRunning = true;
+      button.disabled = true;
+      status.className = 'rs485-test-status warn';
+      status.textContent = 'Modbus-Adressen werden gescannt ...';
+
+      try {
+        const res = await fetchWithTimeout('/api/rs485-address-scan', {}, 35000);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const hits = data.hits || [];
+        if (hits.length) {
+          grid.innerHTML = hits.map(hit =>
+            renderMetric(`Adresse ${hit.address}`, `Funktion 0x${Number(hit.function || 0).toString(16).toUpperCase()}`, `${hit.bytes || 0} Bytes · ${hit.duration_ms || 0} ms`)
+          ).join('');
+          status.className = 'rs485-test-status ok';
+          status.textContent = `Modbus-Gerät gefunden bei ${hits.map(hit => hit.address).join(', ')} auf ${data.baud} Baud.`;
+        } else {
+          grid.innerHTML = [
+            renderMetric('Adressscan', `${data.scanned || 0} Adressen`, `${data.duration_ms || 0} ms`),
+            renderMetric('RS485 Pins', `RX GPIO${data.rx_pin}`, `TX GPIO${data.tx_pin} · RTS GPIO${data.rts_pin}`)
+          ].join('');
+          status.className = 'rs485-test-status fail';
+          status.textContent = `Keine Modbus-Antwort auf ${data.baud} Baud gefunden.`;
+        }
+      } catch (err) {
+        status.className = 'rs485-test-status fail';
+        status.textContent = 'Adressscan fehlgeschlagen: API nicht erreichbar oder Timeout.';
+      } finally {
+        rs485TestRunning = false;
+        button.disabled = false;
+      }
+    }
+
+    async function runRs485RegisterScan() {
+      if (rs485TestRunning) return;
+      const button = document.getElementById('rs485RegisterScan');
+      const status = document.getElementById('rs485TestStatus');
+      const grid = document.getElementById('rs485TestGrid');
+      rs485TestRunning = true;
+      button.disabled = true;
+      status.className = 'rs485-test-status warn';
+      status.textContent = 'Modbus-Register werden gescannt ...';
+
+      try {
+        const res = await fetchWithTimeout('/api/rs485-register-scan', {}, 35000);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const registers = data.registers || [];
+        if (data.ok) {
+          grid.innerHTML = registers.length
+            ? registers.map(item =>
+                renderMetric(`Reg ${item.register} (${item.hex})`, String(item.value), `${item.value_hex} · ${item.duration_ms || 0} ms`)
+              ).join('')
+            : renderMetric('Registerscan', `${data.responded || 0} Antworten`, 'Alle gelisteten Werte waren 0');
+          status.className = 'rs485-test-status ok';
+          status.textContent = `${data.responded || 0} von ${data.scanned || 0} Registern haben geantwortet.`;
+        } else {
+          grid.innerHTML = renderMetric('Registerscan', `${data.scanned || 0} Register`, 'Keine Antwort');
+          status.className = 'rs485-test-status fail';
+          status.textContent = `Keine Registerantwort bei Adresse ${data.address} auf ${data.baud} Baud.`;
+        }
+      } catch (err) {
+        status.className = 'rs485-test-status fail';
+        status.textContent = 'Registerscan fehlgeschlagen: API nicht erreichbar oder Timeout.';
+      } finally {
+        rs485TestRunning = false;
+        button.disabled = false;
+      }
+    }
+
     async function refreshTrack() {
       if (trackBusy || !pageActive) return;
       if (isCameraStreamOpen()) return;
@@ -2312,6 +2803,7 @@ String htmlPage() {
         lightOnState = Boolean(data.light_on);
         lightSwitchable = Boolean(data.light_switchable);
         updateLightButton();
+        updateValveButtons(data.pneumatic_valves || []);
         updateCamera(data);
         if (document.activeElement !== document.getElementById('sensitivityInput')) {
           document.getElementById('sensitivityInput').value = data.quality_signal_hold_ms || data.main_signal_hold_ms || 1500;
@@ -2325,15 +2817,6 @@ String htmlPage() {
         }
         if (document.activeElement !== document.getElementById('fieldInput')) {
           document.getElementById('fieldInput').value = data.field_name || '';
-        }
-        if (document.activeElement !== document.getElementById('cameraHostInput')) {
-          document.getElementById('cameraHostInput').value = data.camera_host || '';
-        }
-        if (document.activeElement !== document.getElementById('cameraUserInput')) {
-          document.getElementById('cameraUserInput').value = data.camera_username || '';
-        }
-        if (!document.getElementById('cameraPasswordInput').value) {
-          document.getElementById('cameraPasswordInput').placeholder = 'Passwort gespeichert';
         }
         document.getElementById('gpsCount').textContent = `${data.gps_log_count || 0} / ${data.gps_log_capacity || 0}`;
         document.getElementById('mainEventCount').textContent = `${data.main_event_count || 0} / ${data.main_event_capacity || 0}`;
@@ -2350,6 +2833,7 @@ String htmlPage() {
         document.getElementById('gpsSatellites').textContent = (gnss.satellites !== undefined && gnss.satellites !== null) ? gnss.satellites : '-';
         document.getElementById('gnssRs485').textContent = `${gnss.last_error || '-'} · OK ${gnss.ok_count || 0} / Fehler ${gnss.error_count || 0}`;
         updateGnssWarning(gnss);
+        updateMapGnssStatus(gnss);
         // minimal overview fields
         const channelsList = data.channels || [];
         const seedChannels = channelsList.filter(c => c.seed_channel);
@@ -2459,14 +2943,15 @@ String htmlPage() {
       }
     }
 
-    async function testCameraConnection() {
-      const button = document.getElementById('cameraTest');
-      const target = document.getElementById('cameraTestStatus');
+    async function testCameraConnection(card) {
+      const button = card.querySelector('.cameraTest');
+      const target = card.querySelector('.camera-test-status');
+      const index = Number(card.dataset.cameraIndex);
       button.disabled = true;
       target.className = 'camera-test-status';
       target.textContent = 'Kamera wird getestet ...';
       try {
-        const res = await fetchWithTimeout('/api/camera-test', {}, 12000);
+        const res = await fetchWithTimeout('/api/camera-test?index=' + encodeURIComponent(index), {}, 12000);
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         const items = [data.substream, data.mainstream].filter(Boolean);
@@ -2490,31 +2975,52 @@ String htmlPage() {
       }
     }
 
-    async function saveCameraSettings() {
-      const host = document.getElementById('cameraHostInput').value.trim();
-      const username = document.getElementById('cameraUserInput').value.trim();
-      const passwordInput = document.getElementById('cameraPasswordInput');
+    async function saveCameraSettings(card) {
+      const index = Number(card.dataset.cameraIndex);
+      const host = card.querySelector('.cameraHostInput').value.trim();
+      const username = card.querySelector('.cameraUserInput').value.trim();
+      const passwordInput = card.querySelector('.cameraPasswordInput');
       const password = passwordInput.value.trim();
+      const target = card.querySelector('.camera-test-status');
       if (!host || !username || !password) {
-        document.getElementById('cameraTestStatus').className = 'camera-test-status fail';
-        document.getElementById('cameraTestStatus').textContent = 'Kamera-IP, Benutzer und Passwort eintragen.';
+        target.className = 'camera-test-status fail';
+        target.textContent = 'Kamera-IP, Benutzer und Passwort eintragen.';
         return;
       }
       try {
         const res = await fetchWithTimeout('/api/camera-settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ host, username, password })
+          body: JSON.stringify({ index, host, username, password })
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         passwordInput.value = '';
         passwordInput.placeholder = 'Passwort gespeichert';
-        document.getElementById('cameraTestStatus').className = 'camera-test-status ok';
-        document.getElementById('cameraTestStatus').textContent = 'Kameraeinstellungen gespeichert.';
+        target.className = 'camera-test-status ok';
+        target.textContent = 'Kameraeinstellungen gespeichert.';
         await refresh();
       } catch (err) {
-        document.getElementById('cameraTestStatus').className = 'camera-test-status fail';
-        document.getElementById('cameraTestStatus').textContent = 'Kameraeinstellungen speichern fehlgeschlagen';
+        target.className = 'camera-test-status fail';
+        target.textContent = 'Kameraeinstellungen speichern fehlgeschlagen';
+      }
+    }
+
+    async function clearCameraSettings(card) {
+      const index = Number(card.dataset.cameraIndex);
+      const target = card.querySelector('.camera-test-status');
+      try {
+        const res = await fetchWithTimeout('/api/camera-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index, host: '', username: '', password: '' })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        target.className = 'camera-test-status ok';
+        target.textContent = 'Kamera ausgeblendet.';
+        await refresh();
+      } catch (err) {
+        target.className = 'camera-test-status fail';
+        target.textContent = 'Kamera ausblenden fehlgeschlagen';
       }
     }
 
@@ -2554,7 +3060,98 @@ String htmlPage() {
       await saveCrop();
     }
 
+    function formatBytes(bytes) {
+      const value = Number(bytes || 0);
+      if (value >= 1048576) return (value / 1048576).toFixed(1) + ' MB';
+      if (value >= 1024) return Math.round(value / 1024) + ' KB';
+      return value + ' B';
+    }
+
+    function formatPct(used, total) {
+      if (!total) return '-';
+      return Math.round((used / total) * 100) + ' %';
+    }
+
+    function formatDuration(ms) {
+      const totalSeconds = Math.floor(Number(ms || 0) / 1000);
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      return `${hours} h ${minutes} min ${seconds} s`;
+    }
+
+    function renderMetric(label, value, detail = '') {
+      return `<div class="sensor-row system-row"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(value)}</span><span>${escapeHtml(detail)}</span></div>`;
+    }
+
+    function rs485Diagnosis(gnss, byteDelta = null) {
+      const bytes = Number(gnss.byte_count || 0);
+      const lastByteAge = Number(gnss.last_byte_age_ms);
+      const hasRecentBytes = Number.isFinite(lastByteAge) && lastByteAge >= 0 && lastByteAge <= 10000;
+      const hasNewBytes = byteDelta !== null && byteDelta > 0;
+
+      if (gnss.fix) {
+        return { className: 'ok', text: `OK: GPS-Fix erkannt. Bytes gesamt: ${bytes}.` };
+      }
+      if (gnss.seen || gnss.last_sentence) {
+        return { className: 'ok', text: `OK: GNSS-Daten erkannt, aber noch kein Fix. Fehler: ${gnss.last_error || '-'}.` };
+      }
+      if (hasNewBytes || hasRecentBytes || bytes > 0) {
+        const deltaText = byteDelta !== null ? ` Neue Bytes im Test: ${byteDelta}.` : '';
+        return { className: 'warn', text: `RS485 empfängt Daten, aber noch keinen gültigen GPS-Satz.${deltaText} Fehler: ${gnss.last_error || '-'}.` };
+      }
+      return { className: 'fail', text: `Keine RS485-Bytes empfangen. Fehler: ${gnss.last_error || '-'}.` };
+    }
+
+    function updateRs485Diagnostics(data, byteDelta = null) {
+      const gnss = data.gnss || {};
+      const grid = document.getElementById('rs485TestGrid');
+      const raw = document.getElementById('rs485RawPreview');
+      const hex = document.getElementById('rs485HexPreview');
+      if (!grid || !raw || !hex) return;
+
+      grid.innerHTML = [
+        renderMetric('Schnittstelle', gnss.interface || '-', `${gnss.baud || '-'} Baud · Adresse ${gnss.modbus_address || '-'}`),
+        renderMetric('Empfangene Bytes', String(gnss.byte_count || 0), byteDelta !== null ? `+${byteDelta} im Test` : ''),
+        renderMetric('Letztes Byte', Number(gnss.last_byte_age_ms) >= 0 ? `${gnss.last_byte_age_ms} ms` : 'Noch nie', ''),
+        renderMetric('Letzter Fehler', gnss.last_error || '-', `OK ${gnss.ok_count || 0} / Fehler ${gnss.error_count || 0}`),
+        renderMetric('GPS-Satz', gnss.last_sentence ? 'Erkannt' : 'Noch keiner', gnss.fix ? 'Fix vorhanden' : 'Kein Fix')
+      ].join('');
+      raw.textContent = gnss.raw_preview || 'Keine Rohdaten.';
+      hex.textContent = gnss.raw_hex_preview || 'Keine HEX-Daten.';
+
+      if (!rs485TestRunning) {
+        const status = document.getElementById('rs485TestStatus');
+        const diagnosis = rs485Diagnosis(gnss, byteDelta);
+        status.className = `rs485-test-status ${diagnosis.className}`;
+        status.textContent = diagnosis.text;
+      }
+    }
+
     function renderSettings(data) {
+      try {
+        const heapTotal = Number(data.heap_total_bytes || 0);
+        const heapFree = Number(data.heap_free_bytes || 0);
+        const psramTotal = Number(data.psram_total_bytes || 0);
+        const psramFree = Number(data.psram_free_bytes || 0);
+        const fsTotal = Number(data.filesystem_total_bytes || 0);
+        const fsUsed = Number(data.filesystem_used_bytes || 0);
+        const sketchSize = Number(data.sketch_size_bytes || 0);
+        const sketchFree = Number(data.sketch_free_space_bytes || 0);
+        document.getElementById('systemLoadGrid').innerHTML = [
+          renderMetric('Heap', formatBytes(heapTotal - heapFree) + ' / ' + formatBytes(heapTotal), formatPct(heapTotal - heapFree, heapTotal)),
+          renderMetric('Heap Minimum frei', formatBytes(data.heap_min_free_bytes), ''),
+          renderMetric('PSRAM', formatBytes(psramTotal - psramFree) + ' / ' + formatBytes(psramTotal), formatPct(psramTotal - psramFree, psramTotal)),
+          renderMetric('LittleFS', data.filesystem_ready ? formatBytes(fsUsed) + ' / ' + formatBytes(fsTotal) : 'Nicht bereit', data.filesystem_ready ? formatPct(fsUsed, fsTotal) : ''),
+          renderMetric('Sketch Flash', formatBytes(sketchSize) + ' / ' + formatBytes(sketchSize + sketchFree), formatPct(sketchSize, sketchSize + sketchFree)),
+          renderMetric('Uptime', formatDuration(data.uptime_ms), ''),
+          renderMetric('Boots / Reset', String(data.boot_counter || 0), data.reset_reason || '-'),
+          renderMetric('Ethernet', data.ethernet_ready ? (data.ethernet_link ? 'Link aktiv' : 'Kein Link') : 'Nicht bereit', data.ethernet_ip || '-')
+        ].join('');
+      } catch (e) {
+        document.getElementById('systemLoadGrid').textContent = 'Nicht verfügbar';
+      }
+      updateRs485Diagnostics(data);
       try {
         const gnss = data.gnss || {};
         const info = {
@@ -2563,6 +3160,9 @@ String htmlPage() {
           last_error: gnss.last_error,
           last_sentence: gnss.last_sentence,
           raw_preview: gnss.raw_preview,
+          raw_hex_preview: gnss.raw_hex_preview,
+          byte_count: gnss.byte_count,
+          last_byte_age_ms: gnss.last_byte_age_ms,
           poll_count: gnss.poll_count,
           ok_count: gnss.ok_count,
           error_count: gnss.error_count
@@ -2650,9 +3250,11 @@ String htmlPage() {
     document.getElementById('cropSave').addEventListener('click', saveCrop);
     document.getElementById('fieldSave').addEventListener('click', saveField);
     document.getElementById('sensitivitySave').addEventListener('click', saveSensitivitySetting);
-    document.getElementById('cameraSave').addEventListener('click', saveCameraSettings);
-    document.getElementById('cameraTest').addEventListener('click', testCameraConnection);
     document.getElementById('archiveRefresh').addEventListener('click', loadArchive);
+    document.getElementById('rs485Test').addEventListener('click', runRs485Test);
+    document.getElementById('rs485BaudScan').addEventListener('click', runRs485BaudScan);
+    document.getElementById('rs485AddressScan').addEventListener('click', runRs485AddressScan);
+    document.getElementById('rs485RegisterScan').addEventListener('click', runRs485RegisterScan);
     document.getElementById('alarmEnable').addEventListener('click', enableAlarm);
     document.getElementById('alarmAck').addEventListener('click', acknowledgeAlarm);
     document.getElementById('monitoringTab').addEventListener('click', () => selectView('monitoring'));
@@ -2660,21 +3262,9 @@ String htmlPage() {
     document.getElementById('settingsTab').addEventListener('click', () => selectView('settings'));
     document.getElementById('lightOn').addEventListener('click', () => toggleLight());
     document.getElementById('mapFollow').addEventListener('click', () => setMapFollow(!followMap));
-    document.getElementById('cameraSubStream').addEventListener('click', () => setCameraStreamMode('sub'));
-    document.getElementById('cameraMainStream').addEventListener('click', () => setCameraStreamMode('main'));
-    document.getElementById('cameraPanel').addEventListener('toggle', event => {
-      updateCamera(window.lastStatusData || {});
-      if (event.currentTarget.open) {
-        document.getElementById('error').textContent = '';
-        hideDebugOverlay();
-        updateLastContact();
-      } else {
-        refresh();
-      }
-    });
     window.addEventListener('pagehide', () => {
       pageActive = false;
-      document.getElementById('cameraImage').removeAttribute('src');
+      document.querySelectorAll('.camera-panel img').forEach(image => image.removeAttribute('src'));
     });
     document.getElementById('grid').addEventListener('click', event => {
       if (event.target.tagName !== 'SUMMARY') return;
@@ -2725,12 +3315,288 @@ void handleApiStatus() {
   server.send(200, "application/json", statusJson());
 }
 
-void addCameraTestResult(JsonObject target, const char *label, const char *path) {
+uint16_t listenForRs485Bytes(uint32_t listenMs, char *preview, size_t previewSize) {
+  uint16_t count = 0;
+  const uint32_t startMs = millis();
+  if (preview != nullptr && previewSize > 0) {
+    preview[0] = '\0';
+  }
+
+  while (millis() - startMs < listenMs) {
+    while (gnssSerial.available()) {
+      const char c = static_cast<char>(gnssSerial.read());
+      count++;
+      noteGnssReceivedByte(c);
+      if (preview != nullptr && previewSize > 1) {
+        const size_t length = strnlen(preview, previewSize);
+        if (length + 1 < previewSize) {
+          preview[length] = (c >= 32 && c <= 126) ? c : '.';
+          preview[length + 1] = '\0';
+        }
+      }
+    }
+    delay(1);
+  }
+
+  return count;
+}
+
+void restartGnssSerial(uint32_t baud) {
+  gnssSerial.end();
+  delay(20);
+  digitalWrite(GNSS_RS485_DE_RE_PIN, LOW);
+  gnssSerial.begin(baud, SERIAL_8N1, GNSS_RS485_RX_PIN, GNSS_RS485_TX_PIN);
+  gnssDirectLineLength = 0;
+}
+
+void handleApiRs485Scan() {
+  JsonDocument doc;
+  JsonArray rates = doc["rates"].to<JsonArray>();
+  uint32_t bestBaud = 0;
+  uint16_t bestCount = 0;
+  char bestPreview[64] = "";
+  const uint32_t liveBytesBefore = gnss.byteCount;
+  const uint32_t liveLastByteAgeBefore = gnss.lastByteMs > 0 ? millis() - gnss.lastByteMs : UINT32_MAX;
+
+  digitalWrite(GNSS_RS485_DE_RE_PIN, LOW);
+
+  for (uint8_t i = 0; i < sizeof(GNSS_BAUD_SCAN_RATES) / sizeof(GNSS_BAUD_SCAN_RATES[0]); i++) {
+    const uint32_t baud = GNSS_BAUD_SCAN_RATES[i];
+    restartGnssSerial(baud);
+    listenForRs485Bytes(250, nullptr, 0);
+
+    char preview[64] = "";
+    const uint16_t count = listenForRs485Bytes(1600, preview, sizeof(preview));
+    JsonObject result = rates.add<JsonObject>();
+    result["baud"] = baud;
+    result["bytes"] = count;
+    result["preview"] = preview;
+
+    if (count > bestCount) {
+      bestBaud = baud;
+      bestCount = count;
+      strncpy(bestPreview, preview, sizeof(bestPreview) - 1);
+      bestPreview[sizeof(bestPreview) - 1] = '\0';
+    }
+  }
+
+  restartGnssSerial(GNSS_MODBUS_BAUD);
+
+  doc["ok"] = bestCount > 0;
+  doc["live_bytes_before"] = liveBytesBefore;
+  doc["live_bytes_now"] = gnss.byteCount;
+  doc["live_last_byte_age_before_ms"] = liveLastByteAgeBefore == UINT32_MAX ? -1 : static_cast<int32_t>(liveLastByteAgeBefore);
+  doc["best_baud"] = bestBaud;
+  doc["best_bytes"] = bestCount;
+  doc["best_preview"] = bestPreview;
+  doc["default_baud"] = GNSS_MODBUS_BAUD;
+  doc["rx_pin"] = GNSS_RS485_RX_PIN;
+  doc["tx_pin"] = GNSS_RS485_TX_PIN;
+  doc["rts_pin"] = GNSS_RS485_DE_RE_PIN;
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+bool probeModbusAddress(uint8_t address, uint8_t &functionCode, uint8_t &byteCount, uint32_t &durationMs) {
+  const uint32_t startMs = millis();
+  functionCode = 0;
+  byteCount = 0;
+
+  while (gnssSerial.available()) {
+    noteGnssReceivedByte(static_cast<char>(gnssSerial.read()));
+  }
+
+  uint8_t request[8];
+  request[0] = address;
+  request[1] = GNSS_MODBUS_FUNCTION_READ_HOLDING;
+  request[2] = highByte(GNSS_SCAN_START_REGISTER);
+  request[3] = lowByte(GNSS_SCAN_START_REGISTER);
+  request[4] = 0x00;
+  request[5] = 0x01;
+  const uint16_t crc = modbusCrc(request, 6);
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+  digitalWrite(GNSS_RS485_DE_RE_PIN, HIGH);
+  delayMicroseconds(80);
+  gnssSerial.write(request, sizeof(request));
+  gnssSerial.flush();
+  delayMicroseconds(120);
+  digitalWrite(GNSS_RS485_DE_RE_PIN, LOW);
+
+  uint8_t response[16];
+  size_t index = 0;
+  const uint32_t deadline = millis() + 90;
+  while (millis() < deadline && index < sizeof(response)) {
+    while (gnssSerial.available() && index < sizeof(response)) {
+      const char c = static_cast<char>(gnssSerial.read());
+      noteGnssReceivedByte(c);
+      response[index++] = static_cast<uint8_t>(c);
+    }
+    delay(1);
+  }
+
+  durationMs = millis() - startMs;
+  if (index < 5) {
+    return false;
+  }
+
+  const uint16_t receivedCrc = static_cast<uint16_t>(response[index - 2]) | (static_cast<uint16_t>(response[index - 1]) << 8);
+  if (modbusCrc(response, index - 2) != receivedCrc || response[0] != address) {
+    return false;
+  }
+
+  functionCode = response[1];
+  byteCount = response[2];
+  return true;
+}
+
+bool probeModbusRegister(uint16_t startRegister, uint16_t &value, uint32_t &durationMs) {
+  const uint32_t startMs = millis();
+  value = 0;
+
+  while (gnssSerial.available()) {
+    noteGnssReceivedByte(static_cast<char>(gnssSerial.read()));
+  }
+
+  uint8_t request[8];
+  request[0] = GNSS_MODBUS_ADDRESS;
+  request[1] = GNSS_MODBUS_FUNCTION_READ_HOLDING;
+  request[2] = highByte(startRegister);
+  request[3] = lowByte(startRegister);
+  request[4] = 0x00;
+  request[5] = 0x01;
+  const uint16_t crc = modbusCrc(request, 6);
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+  digitalWrite(GNSS_RS485_DE_RE_PIN, HIGH);
+  delayMicroseconds(80);
+  gnssSerial.write(request, sizeof(request));
+  gnssSerial.flush();
+  delayMicroseconds(120);
+  digitalWrite(GNSS_RS485_DE_RE_PIN, LOW);
+
+  uint8_t response[8];
+  size_t index = 0;
+  const uint32_t deadline = millis() + 90;
+  while (millis() < deadline && index < sizeof(response)) {
+    while (gnssSerial.available() && index < sizeof(response)) {
+      const char c = static_cast<char>(gnssSerial.read());
+      noteGnssReceivedByte(c);
+      response[index++] = static_cast<uint8_t>(c);
+    }
+    delay(1);
+  }
+
+  durationMs = millis() - startMs;
+  if (index < 7) {
+    return false;
+  }
+
+  const uint16_t receivedCrc = static_cast<uint16_t>(response[index - 2]) | (static_cast<uint16_t>(response[index - 1]) << 8);
+  if (modbusCrc(response, index - 2) != receivedCrc || response[0] != GNSS_MODBUS_ADDRESS ||
+      response[1] != GNSS_MODBUS_FUNCTION_READ_HOLDING || response[2] != 2) {
+    return false;
+  }
+
+  value = (static_cast<uint16_t>(response[3]) << 8) | response[4];
+  return true;
+}
+
+void handleApiRs485AddressScan() {
+  restartGnssSerial(GNSS_MODBUS_BAUD);
+
+  JsonDocument doc;
+  JsonArray hits = doc["hits"].to<JsonArray>();
+  const uint32_t startMs = millis();
+  uint16_t scanned = 0;
+
+  for (uint16_t address = 1; address <= 247; address++) {
+    uint8_t functionCode = 0;
+    uint8_t byteCount = 0;
+    uint32_t durationMs = 0;
+    scanned++;
+    if (probeModbusAddress(static_cast<uint8_t>(address), functionCode, byteCount, durationMs)) {
+      JsonObject hit = hits.add<JsonObject>();
+      hit["address"] = address;
+      hit["function"] = functionCode;
+      hit["bytes"] = byteCount;
+      hit["duration_ms"] = durationMs;
+    }
+    if ((address % 8) == 0) {
+      esp_task_wdt_reset();
+      server.client().flush();
+    }
+  }
+
+  restartGnssSerial(GNSS_MODBUS_BAUD);
+  doc["ok"] = hits.size() > 0;
+  doc["baud"] = GNSS_MODBUS_BAUD;
+  doc["scanned"] = scanned;
+  doc["duration_ms"] = millis() - startMs;
+  doc["rx_pin"] = GNSS_RS485_RX_PIN;
+  doc["tx_pin"] = GNSS_RS485_TX_PIN;
+  doc["rts_pin"] = GNSS_RS485_DE_RE_PIN;
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleApiRs485RegisterScan() {
+  restartGnssSerial(GNSS_MODBUS_BAUD);
+
+  JsonDocument doc;
+  JsonArray registers = doc["registers"].to<JsonArray>();
+  const uint32_t startMs = millis();
+  uint16_t responded = 0;
+  uint16_t scanned = 0;
+
+  for (uint16_t reg = 0; reg <= 255; reg++) {
+    uint16_t value = 0;
+    uint32_t durationMs = 0;
+    scanned++;
+    if (probeModbusRegister(reg, value, durationMs)) {
+      responded++;
+      if (reg < 32 || value != 0) {
+        JsonObject item = registers.add<JsonObject>();
+        item["register"] = reg;
+        item["hex"] = "0x" + String(reg, HEX);
+        item["value"] = value;
+        item["value_hex"] = "0x" + String(value, HEX);
+        item["duration_ms"] = durationMs;
+      }
+    }
+    if ((reg % 8) == 0) {
+      esp_task_wdt_reset();
+    }
+  }
+
+  restartGnssSerial(GNSS_MODBUS_BAUD);
+  doc["ok"] = responded > 0;
+  doc["baud"] = GNSS_MODBUS_BAUD;
+  doc["address"] = GNSS_MODBUS_ADDRESS;
+  doc["scanned"] = scanned;
+  doc["responded"] = responded;
+  doc["duration_ms"] = millis() - startMs;
+
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void addCameraTestResult(JsonObject target, uint8_t cameraIndex, const char *label, const char *path) {
   const uint32_t startMs = millis();
   EthernetClient client;
   client.setTimeout(HIKVISION_CAMERA_TEST_TIMEOUT_MS);
 
-  bool connected = ethernetReady && client.connect(cameraHost, 80);
+  bool connected = ethernetReady && cameraConfigured(cameraIndex) && client.connect(cameraHosts[cameraIndex], 80);
   int httpCode = -1;
   String statusLine;
   String contentType;
@@ -2740,9 +3606,9 @@ void addCameraTestResult(JsonObject target, const char *label, const char *path)
     client.print("GET ");
     client.print(path);
     client.print(" HTTP/1.1\r\nHost: ");
-    client.print(cameraHost);
+    client.print(cameraHosts[cameraIndex]);
     client.print("\r\nAuthorization: ");
-    client.print(cameraAuthHeader());
+    client.print(cameraAuthHeader(cameraIndex));
     client.print("\r\nConnection: close\r\n\r\n");
 
     String line;
@@ -2786,7 +3652,7 @@ void addCameraTestResult(JsonObject target, const char *label, const char *path)
       error = "no_http_header";
     }
   } else {
-    error = ethernetReady ? "connect_failed" : "ethernet_not_ready";
+    error = !ethernetReady ? "ethernet_not_ready" : cameraConfigured(cameraIndex) ? "connect_failed" : "camera_not_configured";
   }
 
   const uint32_t durationMs = millis() - startMs;
@@ -2811,10 +3677,17 @@ void addCameraTestResult(JsonObject target, const char *label, const char *path)
 }
 
 void handleApiCameraTest() {
+  const int indexArg = server.hasArg("index") ? server.arg("index").toInt() : 0;
+  if (indexArg < 0 || indexArg >= CAMERA_COUNT) {
+    server.send(400, "application/json", "{\"error\":\"invalid_camera_index\"}");
+    return;
+  }
+  const uint8_t cameraIndex = static_cast<uint8_t>(indexArg);
   JsonDocument doc;
-  doc["camera_name"] = HIKVISION_CAMERA_NAME;
-  addCameraTestResult(doc["substream"].to<JsonObject>(), "Substream 102", HIKVISION_CAMERA_SUB_STREAM_PATH);
-  addCameraTestResult(doc["mainstream"].to<JsonObject>(), "Mainstream 101", HIKVISION_CAMERA_MAIN_STREAM_PATH);
+  doc["camera_name"] = "Kamera " + String(cameraIndex + 1);
+  doc["camera_index"] = cameraIndex;
+  addCameraTestResult(doc["substream"].to<JsonObject>(), cameraIndex, "Substream 102", HIKVISION_CAMERA_SUB_STREAM_PATH);
+  addCameraTestResult(doc["mainstream"].to<JsonObject>(), cameraIndex, "Mainstream 101", HIKVISION_CAMERA_MAIN_STREAM_PATH);
 
   String json;
   serializeJson(doc, json);
@@ -2822,15 +3695,19 @@ void handleApiCameraTest() {
   server.send(200, "application/json", json);
 }
 
-void handleCameraProxy(const char *cameraPath) {
+void handleCameraProxy(uint8_t cameraIndex, const char *cameraPath) {
   if (!ethernetReady) {
     server.send(503, "text/plain; charset=utf-8", "Ethernet nicht bereit");
+    return;
+  }
+  if (!cameraConfigured(cameraIndex)) {
+    server.send(404, "text/plain; charset=utf-8", "Kamera nicht konfiguriert");
     return;
   }
 
   EthernetClient camera;
   camera.setTimeout(HIKVISION_CAMERA_TEST_TIMEOUT_MS);
-  if (!camera.connect(cameraHost, 80)) {
+  if (!camera.connect(cameraHosts[cameraIndex], 80)) {
     server.send(502, "text/plain; charset=utf-8", "Kamera nicht erreichbar");
     return;
   }
@@ -2838,9 +3715,9 @@ void handleCameraProxy(const char *cameraPath) {
   camera.print("GET ");
   camera.print(cameraPath);
   camera.print(" HTTP/1.1\r\nHost: ");
-  camera.print(cameraHost);
+  camera.print(cameraHosts[cameraIndex]);
   camera.print("\r\nAuthorization: ");
-  camera.print(cameraAuthHeader());
+  camera.print(cameraAuthHeader(cameraIndex));
   camera.print("\r\nConnection: close\r\n\r\n");
 
   const uint32_t headerStartMs = millis();
@@ -3148,20 +4025,27 @@ void handleApiCameraSettings() {
     return;
   }
 
+  const int indexArg = doc["index"] | 0;
+  if (indexArg < 0 || indexArg >= CAMERA_COUNT) {
+    server.send(400, "application/json", "{\"error\":\"invalid_camera_index\"}");
+    return;
+  }
+  const uint8_t cameraIndex = static_cast<uint8_t>(indexArg);
   const String host = doc["host"] | "";
   const String username = doc["username"] | "";
   const String password = doc["password"] | "";
-  if (host.length() == 0 || username.length() == 0 || password.length() == 0) {
+  if (host.length() > 0 && (username.length() == 0 || password.length() == 0)) {
     server.send(400, "application/json", "{\"error\":\"invalid_camera_settings\"}");
     return;
   }
 
-  saveCameraSettings(host, username, password);
+  saveCameraSettings(cameraIndex, host, username, password);
 
   JsonDocument response;
   response["ok"] = true;
-  response["camera_host"] = cameraHost;
-  response["camera_username"] = cameraUsername;
+  response["camera_index"] = cameraIndex;
+  response["camera_host"] = cameraHosts[cameraIndex];
+  response["camera_username"] = cameraUsernames[cameraIndex];
   String json;
   serializeJson(response, json);
   server.send(200, "application/json", json);
@@ -3739,9 +4623,18 @@ void setup() {
   initDigitalOutputs();
 
   server.on("/", HTTP_GET, handleRoot);
-  server.on(CAMERA_PROXY_SUB_STREAM_URL, HTTP_GET, []() { handleCameraProxy(HIKVISION_CAMERA_SUB_STREAM_PATH); });
-  server.on(CAMERA_PROXY_MAIN_STREAM_URL, HTTP_GET, []() { handleCameraProxy(HIKVISION_CAMERA_MAIN_STREAM_PATH); });
+  server.on("/camera/1/substream", HTTP_GET, []() { handleCameraProxy(0, HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  server.on("/camera/1/mainstream", HTTP_GET, []() { handleCameraProxy(0, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
+  server.on("/camera/2/substream", HTTP_GET, []() { handleCameraProxy(1, HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  server.on("/camera/2/mainstream", HTTP_GET, []() { handleCameraProxy(1, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
+  server.on("/camera/3/substream", HTTP_GET, []() { handleCameraProxy(2, HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  server.on("/camera/3/mainstream", HTTP_GET, []() { handleCameraProxy(2, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
+  server.on("/camera/4/substream", HTTP_GET, []() { handleCameraProxy(3, HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  server.on("/camera/4/mainstream", HTTP_GET, []() { handleCameraProxy(3, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
   server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/rs485-scan", HTTP_GET, handleApiRs485Scan);
+  server.on("/api/rs485-address-scan", HTTP_GET, handleApiRs485AddressScan);
+  server.on("/api/rs485-register-scan", HTTP_GET, handleApiRs485RegisterScan);
   server.on("/api/camera-test", HTTP_GET, handleApiCameraTest);
   server.on("/api/alarm/ack", HTTP_POST, handleApiAlarmAck);
   server.on("/api/channel-name", HTTP_POST, handleApiChannelName);
