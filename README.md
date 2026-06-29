@@ -3,7 +3,7 @@
 Firmware fuer das Waveshare ESP32-S3-POE-ETH-8DI-8DO Board zur
 Ueberwachung einer Drillmaschine.
 
-Aktuelle Firmware-Version: **2.1.0**
+Aktuelle Firmware-Version: **2.2.0**
 
 ## Kurzueberblick
 
@@ -275,6 +275,29 @@ I/O-Pins:
 | W5500 SCLK | GPIO15 | Ethernet |
 | W5500 CS | GPIO16 | Ethernet |
 | W5500 RST | GPIO39 | Ethernet |
+
+Schaltplan-Zuordnung:
+
+Der elektronische DI/DO-Schaltplan liegt als HTML-Datei unter
+[`docs/di_do_schematic.html`](docs/di_do_schematic.html).
+Er ist auf E3F-DS30C4 Sensoren, ein 12V-Lichtrelais, EWD108-GN05(485)
+GNSS und Heschen 3V210-08 DC12V Pneumatikventile ausgelegt.
+
+| Klemme | Funktion | Bemerkung |
+|--------|----------|-----------|
+| DO1 | Licht | Schaltet den Lichtausgang der Maschine |
+| DO2 | Pneumatikventil 1 | Ventilgruppe/Sensorbereich 1 |
+| DO3 | Pneumatikventil 2 | Ventilgruppe/Sensorbereich 2 |
+| DO4 | Pneumatikventil 3 | Ventilgruppe/Sensorbereich 3 |
+| DO5 | Pneumatikventil 4 | Ventilgruppe/Sensorbereich 4 |
+| DI1 | Sensor 1 | Saat-/Durchflussueberwachung |
+| DI2 | Sensor 2 | Saat-/Durchflussueberwachung |
+| DI3 | Sensor 3 | Saat-/Durchflussueberwachung |
+| DI4 | Sensor 4 | Saat-/Durchflussueberwachung |
+| DI5 | Sensor 5 | Saat-/Durchflussueberwachung |
+| DI6 | Sensor 6 | Saat-/Durchflussueberwachung |
+| DI7 | Reserve | Aktuell nicht verwendet |
+| DI8 | Hubwerksignal | Signal fuer Arbeitsstellung/Hubwerk |
 
 ## Signal-Logik
 

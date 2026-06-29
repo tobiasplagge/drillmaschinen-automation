@@ -34,7 +34,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 
 static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
-static const char *FIRMWARE_VERSION = "2.1.0";
+static const char *FIRMWARE_VERSION = "2.2.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
@@ -70,6 +70,9 @@ static constexpr uint32_t GPS_LOG_INTERVAL_MS = 3000;
 static constexpr uint32_t GNSS_POLL_INTERVAL_MS = 1000;
 static constexpr uint32_t GNSS_STALE_MS = 10000;
 static constexpr uint32_t GNSS_AUTO_START_HOLD_MS = 3000;
+static constexpr uint32_t DEFAULT_LIFT_AUTO_STOP_DELAY_MS = 600000;
+static constexpr uint32_t MIN_LIFT_AUTO_STOP_DELAY_MS = 0;
+static constexpr uint32_t MAX_LIFT_AUTO_STOP_DELAY_MS = 3600000;
 static constexpr uint32_t FILE_FLUSH_INTERVAL_MS = 30000;
 static constexpr uint8_t WATCHDOG_TIMEOUT_SECONDS = 8;
 static constexpr uint16_t GPS_LOG_TARGET_CAPACITY = 5000;
@@ -243,8 +246,13 @@ uint32_t tripCounter = 0;
 uint32_t mainSignalHoldMs = DEFAULT_MAIN_SIGNAL_HOLD_MS;
 const char *resetReason = "unknown";
 bool filesystemReady = false;
+uint32_t lastFsCheckMs = 0;
+uint32_t cachedFsUsedBytes = 0;
+uint32_t cachedFsTotalBytes = 0;
 bool autoStartEnabled = true;
 bool autoStartArmed = true;
+uint32_t liftAutoStopDelayMs = DEFAULT_LIFT_AUTO_STOP_DELAY_MS;
+uint32_t liftRaisedSinceMs = 0;
 String persistentGpsBuffer;
 uint32_t lastFileFlushMs = 0;
 GpsLogEntry *gpsLog = nullptr;
@@ -525,6 +533,27 @@ void saveFieldName(const String &name) {
   name.toCharArray(fieldName, FIELD_NAME_LENGTH);
   sanitizeFieldName(fieldName);
   preferences.putString("field", fieldName);
+}
+
+void loadLiftAutoStopDelay() {
+  liftAutoStopDelayMs = preferences.getUInt("lift_stop_ms", DEFAULT_LIFT_AUTO_STOP_DELAY_MS);
+  liftAutoStopDelayMs = constrain(liftAutoStopDelayMs, MIN_LIFT_AUTO_STOP_DELAY_MS, MAX_LIFT_AUTO_STOP_DELAY_MS);
+}
+
+void saveLiftAutoStopDelay(uint32_t delayMs) {
+  liftAutoStopDelayMs = constrain(delayMs, MIN_LIFT_AUTO_STOP_DELAY_MS, MAX_LIFT_AUTO_STOP_DELAY_MS);
+  preferences.putUInt("lift_stop_ms", liftAutoStopDelayMs);
+}
+
+// DI7 (GPIO10, HIDDEN_CHANNEL) liest ISO 11786 PIN5: 0V=unten, 10V=oben.
+// Opto-Koppler invertiert: GPIO LOW = Eingang aktiv = Gerät oben.
+bool liftIsDown() { return !channels[HIDDEN_CHANNEL - 1].active; }
+bool liftIsUp()   { return  channels[HIDDEN_CHANNEL - 1].active; }
+
+uint32_t liftAutoStopRemainingMs(uint32_t now) {
+  if (!recordingActive || !liftIsUp() || liftRaisedSinceMs == 0) return 0;
+  const uint32_t elapsed = now - liftRaisedSinceMs;
+  return elapsed >= liftAutoStopDelayMs ? 0 : liftAutoStopDelayMs - elapsed;
 }
 
 bool cameraConfigured(uint8_t cameraIndex) {
@@ -1085,9 +1114,23 @@ void updateGnssHealthAndRecording() {
     gnss.fixAvailableSinceMs = 0;
     autoStartArmed = true;
   }
-  if (autoStartEnabled && autoStartArmed && !recordingActive && gnss.fix &&
+  if (recordingActive) {
+    if (liftIsUp()) {
+      if (liftRaisedSinceMs == 0) liftRaisedSinceMs = now;
+      if (now - liftRaisedSinceMs >= liftAutoStopDelayMs) {
+        stopRecording("lift_auto");
+        autoStartArmed = true;
+        liftRaisedSinceMs = 0;
+      }
+    } else {
+      liftRaisedSinceMs = 0;
+    }
+    return;
+  }
+  liftRaisedSinceMs = 0;
+  if (autoStartEnabled && autoStartArmed && liftIsDown() && gnss.fix &&
       gnss.fixAvailableSinceMs > 0 && now - gnss.fixAvailableSinceMs >= GNSS_AUTO_START_HOLD_MS) {
-    startRecording("gnss_auto");
+    startRecording("lift_gnss_auto");
   }
 }
 
@@ -1389,6 +1432,17 @@ void readDigitalInputs() {
 String statusJson() {
   JsonDocument doc;
   const uint32_t now = millis();
+
+  if (filesystemReady && now - lastFsCheckMs >= 10000) {
+    cachedFsUsedBytes  = LittleFS.usedBytes();
+    cachedFsTotalBytes = LittleFS.totalBytes();
+    lastFsCheckMs = now;
+  }
+
+  const bool rotMoving      = rotationMoving(now);
+  const float rotRpm        = rotationRpm(now);
+  const char *gnssHealthStr = gnssHealth();
+
   doc["device_id"] = DEVICE_ID;
   doc["device_name"] = DEVICE_NAME;
   doc["firmware_version"] = FIRMWARE_VERSION;
@@ -1399,8 +1453,8 @@ String statusJson() {
   doc["trip_id"] = tripId;
   doc["auto_start_enabled"] = autoStartEnabled;
   doc["filesystem_ready"] = filesystemReady;
-  doc["filesystem_used_bytes"] = filesystemReady ? LittleFS.usedBytes() : 0;
-  doc["filesystem_total_bytes"] = filesystemReady ? LittleFS.totalBytes() : 0;
+  doc["filesystem_used_bytes"] = filesystemReady ? cachedFsUsedBytes : 0;
+  doc["filesystem_total_bytes"] = filesystemReady ? cachedFsTotalBytes : 0;
   doc["boot_counter"] = bootCounter;
   doc["reset_reason"] = resetReason;
   doc["uptime_ms"] = now;
@@ -1423,6 +1477,15 @@ String statusJson() {
   doc["light_channel"] = LIGHT_OUTPUT_CHANNEL;
   doc["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
   doc["light_switchable"] = doExpanderReady;
+  JsonObject liftJson = doc["lift"].to<JsonObject>();
+  liftJson["source"] = "DI7_ISO11786_PIN5";
+  liftJson["is_down"] = liftIsDown();
+  liftJson["is_up"] = liftIsUp();
+  liftJson["raw_high"] = channels[HIDDEN_CHANNEL - 1].inputRaw;
+  liftJson["auto_stop_delay_ms"] = liftAutoStopDelayMs;
+  liftJson["auto_stop_remaining_ms"] = liftAutoStopRemainingMs(now);
+  liftJson["auto_stop_timer_active"] = recordingActive && liftIsUp() && liftRaisedSinceMs > 0;
+  liftJson["auto_start_ready"] = autoStartEnabled && autoStartArmed && liftIsDown() && gnss.fix;
   JsonArray valves = doc["pneumatic_valves"].to<JsonArray>();
   for (uint8_t i = 0; i < PNEUMATIC_VALVE_COUNT; i++) {
     const uint8_t outputChannel = PNEUMATIC_VALVE_OUTPUTS[i];
@@ -1471,8 +1534,8 @@ String statusJson() {
   gnssJson["modbus_address"] = GNSS_MODBUS_ADDRESS;
   gnssJson["baud"] = GNSS_MODBUS_BAUD;
   gnssJson["fix"] = gnss.fix;
-  gnssJson["health"] = gnssHealth();
-  gnssJson["warning"] = strcmp(gnssHealth(), "ok") != 0;
+  gnssJson["health"] = gnssHealthStr;
+  gnssJson["warning"] = strcmp(gnssHealthStr, "ok") != 0;
   gnssJson["seen"] = gnss.seen;
   gnssJson["latitude"] = gnss.latitude;
   gnssJson["longitude"] = gnss.longitude;
@@ -1505,9 +1568,9 @@ String statusJson() {
 
   JsonObject rotationJson = doc["rotation"].to<JsonObject>();
   rotationJson["channel"] = ROTATION_CHANNEL;
-  rotationJson["status"] = rotationMoving(now) ? "Dreht" : "Dreht nicht";
-  rotationJson["moving"] = rotationMoving(now);
-  rotationJson["rpm"] = rotationRpm(now);
+  rotationJson["status"] = rotMoving ? "Dreht" : "Dreht nicht";
+  rotationJson["moving"] = rotMoving;
+  rotationJson["rpm"] = rotRpm;
   rotationJson["pulse_count"] = channels[ROTATION_CHANNEL - 1].detectionCount;
   rotationJson["pulse_interval_ms"] = channels[ROTATION_CHANNEL - 1].pulseIntervalMs;
   rotationJson["last_pulse_age_ms"] = channels[ROTATION_CHANNEL - 1].lastDetectionMs > 0 ? static_cast<int32_t>(now - channels[ROTATION_CHANNEL - 1].lastDetectionMs) : -1;
@@ -1532,8 +1595,9 @@ String statusJson() {
     ch["changes"] = channels[i].changes;
     ch["detection_count"] = channels[i].detectionCount;
     ch["pulse_interval_ms"] = channels[i].pulseIntervalMs;
-    ch["rotation_moving"] = isRotationChannel(i) ? rotationMoving(now) : false;
-    ch["rotation_rpm"] = isRotationChannel(i) ? rotationRpm(now) : 0.0f;
+    const bool isRot = isRotationChannel(i);
+    ch["rotation_moving"] = isRot ? rotMoving : false;
+    ch["rotation_rpm"] = isRot ? rotRpm : 0.0f;
     ch["signal_quality_pct"] = channels[i].signalQualityPct;
     ch["last_detection_age_ms"] = channels[i].lastDetectionMs > 0 ? static_cast<int32_t>(now - channels[i].lastDetectionMs) : -1;
     ch["active_ms"] = channels[i].activeSinceMs > 0 && channels[i].active ? static_cast<int32_t>(now - channels[i].activeSinceMs) : 0;
@@ -1547,8 +1611,8 @@ String statusJson() {
   return json;
 }
 
-String htmlPage() {
-  return R"HTML(
+const char* htmlPage() {
+  static const char PAGE[] = R"HTML(
 <!doctype html>
 <html lang="de">
 <head>
@@ -1713,6 +1777,7 @@ String htmlPage() {
     <div id="connection" class="connection">
       <span>Kontakt: <span class="connection-dot"></span><strong id="connectionState">OK</strong></span>
       <span>ESP Temperatur: <strong id="espTemp">-</strong></span>
+      <span>Hubwerk: <strong id="liftStatusConn">-</strong></span>
     </div>
     <div id="gnssWarning" class="warning hidden"></div>
     <nav class="tabs" aria-label="Ansicht">
@@ -1742,6 +1807,7 @@ String htmlPage() {
       </details>
       <div class="gps-meta">
         <div>Sensor-Status: <strong id="sensorStatus">-</strong></div>
+        <div>Hubwerk: <strong id="liftStatus">-</strong></div>
         <div>Letzter Kontakt: <strong id="lastContactMini">-</strong></div>
         <div>GPS-Signal: <strong id="gnssFix">-</strong></div>
         <div>Alarm: <strong id="alarmStatus">Aus</strong></div>
@@ -1814,6 +1880,20 @@ String htmlPage() {
             <div>Signalpegel 100 % bei: <strong id="sensitivityCurrent">-</strong></div>
             <div>Rot/Alarm ab: <strong id="redSignalCurrent">-</strong></div>
           </div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div style="min-width:0;">
+          <h3>Hubwerk (ISO 11786 PIN 5 · DI7)</h3>
+          <div class="gps-meta">
+            <div>Position: <strong id="liftStatusSettings">-</strong></div>
+            <div>Auto-Stop nach Ausheben nach: <strong id="liftAutoStopCurrent">-</strong></div>
+          </div>
+          <div class="field-row" style="margin-top:6px;">
+            <input id="liftAutoStopInput" type="number" min="0" max="3600000" step="30000" value="600000">
+            <button id="liftAutoStopSave" type="button">Speichern</button>
+          </div>
+          <div class="gps-meta" style="color:#9ca3af;font-size:.82rem;">0 ms = kein Auto-Stop · Wert in Millisekunden</div>
         </div>
       </div>
       <div class="field-row">
@@ -1979,6 +2059,48 @@ String htmlPage() {
         </div>`;
     }
 
+    function updateChannelGrid(channels, rotation) {
+      const grid = document.getElementById('grid');
+      const existing = grid.querySelectorAll('.bar-card');
+      if (existing.length !== channels.length) {
+        renderingGrid = true;
+        grid.innerHTML = channels.map(ch => card(ch, rotation)).join('');
+        setTimeout(() => { renderingGrid = false; }, 80);
+        return;
+      }
+      channels.forEach((ch, idx) => {
+        const cardEl = existing[idx];
+        if (ch.rotation_channel) {
+          const moving = Boolean(rotation && rotation.moving);
+          const rpm = formatRpm(rotation ? rotation.rpm : ch.rotation_rpm);
+          cardEl.querySelector('.status-bar').className = 'status-bar ' + (moving ? 'signal' : 'stopped');
+          const fill = cardEl.querySelector('.bar-fill');
+          fill.className = 'bar-fill';
+          fill.style.setProperty('--level', (moving ? 100 : 0) + '%');
+          cardEl.querySelector('.status-text').textContent = moving ? 'Dreht' : 'Dreht nicht';
+          const rl = cardEl.querySelector('.rotation-line');
+          rl.className = 'rotation-line ' + (moving ? 'on' : 'off');
+          rl.textContent = rpm;
+        } else {
+          const quality = Math.max(0, Math.min(100, Number(ch.signal_quality_pct || 0)));
+          const recentlyDetected = quality > 0;
+          const level = ch.main_signal ? 100 : quality;
+          const fillCls = ch.main_signal ? 'red' : (level >= 70 ? 'yellow' : '');
+          const label = ch.main_signal ? 'Dauersignal' : (recentlyDetected ? level + ' %' : 'Bereit');
+          const rotMoving = Boolean(rotation && rotation.moving);
+          cardEl.classList.toggle('latched', Boolean(ch.latched_alarm));
+          cardEl.querySelector('.status-bar').className = 'status-bar' + (recentlyDetected || ch.main_signal ? ' signal' : '');
+          const fill = cardEl.querySelector('.bar-fill');
+          fill.className = 'bar-fill' + (fillCls ? ' ' + fillCls : '');
+          fill.style.setProperty('--level', level + '%');
+          cardEl.querySelector('.status-text').textContent = label;
+          const rl = cardEl.querySelector('.rotation-line');
+          rl.className = 'rotation-line ' + (rotMoving ? 'on' : 'off');
+          rl.textContent = rotMoving ? `Dreht · ${formatRpm(rotation.rpm)}` : 'Dreht nicht';
+        }
+      });
+    }
+
     function sensorDetails(channels) {
       return visibleChannels(channels).map(ch => `
         <div class="sensor-row">
@@ -2097,12 +2219,23 @@ String htmlPage() {
 
     function updateValveButtons(valves) {
       const container = document.getElementById('valveActions');
-      container.innerHTML = (valves || []).map(valve => `
-        <button class="valve-button ${valve.on ? 'active' : ''}" type="button" data-channel="${valve.output_channel}" data-on="${valve.on ? '1' : '0'}" ${valve.switchable ? '' : 'disabled'}>
-          ${escapeHtml(valve.label || ('Ausgang ' + valve.output_channel))}
-        </button>
-      `).join('');
-      container.querySelectorAll('.valve-button').forEach(button => button.addEventListener('click', () => toggleValve(button)));
+      const list = valves || [];
+      const existing = container.querySelectorAll('.valve-button');
+      if (existing.length !== list.length) {
+        container.innerHTML = list.map(valve => `
+          <button class="valve-button ${valve.on ? 'active' : ''}" type="button" data-channel="${valve.output_channel}" data-on="${valve.on ? '1' : '0'}" ${valve.switchable ? '' : 'disabled'}>
+            ${escapeHtml(valve.label || ('Ausgang ' + valve.output_channel))}
+          </button>
+        `).join('');
+        container.querySelectorAll('.valve-button').forEach(button => button.addEventListener('click', () => toggleValve(button)));
+        return;
+      }
+      list.forEach((valve, idx) => {
+        const btn = existing[idx];
+        btn.className = 'valve-button' + (valve.on ? ' active' : '');
+        btn.disabled = !valve.switchable;
+        btn.dataset.on = valve.on ? '1' : '0';
+      });
     }
 
     async function toggleValve(button) {
@@ -2159,11 +2292,14 @@ String htmlPage() {
     function updateCamera(data) {
       const cameras = data.cameras || [];
       const settingsGrid = document.getElementById('cameraSettingsGrid');
-      if (!settingsGrid.contains(document.activeElement)) {
+      if (document.body.classList.contains('settings-active') && !settingsGrid.contains(document.activeElement)) {
         renderCameraSettings(cameras);
       }
       const configured = cameras.filter(camera => camera.configured);
       const container = document.getElementById('cameraGrid');
+      const cameraConfigKey = configured.map(c => c.index + ':' + (c.host || '')).join('|');
+      if (container.dataset.configKey === cameraConfigKey) return;
+      container.dataset.configKey = cameraConfigKey;
       container.innerHTML = configured.length ? configured.map(camera => {
         const mode = cameraStreamModes[camera.index] === 'main' ? 'main' : 'sub';
         const streamUrl = mode === 'main' ? camera.main_stream_url : camera.sub_stream_url;
@@ -2518,10 +2654,10 @@ String htmlPage() {
       const metersPerLon = 111320 * Math.cos(refLat * Math.PI / 180);
       const local = point => ({ x: (Number(point.longitude) - refLon) * metersPerLon, y: (Number(point.latitude) - refLat) * metersPerLat });
       const localPositions = positions.map(local);
-      let minX = Math.min(...localPositions.map(point => point.x));
-      let maxX = Math.max(...localPositions.map(point => point.x));
-      let minY = Math.min(...localPositions.map(point => point.y));
-      let maxY = Math.max(...localPositions.map(point => point.y));
+      let minX = localPositions.reduce((m, p) => Math.min(m, p.x),  Infinity);
+      let maxX = localPositions.reduce((m, p) => Math.max(m, p.x), -Infinity);
+      let minY = localPositions.reduce((m, p) => Math.min(m, p.y),  Infinity);
+      let maxY = localPositions.reduce((m, p) => Math.max(m, p.y), -Infinity);
       const minSpan = 60;
       if (maxX - minX < minSpan) { const pad = (minSpan - maxX + minX) / 2; minX -= pad; maxX += pad; }
       if (maxY - minY < minSpan) { const pad = (minSpan - maxY + minY) / 2; minY -= pad; maxY += pad; }
@@ -2759,6 +2895,7 @@ String htmlPage() {
     async function refreshTrack() {
       if (trackBusy || !pageActive) return;
       if (isCameraStreamOpen()) return;
+      if (document.getElementById('mapView').classList.contains('hidden')) return;
       trackBusy = true;
       try {
         const res = await fetchWithTimeout('/api/track');
@@ -2808,6 +2945,16 @@ String htmlPage() {
         if (document.activeElement !== document.getElementById('sensitivityInput')) {
           document.getElementById('sensitivityInput').value = data.quality_signal_hold_ms || data.main_signal_hold_ms || 1500;
         }
+        const liftSettings = data.lift || {};
+        document.getElementById('liftStatusSettings').textContent =
+          liftSettings.is_down ? 'Unten' : (liftSettings.is_up ? 'Oben' : '-');
+        document.getElementById('liftAutoStopCurrent').textContent =
+          liftSettings.auto_stop_delay_ms > 0
+            ? Math.round(liftSettings.auto_stop_delay_ms / 1000) + ' s'
+            : 'Deaktiviert';
+        if (document.activeElement !== document.getElementById('liftAutoStopInput')) {
+          document.getElementById('liftAutoStopInput').value = liftSettings.auto_stop_delay_ms ?? 600000;
+        }
         document.getElementById('tripId').textContent = data.trip_id || '-';
         document.getElementById('filesystem').textContent = data.filesystem_ready
           ? `${Math.round((data.filesystem_used_bytes || 0) / 1024)} / ${Math.round((data.filesystem_total_bytes || 0) / 1024)} KB`
@@ -2840,19 +2987,26 @@ String htmlPage() {
         const activeCount = seedChannels.filter(c => c.main_signal).length;
         const rotation = data.rotation || {};
         document.getElementById('sensorStatus').textContent = `${activeCount} / ${seedChannels.length} · ${rotation.moving ? 'Dreht' : 'Dreht nicht'}`;
+        const lift = data.lift || {};
+        const liftText = lift.is_down ? 'Unten' : (lift.is_up ? 'Oben' : '-');
+        const liftTimer = lift.auto_stop_timer_active && lift.auto_stop_remaining_ms > 0
+          ? ` · Stop in ${Math.ceil(lift.auto_stop_remaining_ms / 1000)} s` : '';
+        const liftPct = lift.is_up ? '100%' : (lift.is_down ? '0%' : '-');
+        const liftDisplay = liftText + (liftPct !== '-' ? ' · ' + liftPct : '') + liftTimer;
+        ['liftStatus', 'liftStatusConn'].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = liftDisplay;
+        });
         document.getElementById('lastContactMini').textContent = '0 s';
-        // populate settings debug
-        try { renderSettings(data); } catch (e) {}
-        document.getElementById('modules').innerHTML = (data.modules || []).map(module =>
-          `<div class="module ${module.online ? 'online' : ''}"><strong>${escapeHtml(module.id)}</strong><br>${module.online ? 'Lokal online' : 'Vorbereitet'}</div>`
-        ).join('');
         checkMainSignalAlarms(data.channels || []);
-        const grid = document.getElementById('grid');
-        const shownChannels = visibleChannels(data.channels || []);
-        renderingGrid = true;
-        grid.innerHTML = shownChannels.map(ch => card(ch, rotation)).join('');
-        document.getElementById('sensorDetailsGrid').innerHTML = sensorDetails(data.channels || []);
-        setTimeout(() => { renderingGrid = false; }, 80);
+        updateChannelGrid(visibleChannels(data.channels || []), rotation);
+        if (document.body.classList.contains('settings-active')) {
+          try { renderSettings(data); } catch (e) {}
+          document.getElementById('modules').innerHTML = (data.modules || []).map(module =>
+            `<div class="module ${module.online ? 'online' : ''}"><strong>${escapeHtml(module.id)}</strong><br>${module.online ? 'Lokal online' : 'Vorbereitet'}</div>`
+          ).join('');
+          document.getElementById('sensorDetailsGrid').innerHTML = sensorDetails(data.channels || []);
+        }
         document.getElementById('error').textContent = '';
         hideDebugOverlay();
       } catch (err) {
@@ -2940,6 +3094,21 @@ String htmlPage() {
         await refresh();
       } catch (err) {
         document.getElementById('error').textContent = 'Empfindlichkeit speichern fehlgeschlagen';
+      }
+    }
+
+    async function saveLiftAutoStopSetting() {
+      const value = Number(document.getElementById('liftAutoStopInput').value);
+      try {
+        const res = await fetchWithTimeout('/api/lift-autostop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ auto_stop_delay_ms: value })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await refresh();
+      } catch (err) {
+        document.getElementById('error').textContent = 'Hubwerk-Einstellung speichern fehlgeschlagen';
       }
     }
 
@@ -3250,6 +3419,7 @@ String htmlPage() {
     document.getElementById('cropSave').addEventListener('click', saveCrop);
     document.getElementById('fieldSave').addEventListener('click', saveField);
     document.getElementById('sensitivitySave').addEventListener('click', saveSensitivitySetting);
+    document.getElementById('liftAutoStopSave').addEventListener('click', saveLiftAutoStopSetting);
     document.getElementById('archiveRefresh').addEventListener('click', loadArchive);
     document.getElementById('rs485Test').addEventListener('click', runRs485Test);
     document.getElementById('rs485BaudScan').addEventListener('click', runRs485BaudScan);
@@ -3303,11 +3473,12 @@ String htmlPage() {
 </body>
 </html>
 )HTML";
+  return PAGE;
 }
 
 void handleRoot() {
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/html; charset=utf-8", htmlPage());
+  server.send_P(200, "text/html; charset=utf-8", htmlPage());
 }
 
 void handleApiStatus() {
@@ -4017,6 +4188,23 @@ void handleApiSensitivity() {
   server.send(200, "application/json", json);
 }
 
+void handleApiLiftAutoStop() {
+  const String body = server.arg("plain");
+  JsonDocument doc;
+  if (body.length() == 0 || deserializeJson(doc, body)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_body\"}");
+    return;
+  }
+  const uint32_t delayMs = doc["auto_stop_delay_ms"] | DEFAULT_LIFT_AUTO_STOP_DELAY_MS;
+  saveLiftAutoStopDelay(delayMs);
+  JsonDocument response;
+  response["ok"] = true;
+  response["auto_stop_delay_ms"] = liftAutoStopDelayMs;
+  String json;
+  serializeJson(response, json);
+  server.send(200, "application/json", json);
+}
+
 void handleApiCameraSettings() {
   const String body = server.arg("plain");
   JsonDocument doc;
@@ -4610,6 +4798,7 @@ void setup() {
   loadFieldName();
   loadCameraSettings();
   loadSensitivity();
+  loadLiftAutoStopDelay();
   bootCounter = preferences.getUInt("boot_counter", 0) + 1;
   tripCounter = preferences.getUInt("trip_counter", 0);
   preferences.putUInt("boot_counter", bootCounter);
@@ -4641,6 +4830,7 @@ void setup() {
   server.on("/api/crop", HTTP_POST, handleApiCrop);
   server.on("/api/field", HTTP_POST, handleApiField);
   server.on("/api/sensitivity", HTTP_POST, handleApiSensitivity);
+  server.on("/api/lift-autostop", HTTP_POST, handleApiLiftAutoStop);
   server.on("/api/camera-settings", HTTP_POST, handleApiCameraSettings);
   server.on("/api/recording", HTTP_POST, handleApiRecording);
   server.on("/api/output", HTTP_POST, handleApiOutput);
