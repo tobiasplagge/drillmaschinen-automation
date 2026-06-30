@@ -2033,6 +2033,28 @@ const char* htmlPage() {
           <div id="cropSuggestionsList" style="color:#d1d5db;font-size:.95rem;"></div>
         </div>
       </div>
+      <div class="field-row">
+        <div style="min-width:0;">
+          <h3>Cloud-Upload (Landmaschinenmanager)</h3>
+          <div class="field-row" style="margin-bottom:6px;">
+            <input id="uploadUrlInput" placeholder="https://server/api/trips/upload" style="flex:1; min-width:220px;" />
+          </div>
+          <div class="field-row" style="margin-bottom:6px;">
+            <input id="uploadTokenInput" type="password" placeholder="API-Token (leer lassen = unverändert)" style="flex:1; min-width:220px;" autocomplete="new-password" />
+          </div>
+          <div class="field-row" style="margin-bottom:6px; align-items:center;">
+            <label style="display:flex; align-items:center; gap:6px;">
+              <input id="autoUploadInput" type="checkbox" />
+              Automatisch nach Fahrtende hochladen
+            </label>
+          </div>
+          <div class="actions">
+            <button id="uploadConfigSave" type="button">Speichern</button>
+            <button id="uploadNowBtn" class="secondary" type="button">Jetzt hochladen</button>
+          </div>
+          <div class="gps-meta" id="uploadConfigStatus"></div>
+        </div>
+      </div>
       <details>
         <summary>Dateien und Logs</summary>
         <div class="actions">
@@ -2727,6 +2749,7 @@ const char* htmlPage() {
       if (showSettings) {
         renderSettings(window.lastStatusData || {});
         try { loadCropSuggestions(); } catch (e) {}
+        try { loadUploadConfig(); } catch (e) {}
       }
     }
 
@@ -3219,6 +3242,52 @@ const char* htmlPage() {
       }
     }
 
+    async function loadUploadConfig() {
+      try {
+        const res = await fetchWithTimeout('/api/upload-config');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (document.activeElement !== document.getElementById('uploadUrlInput')) {
+          document.getElementById('uploadUrlInput').value = data.upload_url || '';
+        }
+        document.getElementById('autoUploadInput').checked = Boolean(data.auto_upload);
+      } catch (err) {
+        document.getElementById('uploadConfigStatus').textContent = 'Konfiguration konnte nicht geladen werden';
+      }
+    }
+
+    async function saveUploadConfigSetting() {
+      const url = document.getElementById('uploadUrlInput').value.trim();
+      const token = document.getElementById('uploadTokenInput').value;
+      const autoUpload = document.getElementById('autoUploadInput').checked;
+      const body = { upload_url: url, auto_upload: autoUpload };
+      if (token.length > 0) body.upload_token = token;
+      try {
+        const res = await fetchWithTimeout('/api/upload-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        document.getElementById('uploadTokenInput').value = '';
+        document.getElementById('uploadConfigStatus').textContent = 'Gespeichert.';
+      } catch (err) {
+        document.getElementById('uploadConfigStatus').textContent = 'Speichern fehlgeschlagen';
+      }
+    }
+
+    async function triggerUploadNow() {
+      document.getElementById('uploadConfigStatus').textContent = 'Upload wird gestartet ...';
+      try {
+        const res = await fetchWithTimeout('/api/upload-now', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        document.getElementById('uploadConfigStatus').textContent = 'Upload gestartet (Fahrt ' + (data.trip_id || '') + ').';
+      } catch (err) {
+        document.getElementById('uploadConfigStatus').textContent = 'Upload fehlgeschlagen: ' + err.message;
+      }
+    }
+
     async function testCameraConnection(card) {
       const button = card.querySelector('.cameraTest');
       const target = card.querySelector('.camera-test-status');
@@ -3527,6 +3596,8 @@ const char* htmlPage() {
     document.getElementById('fieldSave').addEventListener('click', saveField);
     document.getElementById('sensitivitySave').addEventListener('click', saveSensitivitySetting);
     document.getElementById('liftAutoStopSave').addEventListener('click', saveLiftAutoStopSetting);
+    document.getElementById('uploadConfigSave').addEventListener('click', saveUploadConfigSetting);
+    document.getElementById('uploadNowBtn').addEventListener('click', triggerUploadNow);
     document.getElementById('archiveRefresh').addEventListener('click', loadArchive);
     document.getElementById('rs485Test').addEventListener('click', runRs485Test);
     document.getElementById('rs485BaudScan').addEventListener('click', runRs485BaudScan);
