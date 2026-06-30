@@ -7,6 +7,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <WiFiClientSecure.h>
 #include <base64.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -34,7 +35,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 
 static const char *DEVICE_ID = "waveshare-8di8do-01";
 static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
-static const char *FIRMWARE_VERSION = "2.2.0";
+static const char *FIRMWARE_VERSION = "2.3.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
@@ -59,6 +60,10 @@ static constexpr uint8_t CHANNEL_NAME_LENGTH = 24;
 static constexpr uint8_t CROP_NAME_LENGTH = 24;
 static constexpr uint8_t FIELD_NAME_LENGTH = 32;
 static constexpr uint8_t TRIP_ID_LENGTH = 48;
+static constexpr uint8_t UPLOAD_URL_LENGTH = 128;
+static constexpr uint8_t UPLOAD_TOKEN_LENGTH = 128;
+static constexpr uint8_t UPLOAD_RETRY_MAX = 3;
+static constexpr uint32_t UPLOAD_RETRY_DELAY_MS = 60000;
 static constexpr uint32_t DEFAULT_MAIN_SIGNAL_HOLD_MS = 1500;
 static constexpr uint32_t MIN_MAIN_SIGNAL_HOLD_MS = 300;
 static constexpr uint32_t MAX_MAIN_SIGNAL_HOLD_MS = 10000;
@@ -183,6 +188,8 @@ struct GnssState {
   char lastSentence[128] = "";
   char rawPreview[96] = "";
   char rawHexPreview[160] = "";
+  uint32_t unixEpoch = 0;
+  uint32_t unixEpochUptimeMs = 0;
 };
 
 struct MainSignalEvent {
@@ -282,6 +289,17 @@ double sensorActiveStartLongitude[CHANNEL_COUNT] = {};
 float sensorActiveStartAccuracyM[CHANNEL_COUNT] = {};
 uint8_t sensorActiveStartLiveMask[CHANNEL_COUNT] = {};
 uint8_t sensorActiveStartMainMask[CHANNEL_COUNT] = {};
+char uploadUrl[UPLOAD_URL_LENGTH] = "";
+char uploadToken[UPLOAD_TOKEN_LENGTH] = "";
+bool autoUpload = false;
+bool pendingUpload = false;
+char pendingUploadTripId[TRIP_ID_LENGTH] = "";
+uint8_t uploadRetryCount = 0;
+uint32_t uploadRetryNextMs = 0;
+uint32_t tripStartRealTime = 0;
+uint32_t tripEndRealTime = 0;
+char tripStartFieldName[FIELD_NAME_LENGTH] = "";
+char tripStartCropName[CROP_NAME_LENGTH] = "";
 
 void startRecording(const char *source);
 void stopRecording(const char *source);
@@ -543,6 +561,20 @@ void loadLiftAutoStopDelay() {
 void saveLiftAutoStopDelay(uint32_t delayMs) {
   liftAutoStopDelayMs = constrain(delayMs, MIN_LIFT_AUTO_STOP_DELAY_MS, MAX_LIFT_AUTO_STOP_DELAY_MS);
   preferences.putUInt("lift_stop_ms", liftAutoStopDelayMs);
+}
+
+void loadUploadConfig() {
+  String stored = preferences.getString("upload_url", "");
+  stored.toCharArray(uploadUrl, UPLOAD_URL_LENGTH);
+  stored = preferences.getString("upload_tok", "");
+  stored.toCharArray(uploadToken, UPLOAD_TOKEN_LENGTH);
+  autoUpload = preferences.getBool("auto_upload", false);
+}
+
+void saveUploadConfig() {
+  preferences.putString("upload_url", uploadUrl);
+  preferences.putString("upload_tok", uploadToken);
+  preferences.putBool("auto_upload", autoUpload);
 }
 
 // DI7 (GPIO10, HIDDEN_CHANNEL) liest ISO 11786 PIN5: 0V=unten, 10V=oben.
@@ -871,6 +903,25 @@ String nmeaField(const String &sentence, uint8_t wantedField) {
   return "";
 }
 
+uint32_t nmeaToEpoch(const String &hhmmss, const String &ddmmyy) {
+  if (hhmmss.length() < 6 || ddmmyy.length() < 6) return 0;
+  int h  = hhmmss.substring(0, 2).toInt();
+  int m  = hhmmss.substring(2, 4).toInt();
+  int s  = hhmmss.substring(4, 6).toInt();
+  int d  = ddmmyy.substring(0, 2).toInt();
+  int mo = ddmmyy.substring(2, 4).toInt();
+  int y  = ddmmyy.substring(4, 6).toInt() + 2000;
+  if (d < 1 || d > 31 || mo < 1 || mo > 12 || y < 2020) return 0;
+  // Civil day → Unix epoch (Howard Hinnant algorithm, UTC)
+  if (mo <= 2) { y--; mo += 12; }
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (mo - 3) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  int32_t days = (int32_t)(era * 146097 + (int32_t)doe - 719468);
+  return (uint32_t)((int64_t)days * 86400 + h * 3600 + m * 60 + s);
+}
+
 bool applyNmeaSentence(const String &sentence) {
   if (!sentence.startsWith("$") || sentence.length() < 10) {
     return false;
@@ -901,6 +952,13 @@ bool applyNmeaSentence(const String &sentence) {
     gnss.lastFixMs = millis();
     if (gnss.fixAvailableSinceMs == 0) {
       gnss.fixAvailableSinceMs = gnss.lastFixMs;
+    }
+    {
+      uint32_t epoch = nmeaToEpoch(nmeaField(sentence, 1), nmeaField(sentence, 9));
+      if (epoch > 0) {
+        gnss.unixEpoch = epoch;
+        gnss.unixEpochUptimeMs = millis();
+      }
     }
     sentence.toCharArray(gnss.lastSentence, sizeof(gnss.lastSentence));
     setGnssError("ok");
@@ -1253,9 +1311,24 @@ void createTripFiles() {
   LittleFS.remove(tripMetaPath);
   appendFile(tripGpsPath, "uptime_ms,crop_name,field_name,latitude,longitude,accuracy_m,speed_mps,heading_deg,satellites,live_mask,main_mask\n");
   appendFile(tripSensorPath, "start_uptime_ms,end_uptime_ms,duration_ms,channel,channel_name,crop_name,field_name,start_latitude,start_longitude,end_latitude,end_longitude\n");
-  String meta = "trip_id=" + String(tripId) + "\nmodule=" + MODULE_ID + "\nfield=" + fieldName +
-                "\ncrop=" + cropName + "\nstart_uptime_ms=" + String(millis()) + "\nstatus=active\n";
-  appendFile(tripMetaPath, meta);
+  // Write initial metadata as JSON (will be overwritten with final values on stopRecording)
+  JsonDocument metaDoc;
+  metaDoc["trip_id"] = tripId;
+  metaDoc["device_id"] = DEVICE_ID;
+  metaDoc["module_id"] = MODULE_ID;
+  metaDoc["firmware_version"] = FIRMWARE_VERSION;
+  metaDoc["field_name"] = fieldName;
+  metaDoc["crop_name"] = cropName;
+  metaDoc["start_uptime_ms"] = millis();
+  metaDoc["start_real_time"] = tripStartRealTime;
+  metaDoc["end_real_time"] = 0;
+  metaDoc["status"] = "active";
+  metaDoc["gps_points"] = 0;
+  metaDoc["sensor_events"] = 0;
+  metaDoc["main_events"] = 0;
+  String metaJson;
+  serializeJson(metaDoc, metaJson);
+  appendFile(tripMetaPath, metaJson);
 }
 
 void startRecording(const char *source) {
@@ -1267,6 +1340,14 @@ void startRecording(const char *source) {
   preferences.putUInt("trip_counter", tripCounter);
   snprintf(tripId, sizeof(tripId), "%s-B%06lu-F%04lu", MODULE_ID,
            static_cast<unsigned long>(bootCounter), static_cast<unsigned long>(tripCounter));
+  strncpy(tripStartFieldName, fieldName, FIELD_NAME_LENGTH - 1);
+  tripStartFieldName[FIELD_NAME_LENGTH - 1] = '\0';
+  strncpy(tripStartCropName, cropName, CROP_NAME_LENGTH - 1);
+  tripStartCropName[CROP_NAME_LENGTH - 1] = '\0';
+  tripStartRealTime = gnss.unixEpoch > 0
+      ? gnss.unixEpoch + (millis() - gnss.unixEpochUptimeMs) / 1000
+      : 0;
+  tripEndRealTime = 0;
   createTripFiles();
   persistentGpsBuffer = "";
   lastFileFlushMs = millis();
@@ -1289,13 +1370,39 @@ void stopRecording(const char *source) {
     finishSensorTriggerEvent(i);
   }
   flushPersistentGpsBuffer();
-  if (tripMetaPath[0] != '\0') {
-    appendFile(tripMetaPath, "end_uptime_ms=" + String(millis()) + "\nstatus=completed\n");
+  tripEndRealTime = gnss.unixEpoch > 0
+      ? gnss.unixEpoch + (millis() - gnss.unixEpochUptimeMs) / 1000
+      : 0;
+  if (tripMetaPath[0] != '\0' && filesystemReady) {
+    LittleFS.remove(tripMetaPath);
+    JsonDocument metaDoc;
+    metaDoc["trip_id"] = tripId;
+    metaDoc["device_id"] = DEVICE_ID;
+    metaDoc["module_id"] = MODULE_ID;
+    metaDoc["firmware_version"] = FIRMWARE_VERSION;
+    metaDoc["field_name"] = tripStartFieldName;
+    metaDoc["crop_name"] = tripStartCropName;
+    metaDoc["start_real_time"] = tripStartRealTime;
+    metaDoc["end_real_time"] = tripEndRealTime;
+    metaDoc["status"] = "completed";
+    metaDoc["gps_points"] = (uint32_t)gpsLogTotal;
+    metaDoc["sensor_events"] = (uint32_t)sensorEventTotal;
+    metaDoc["main_events"] = (uint32_t)mainEventTotal;
+    String metaJson;
+    serializeJson(metaDoc, metaJson);
+    appendFile(tripMetaPath, metaJson);
   }
   appendSystemEvent("recording_stop," + String(source) + "," + tripId);
   recordingActive = false;
   if (strcmp(source, "manual") == 0) {
     autoStartArmed = false;
+  }
+  if (autoUpload) {
+    strncpy(pendingUploadTripId, tripId, TRIP_ID_LENGTH - 1);
+    pendingUploadTripId[TRIP_ID_LENGTH - 1] = '\0';
+    pendingUpload = true;
+    uploadRetryCount = 0;
+    uploadRetryNextMs = millis() + 2000;
   }
   Serial.printf("Fahrtaufzeichnung beendet: %s (%s)\n", tripId, source);
 }
@@ -4709,6 +4816,56 @@ void handleApiSensorEventsTxt() {
   server.send(200, "text/plain; charset=utf-8", text);
 }
 
+void handleApiUploadConfig() {
+  if (server.method() == HTTP_GET) {
+    JsonDocument doc;
+    doc["upload_url"]  = uploadUrl;
+    doc["auto_upload"] = autoUpload;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+    return;
+  }
+  // POST
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+  if (doc["upload_url"].is<const char *>()) {
+    String u = doc["upload_url"].as<String>();
+    u.toCharArray(uploadUrl, UPLOAD_URL_LENGTH);
+  }
+  if (doc["upload_token"].is<const char *>()) {
+    String t = doc["upload_token"].as<String>();
+    t.toCharArray(uploadToken, UPLOAD_TOKEN_LENGTH);
+  }
+  if (doc["auto_upload"].is<bool>()) {
+    autoUpload = doc["auto_upload"].as<bool>();
+  }
+  saveUploadConfig();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiUploadNow() {
+  const String tid = server.arg("trip_id");
+  const char *targetId = tid.length() > 0 ? tid.c_str() : tripId;
+  if (recordingActive) {
+    server.send(409, "application/json", "{\"error\":\"recording_active\"}");
+    return;
+  }
+  if (uploadUrl[0] == '\0') {
+    server.send(400, "application/json", "{\"error\":\"no_upload_url\"}");
+    return;
+  }
+  server.send(202, "application/json", "{\"ok\":true,\"trip_id\":\"" + String(targetId) + "\"}");
+  strncpy(pendingUploadTripId, targetId, TRIP_ID_LENGTH - 1);
+  pendingUploadTripId[TRIP_ID_LENGTH - 1] = '\0';
+  pendingUpload = true;
+  uploadRetryCount = 0;
+  uploadRetryNextMs = millis() + 500;
+}
+
 void handleApiGpsLogClear() {
   if (recordingActive) {
     server.send(409, "application/json", "{\"error\":\"recording_active\"}");
@@ -4716,6 +4873,256 @@ void handleApiGpsLogClear() {
   }
   clearGpsLog();
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ---------------------------------------------------------------------------
+// Portal-Upload
+// ---------------------------------------------------------------------------
+
+String buildMainEventsCsvString() {
+  String csv;
+  csv.reserve(96 + mainEventCount * 100);
+  csv += "index,uptime_ms,channel,detected,crop_name,latitude,longitude,accuracy_m,live_mask,main_mask\n";
+  for (uint16_t i = 0; i < mainEventCount; i++) {
+    const MainSignalEvent &ev = mainEventAt(i);
+    csv += i; csv += ",";
+    csv += ev.uptimeMs; csv += ",";
+    csv += ev.channel; csv += ",";
+    csv += ev.detected ? "1" : "0"; csv += ",";
+    csv += ev.crop; csv += ",";
+    if (ev.hasGps) {
+      csv += String(ev.latitude, 7); csv += ",";
+      csv += String(ev.longitude, 7); csv += ",";
+      csv += String(ev.accuracyM, 1);
+    } else {
+      csv += ",,";
+    }
+    csv += ","; csv += (unsigned)ev.liveMask;
+    csv += ","; csv += (unsigned)ev.mainMask;
+    csv += "\n";
+  }
+  return csv;
+}
+
+struct ParsedUploadUrl {
+  bool isSSL;
+  String host;
+  uint16_t port;
+  String path;
+};
+
+bool parseUploadUrl(const char *url, ParsedUploadUrl &out) {
+  String u(url);
+  if (u.startsWith("https://")) {
+    out.isSSL = true;
+    u = u.substring(8);
+    out.port = 443;
+  } else if (u.startsWith("http://")) {
+    out.isSSL = false;
+    u = u.substring(7);
+    out.port = 80;
+  } else {
+    return false;
+  }
+  int slash = u.indexOf('/');
+  if (slash < 0) {
+    out.path = "/";
+    out.host = u;
+  } else {
+    out.path = u.substring(slash);
+    out.host = u.substring(0, slash);
+  }
+  int colon = out.host.indexOf(':');
+  if (colon >= 0) {
+    out.port = (uint16_t)out.host.substring(colon + 1).toInt();
+    out.host = out.host.substring(0, colon);
+  }
+  return out.host.length() > 0;
+}
+
+static const char *UPLOAD_BOUNDARY = "----FormBoundaryESP32Upload";
+
+String mpTextHeader(const char *name) {
+  String h = "--";
+  h += UPLOAD_BOUNDARY;
+  h += "\r\nContent-Disposition: form-data; name=\"";
+  h += name;
+  h += "\"\r\n\r\n";
+  return h;
+}
+
+String mpFileHeader(const char *name, const char *filename, const char *contentType) {
+  String h = "--";
+  h += UPLOAD_BOUNDARY;
+  h += "\r\nContent-Disposition: form-data; name=\"";
+  h += name;
+  h += "\"; filename=\"";
+  h += filename;
+  h += "\"\r\nContent-Type: ";
+  h += contentType;
+  h += "\r\n\r\n";
+  return h;
+}
+
+bool uploadTripToServer(const char *targetTripId) {
+  if (uploadUrl[0] == '\0') {
+    appendSystemEvent("upload_skip,no_url," + String(targetTripId));
+    return false;
+  }
+
+  ParsedUploadUrl parsed;
+  if (!parseUploadUrl(uploadUrl, parsed)) {
+    appendSystemEvent("upload_fail,bad_url," + String(targetTripId));
+    return false;
+  }
+
+  char gpsPath[64], sensorPath[64], metaPath[64];
+  snprintf(gpsPath, sizeof(gpsPath), "/trip-%s-gps.csv", targetTripId);
+  snprintf(sensorPath, sizeof(sensorPath), "/trip-%s-sensor.csv", targetTripId);
+  snprintf(metaPath, sizeof(metaPath), "/trip-%s-meta.txt", targetTripId);
+
+  // Read metadata JSON from LittleFS
+  String metaJson;
+  if (filesystemReady && LittleFS.exists(metaPath)) {
+    File mf = LittleFS.open(metaPath, FILE_READ);
+    if (mf) { metaJson = mf.readString(); mf.close(); }
+  }
+  if (metaJson.length() == 0) {
+    metaJson = "{\"trip_id\":\"" + String(targetTripId) + "\",\"device_id\":\"" + DEVICE_ID + "\"}";
+  }
+
+  String mainCsv = buildMainEventsCsvString();
+
+  bool hasGps    = filesystemReady && LittleFS.exists(gpsPath);
+  bool hasSensor = filesystemReady && LittleFS.exists(sensorPath);
+
+  size_t gpsFileSize    = 0;
+  size_t sensorFileSize = 0;
+  if (hasGps)    { File f = LittleFS.open(gpsPath, FILE_READ);    if (f) { gpsFileSize    = f.size(); f.close(); } }
+  if (hasSensor) { File f = LittleFS.open(sensorPath, FILE_READ); if (f) { sensorFileSize = f.size(); f.close(); } }
+
+  // Pre-compute Content-Length
+  String hTripId   = mpTextHeader("trip_id");
+  String hDeviceId = mpTextHeader("device_id");
+  String hMeta     = mpFileHeader("metadata", "meta.json", "application/json");
+  String hMainCsv  = mpFileHeader("main_events_csv", "main-events.csv", "text/csv");
+  String hGpsCsv   = mpFileHeader("gps_csv", "gps.csv", "text/csv");
+  String hSensor   = mpFileHeader("sensor_events_csv", "sensor-events.csv", "text/csv");
+  String finalBnd  = String("--") + UPLOAD_BOUNDARY + "--\r\n";
+
+  size_t contentLength = 0;
+  contentLength += hTripId.length()   + strlen(targetTripId) + 2;
+  contentLength += hDeviceId.length() + strlen(DEVICE_ID)    + 2;
+  contentLength += hMeta.length()     + metaJson.length()    + 2;
+  if (mainCsv.length() > 0) contentLength += hMainCsv.length() + mainCsv.length() + 2;
+  if (hasGps)               contentLength += hGpsCsv.length()  + gpsFileSize      + 2;
+  if (hasSensor)            contentLength += hSensor.length()   + sensorFileSize   + 2;
+  contentLength += finalBnd.length();
+
+  // Connect
+  WiFiClientSecure wifiSecure;
+  WiFiClient wifiPlain;
+  EthernetClient ethClient;
+  Client *client = nullptr;
+
+  if (parsed.isSSL) {
+    wifiSecure.setInsecure();
+    if (!wifiSecure.connect(parsed.host.c_str(), parsed.port)) {
+      appendSystemEvent("upload_fail,ssl_connect," + String(targetTripId));
+      return false;
+    }
+    client = &wifiSecure;
+  } else if (ethernetReady && Ethernet.linkStatus() == LinkON) {
+    if (!ethClient.connect(parsed.host.c_str(), parsed.port)) {
+      appendSystemEvent("upload_fail,eth_connect," + String(targetTripId));
+      return false;
+    }
+    client = &ethClient;
+  } else {
+    if (!wifiPlain.connect(parsed.host.c_str(), parsed.port)) {
+      appendSystemEvent("upload_fail,wifi_connect," + String(targetTripId));
+      return false;
+    }
+    client = &wifiPlain;
+  }
+
+  client->setTimeout(30000);
+
+  // HTTP request headers
+  client->print("POST "); client->print(parsed.path); client->print(" HTTP/1.1\r\n");
+  client->print("Host: "); client->print(parsed.host); client->print("\r\n");
+  if (uploadToken[0] != '\0') {
+    client->print("Authorization: Bearer "); client->print(uploadToken); client->print("\r\n");
+  }
+  client->print("Content-Type: multipart/form-data; boundary=");
+  client->print(UPLOAD_BOUNDARY); client->print("\r\n");
+  client->print("Content-Length: "); client->print((uint32_t)contentLength); client->print("\r\n");
+  client->print("Connection: close\r\n\r\n");
+
+  // Multipart body – text parts
+  client->print(hTripId);   client->print(targetTripId); client->print("\r\n");
+  client->print(hDeviceId); client->print(DEVICE_ID);    client->print("\r\n");
+  client->print(hMeta);     client->print(metaJson);     client->print("\r\n");
+  if (mainCsv.length() > 0) {
+    client->print(hMainCsv); client->print(mainCsv); client->print("\r\n");
+  }
+
+  // GPS CSV – streamed from LittleFS
+  if (hasGps) {
+    client->print(hGpsCsv);
+    File f = LittleFS.open(gpsPath, FILE_READ);
+    if (f) {
+      uint8_t buf[512];
+      while (f.available()) {
+        int n = f.read(buf, sizeof(buf));
+        if (n > 0) client->write(buf, (size_t)n);
+        esp_task_wdt_reset();
+      }
+      f.close();
+    }
+    client->print("\r\n");
+  }
+
+  // Sensor CSV – streamed from LittleFS
+  if (hasSensor) {
+    client->print(hSensor);
+    File f = LittleFS.open(sensorPath, FILE_READ);
+    if (f) {
+      uint8_t buf[512];
+      while (f.available()) {
+        int n = f.read(buf, sizeof(buf));
+        if (n > 0) client->write(buf, (size_t)n);
+        esp_task_wdt_reset();
+      }
+      f.close();
+    }
+    client->print("\r\n");
+  }
+
+  client->print(finalBnd);
+
+  // Read response status line
+  uint32_t deadline = millis() + 15000;
+  while (!client->available() && millis() < deadline) {
+    delay(10);
+    esp_task_wdt_reset();
+  }
+  String statusLine = client->readStringUntil('\n');
+  client->stop();
+
+  int httpStatus = 0;
+  if (statusLine.startsWith("HTTP/")) {
+    httpStatus = statusLine.substring(9, 12).toInt();
+  }
+
+  if (httpStatus == 200 || httpStatus == 201) {
+    appendSystemEvent("upload_ok," + String(httpStatus) + "," + String(targetTripId));
+    Serial.printf("Upload OK (%d): %s\n", httpStatus, targetTripId);
+    return true;
+  }
+  appendSystemEvent("upload_fail," + String(httpStatus) + "," + String(targetTripId));
+  Serial.printf("Upload FEHLER (%d): %s\n", httpStatus, targetTripId);
+  return false;
 }
 
 void startWiFiAccessPoint() {
@@ -4799,6 +5206,7 @@ void setup() {
   loadCameraSettings();
   loadSensitivity();
   loadLiftAutoStopDelay();
+  loadUploadConfig();
   bootCounter = preferences.getUInt("boot_counter", 0) + 1;
   tripCounter = preferences.getUInt("trip_counter", 0);
   preferences.putUInt("boot_counter", bootCounter);
@@ -4848,6 +5256,9 @@ void setup() {
   server.on("/api/gps-log/clear", HTTP_POST, handleApiGpsLogClear);
   server.on("/api/crops", HTTP_GET, handleApiCrops);
   server.on("/api/crops", HTTP_POST, handleApiCropsPost);
+  server.on("/api/upload-config", HTTP_GET, handleApiUploadConfig);
+  server.on("/api/upload-config", HTTP_POST, handleApiUploadConfig);
+  server.on("/api/upload-now", HTTP_POST, handleApiUploadNow);
   server.onNotFound([]() {
     server.send(404, "application/json", "{\"error\":\"not_found\"}");
   });
@@ -4869,6 +5280,18 @@ void loop() {
     flushPersistentGpsBuffer();
   }
   esp_task_wdt_reset();
+
+  if (pendingUpload && !recordingActive && millis() >= uploadRetryNextMs) {
+    pendingUpload = false;
+    bool ok = uploadTripToServer(pendingUploadTripId);
+    if (!ok && uploadRetryCount < UPLOAD_RETRY_MAX) {
+      uploadRetryCount++;
+      pendingUpload = true;
+      uploadRetryNextMs = millis() + UPLOAD_RETRY_DELAY_MS;
+      Serial.printf("Upload fehlgeschlagen, Versuch %u/%u in %lus\n",
+                    uploadRetryCount, (uint8_t)UPLOAD_RETRY_MAX, UPLOAD_RETRY_DELAY_MS / 1000UL);
+    }
+  }
 
   if (millis() - lastDebugMs > 1000) {
     lastDebugMs = millis();
