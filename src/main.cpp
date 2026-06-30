@@ -33,8 +33,9 @@ static const IPAddress ETHERNET_DNS(192, 168, 4, 1);
 static const IPAddress ETHERNET_GATEWAY(192, 168, 4, 1);
 static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 
-static const char *DEVICE_ID = "Rabe Megadrill 3000-01";
-static const char *DEVICE_NAME = "Rabe Megadrill 3000";
+static constexpr uint8_t DEVICE_NAME_LENGTH = 64;
+static const char *DEVICE_ID_DEFAULT = "Rabe Megadrill 3000-01";
+char deviceName[DEVICE_NAME_LENGTH] = "Rabe Megadrill 3000-01";
 static const char *FIRMWARE_VERSION = "2.3.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
@@ -577,6 +578,17 @@ void saveUploadConfig() {
   preferences.putString("upload_url", uploadUrl);
   preferences.putString("upload_tok", uploadToken);
   preferences.putBool("auto_upload", autoUpload);
+}
+
+void loadDeviceConfig() {
+  String stored = preferences.getString("device_name", "");
+  if (stored.length() > 0) {
+    stored.toCharArray(deviceName, DEVICE_NAME_LENGTH);
+  }
+}
+
+void saveDeviceConfig() {
+  preferences.putString("device_name", deviceName);
 }
 
 // DI7 (GPIO10, HIDDEN_CHANNEL) liest ISO 11786 PIN5: 0V=unten, 10V=oben.
@@ -1316,7 +1328,7 @@ void createTripFiles() {
   // Write initial metadata as JSON (will be overwritten with final values on stopRecording)
   JsonDocument metaDoc;
   metaDoc["trip_id"] = tripId;
-  metaDoc["device_id"] = DEVICE_ID;
+  metaDoc["device_id"] = deviceName;
   metaDoc["module_id"] = MODULE_ID;
   metaDoc["firmware_version"] = FIRMWARE_VERSION;
   metaDoc["field_name"] = fieldName;
@@ -1379,7 +1391,7 @@ void stopRecording(const char *source) {
     LittleFS.remove(tripMetaPath);
     JsonDocument metaDoc;
     metaDoc["trip_id"] = tripId;
-    metaDoc["device_id"] = DEVICE_ID;
+    metaDoc["device_id"] = deviceName;
     metaDoc["module_id"] = MODULE_ID;
     metaDoc["firmware_version"] = FIRMWARE_VERSION;
     metaDoc["field_name"] = tripStartFieldName;
@@ -1557,8 +1569,8 @@ String statusJson() {
   const float rotRpm        = rotationRpm(now);
   const char *gnssHealthStr = gnssHealth();
 
-  doc["device_id"] = DEVICE_ID;
-  doc["device_name"] = DEVICE_NAME;
+  doc["device_id"] = deviceName;
+  doc["device_name"] = deviceName;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["module_id"] = MODULE_ID;
   doc["esp_temperature_c"] = temperatureRead();
@@ -2050,6 +2062,16 @@ const char* htmlPage() {
             <button id="cropAddBtn" class="secondary" type="button">Hinzufügen</button>
           </div>
           <div id="cropSuggestionsList" style="color:#d1d5db;font-size:.95rem;"></div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div style="min-width:0;">
+          <h3>Ger&auml;tename</h3>
+          <div class="field-row" style="margin-bottom:6px;">
+            <input id="deviceNameInput" maxlength="63" placeholder="z.B. Rabe Megadrill 3000-01" style="flex:1;" />
+            <button id="deviceNameSave" type="button">Speichern</button>
+          </div>
+          <div class="gps-meta" id="deviceNameStatus"></div>
         </div>
       </div>
       <div class="field-row">
@@ -2797,6 +2819,7 @@ const char* htmlPage() {
       if (showSettings) {
         renderSettings(window.lastStatusData || {});
         try { loadCropSuggestions(); } catch (e) {}
+        try { loadDeviceConfig(); } catch (e) {}
         try { loadUploadConfig(); } catch (e) {}
       }
     }
@@ -3359,6 +3382,36 @@ const char* htmlPage() {
       } catch (e) {}
     }
 
+    async function loadDeviceConfig() {
+      try {
+        const res = await fetchWithTimeout('/api/device-config');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (document.activeElement !== document.getElementById('deviceNameInput')) {
+          document.getElementById('deviceNameInput').value = data.device_name || '';
+        }
+      } catch (err) {
+        document.getElementById('deviceNameStatus').textContent = 'Konfiguration konnte nicht geladen werden';
+      }
+    }
+
+    async function saveDeviceNameSetting() {
+      const name = document.getElementById('deviceNameInput').value.trim();
+      if (!name) return;
+      try {
+        const res = await fetchWithTimeout('/api/device-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device_name: name })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        document.getElementById('deviceNameStatus').textContent = 'Gespeichert.';
+        await refresh();
+      } catch (err) {
+        document.getElementById('deviceNameStatus').textContent = 'Speichern fehlgeschlagen';
+      }
+    }
+
     async function loadUploadConfig() {
       try {
         const res = await fetchWithTimeout('/api/upload-config');
@@ -3713,6 +3766,7 @@ const char* htmlPage() {
     document.getElementById('fieldSave').addEventListener('click', saveField);
     document.getElementById('sensitivitySave').addEventListener('click', saveSensitivitySetting);
     document.getElementById('liftAutoStopSave').addEventListener('click', saveLiftAutoStopSetting);
+    document.getElementById('deviceNameSave').addEventListener('click', saveDeviceNameSetting);
     document.getElementById('uploadConfigSave').addEventListener('click', saveUploadConfigSetting);
     document.getElementById('uploadNowBtn').addEventListener('click', triggerUploadNow);
     document.getElementById('liftConfirmUploadBtn').addEventListener('click', liftConfirmUpload);
@@ -5006,6 +5060,31 @@ void handleApiSensorEventsTxt() {
   server.send(200, "text/plain; charset=utf-8", text);
 }
 
+void handleApiDeviceConfig() {
+  if (server.method() == HTTP_GET) {
+    JsonDocument doc;
+    doc["device_name"] = deviceName;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+  if (doc["device_name"].is<const char *>()) {
+    String n = doc["device_name"].as<String>();
+    n.trim();
+    if (n.length() > 0) {
+      n.toCharArray(deviceName, DEVICE_NAME_LENGTH);
+      saveDeviceConfig();
+    }
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleApiLiftConfirm() {
   liftAutoStopPendingConfirm = false;
   server.send(200, "application/json", "{\"ok\":true}");
@@ -5183,7 +5262,7 @@ bool uploadTripToServer(const char *targetTripId) {
     if (mf) { metaJson = mf.readString(); mf.close(); }
   }
   if (metaJson.length() == 0) {
-    metaJson = "{\"trip_id\":\"" + String(targetTripId) + "\",\"device_id\":\"" + DEVICE_ID + "\"}";
+    metaJson = "{\"trip_id\":\"" + String(targetTripId) + "\",\"device_id\":\"" + String(deviceName) + "\"}";
   }
 
   String mainCsv = buildMainEventsCsvString();
@@ -5207,7 +5286,7 @@ bool uploadTripToServer(const char *targetTripId) {
 
   size_t contentLength = 0;
   contentLength += hTripId.length()   + strlen(targetTripId) + 2;
-  contentLength += hDeviceId.length() + strlen(DEVICE_ID)    + 2;
+  contentLength += hDeviceId.length() + strlen(deviceName)    + 2;
   contentLength += hMeta.length()     + metaJson.length()    + 2;
   if (mainCsv.length() > 0) contentLength += hMainCsv.length() + mainCsv.length() + 2;
   if (hasGps)               contentLength += hGpsCsv.length()  + gpsFileSize      + 2;
@@ -5256,7 +5335,7 @@ bool uploadTripToServer(const char *targetTripId) {
 
   // Multipart body – text parts
   client->print(hTripId);   client->print(targetTripId); client->print("\r\n");
-  client->print(hDeviceId); client->print(DEVICE_ID);    client->print("\r\n");
+  client->print(hDeviceId); client->print(deviceName);    client->print("\r\n");
   client->print(hMeta);     client->print(metaJson);     client->print("\r\n");
   if (mainCsv.length() > 0) {
     client->print(hMainCsv); client->print(mainCsv); client->print("\r\n");
@@ -5402,6 +5481,7 @@ void setup() {
   loadSensitivity();
   loadLiftAutoStopDelay();
   loadUploadConfig();
+  loadDeviceConfig();
   bootCounter = preferences.getUInt("boot_counter", 0) + 1;
   tripCounter = preferences.getUInt("trip_counter", 0);
   preferences.putUInt("boot_counter", bootCounter);
@@ -5451,6 +5531,8 @@ void setup() {
   server.on("/api/gps-log/clear", HTTP_POST, handleApiGpsLogClear);
   server.on("/api/crops", HTTP_GET, handleApiCrops);
   server.on("/api/crops", HTTP_POST, handleApiCropsPost);
+  server.on("/api/device-config", HTTP_GET,  handleApiDeviceConfig);
+  server.on("/api/device-config", HTTP_POST, handleApiDeviceConfig);
   server.on("/api/lift-confirm", HTTP_POST, handleApiLiftConfirm);
   server.on("/api/upload-config", HTTP_GET, handleApiUploadConfig);
   server.on("/api/upload-config", HTTP_POST, handleApiUploadConfig);
