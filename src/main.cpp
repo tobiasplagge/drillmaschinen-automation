@@ -33,8 +33,8 @@ static const IPAddress ETHERNET_DNS(192, 168, 4, 1);
 static const IPAddress ETHERNET_GATEWAY(192, 168, 4, 1);
 static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 
-static const char *DEVICE_ID = "waveshare-8di8do-01";
-static const char *DEVICE_NAME = "Drillmaschinenüberwachung";
+static const char *DEVICE_ID = "Rabe Megadrill 3000-01";
+static const char *DEVICE_NAME = "Rabe Megadrill 3000";
 static const char *FIRMWARE_VERSION = "2.3.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
