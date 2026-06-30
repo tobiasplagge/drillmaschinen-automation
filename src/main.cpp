@@ -300,6 +300,8 @@ uint32_t tripStartRealTime = 0;
 uint32_t tripEndRealTime = 0;
 char tripStartFieldName[FIELD_NAME_LENGTH] = "";
 char tripStartCropName[CROP_NAME_LENGTH] = "";
+bool liftAutoStopPendingConfirm = false;
+char liftAutoStopTripId[TRIP_ID_LENGTH] = "";
 
 void startRecording(const char *source);
 void stopRecording(const char *source);
@@ -1394,6 +1396,11 @@ void stopRecording(const char *source) {
   }
   appendSystemEvent("recording_stop," + String(source) + "," + tripId);
   recordingActive = false;
+  if (strcmp(source, "lift_auto") == 0) {
+    liftAutoStopPendingConfirm = true;
+    strncpy(liftAutoStopTripId, tripId, TRIP_ID_LENGTH - 1);
+    liftAutoStopTripId[TRIP_ID_LENGTH - 1] = '\0';
+  }
   if (strcmp(source, "manual") == 0) {
     autoStartArmed = false;
   }
@@ -1593,6 +1600,8 @@ String statusJson() {
   liftJson["auto_stop_remaining_ms"] = liftAutoStopRemainingMs(now);
   liftJson["auto_stop_timer_active"] = recordingActive && liftIsUp() && liftRaisedSinceMs > 0;
   liftJson["auto_start_ready"] = autoStartEnabled && autoStartArmed && liftIsDown() && gnss.fix;
+  doc["lift_confirm_pending"] = liftAutoStopPendingConfirm;
+  if (liftAutoStopPendingConfirm) doc["lift_confirm_trip_id"] = liftAutoStopTripId;
   JsonArray valves = doc["pneumatic_valves"].to<JsonArray>();
   for (uint8_t i = 0; i < PNEUMATIC_VALVE_COUNT; i++) {
     const uint8_t outputChannel = PNEUMATIC_VALVE_OUTPUTS[i];
@@ -1851,6 +1860,15 @@ const char* htmlPage() {
     .legend-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; background: #16a34a; }
     .legend-dot.route { background: #2563eb; }
     .legend-dot.alert { background: #dc2626; }
+    .recording-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .recording-label { font-size: 1.05rem; font-weight: 700; }
+    .recording-label.active { color: #16a34a; }
+    .recording-trip { font-size: .85rem; color: #9ca3af; margin-top: 2px; }
+    .recording-row button { font-size: .97rem; padding: 10px 20px; }
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.75); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 16px; }
+    .modal-box { background: #1f2937; border: 1px solid #374151; border-radius: 10px; padding: 22px; max-width: 400px; width: 100%; }
+    .modal-box h3 { margin: 0 0 8px; font-size: 1.1rem; }
+    .modal-box p { color: #d1d5db; font-size: .92rem; margin: 0 0 16px; line-height: 1.5; }
     details { margin-top: 10px; border-top: 1px solid #374151; padding-top: 10px; }
     summary { color: #d1d5db; cursor: pointer; font-weight: 700; }
     dl { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 0; font-size: .92rem; }
@@ -2072,11 +2090,39 @@ const char* htmlPage() {
       <h2>Module</h2>
       <div id="modules" class="module-grid"></div>
     </section>
+    <section class="panel monitoring-view">
+      <div class="recording-row">
+        <div>
+          <div class="recording-label" id="recStatusLabel">Aufzeichnung: <span id="gpsStatus">–</span></div>
+          <div class="recording-trip">Fahrt-ID: <span id="tripId">–</span></div>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button id="gpsStart" type="button">&#9654; Start</button>
+          <button id="gpsStop" class="danger" type="button">&#9632; Stop</button>
+        </div>
+      </div>
+    </section>
+    <div id="liftConfirmModal" class="modal-overlay hidden">
+      <div class="modal-box">
+        <h3>Arbeit abgeschlossen?</h3>
+        <p>Das Hubwerk war l&auml;ngere Zeit oben – die Aufzeichnung wurde automatisch beendet.<br>
+           Fahrt: <strong id="liftConfirmTripId">–</strong></p>
+        <div class="actions">
+          <button id="liftConfirmUploadBtn" type="button">&#8679; Jetzt hochladen</button>
+          <button id="liftConfirmCloseBtn" class="secondary" type="button">Schlie&szlig;en</button>
+        </div>
+        <div id="liftConfirmDownload" class="hidden" style="margin-top:12px;">
+          <div style="color:#9ca3af; font-size:.88rem; margin-bottom:6px;">Direkt herunterladen:</div>
+          <div class="actions">
+            <a id="liftDlGps" class="link-button secondary" href="/api/gps-log.csv">GPS-Daten (CSV)</a>
+            <a id="liftDlSensor" class="link-button secondary" href="/api/sensor-events.csv">Sensordaten (CSV)</a>
+            <a id="liftDlCombined" class="link-button secondary" href="/api/combined.geojson">Route + Sensoren</a>
+          </div>
+        </div>
+        <div id="liftConfirmStatus" class="gps-meta" style="margin-top:8px;"></div>
+      </div>
+    </div>
     <div class="hidden" aria-hidden="true">
-      <button id="gpsStart" type="button">Aufzeichnen</button>
-      <button id="gpsStop" type="button">Aufzeichnung Stop</button>
-      <span id="gpsStatus"></span>
-      <span id="tripId"></span>
       <span id="gnssSource"></span>
       <span id="gpsCount"></span>
       <span id="mainEventCount"></span>
@@ -2100,6 +2146,7 @@ const char* htmlPage() {
     let actionBusy = false;
     let refreshBusy = false;
     let pageActive = true;
+    let liftConfirmShown = false;
     let alarmEnabled = false;
     let audioContext = null;
     let alarmOscillator = null;
@@ -3099,9 +3146,19 @@ const char* htmlPage() {
         document.getElementById('mainEventCount').textContent = `${data.main_event_count || 0} / ${data.main_event_capacity || 0}`;
         document.getElementById('sensorEventCount').textContent = `${data.sensor_event_count || 0} / ${data.sensor_event_capacity || 0}`;
         document.getElementById('gpsLast').textContent = data.last_gps_log_age_ms >= 0 ? data.last_gps_log_age_ms + ' ms' : '-';
-        document.getElementById('gpsStatus').textContent = data.recording_active ? 'Aktiv' : 'Aus';
-        document.getElementById('gpsStart').disabled = Boolean(data.recording_active);
-        document.getElementById('gpsStop').disabled = !data.recording_active;
+        const recActive = Boolean(data.recording_active);
+        const statusEl = document.getElementById('gpsStatus');
+        statusEl.textContent = recActive ? 'Aktiv ●' : 'Gestoppt';
+        const labelEl = document.getElementById('recStatusLabel');
+        if (labelEl) labelEl.className = 'recording-label' + (recActive ? ' active' : '');
+        document.getElementById('gpsStart').disabled = recActive;
+        document.getElementById('gpsStop').disabled = !recActive;
+        if (data.lift_confirm_pending && !liftConfirmShown) {
+          liftConfirmShown = true;
+          showLiftConfirmModal(data.lift_confirm_trip_id || '');
+        } else if (!data.lift_confirm_pending) {
+          liftConfirmShown = false;
+        }
         const gnss = data.gnss || {};
         document.getElementById('gnssFix').textContent = gnss.fix ? 'Ja' : (gnss.seen ? 'Nein' : 'Nicht empfangen');
         document.getElementById('gnssSource').textContent = gnss.source || '-';
@@ -3240,6 +3297,43 @@ const char* htmlPage() {
       } catch (err) {
         document.getElementById('error').textContent = 'Hubwerk-Einstellung speichern fehlgeschlagen';
       }
+    }
+
+    function showLiftConfirmModal(tid) {
+      document.getElementById('liftConfirmTripId').textContent = tid || '–';
+      document.getElementById('liftConfirmStatus').textContent = '';
+      document.getElementById('liftConfirmDownload').classList.add('hidden');
+      document.getElementById('liftConfirmModal').classList.remove('hidden');
+    }
+
+    async function dismissLiftConfirm() {
+      document.getElementById('liftConfirmModal').classList.add('hidden');
+      try {
+        await fetchWithTimeout('/api/lift-confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      } catch (e) {}
+    }
+
+    async function liftConfirmUpload() {
+      document.getElementById('liftConfirmStatus').textContent = 'Upload wird gestartet …';
+      document.getElementById('liftConfirmUploadBtn').disabled = true;
+      try {
+        const res = await fetchWithTimeout('/api/upload-now', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          document.getElementById('liftConfirmStatus').textContent = 'Upload nicht möglich (' + (data.error || 'HTTP ' + res.status) + ') – Daten herunterladen:';
+          document.getElementById('liftConfirmDownload').classList.remove('hidden');
+        } else {
+          document.getElementById('liftConfirmStatus').textContent = 'Upload gestartet.';
+          setTimeout(() => dismissLiftConfirm(), 2500);
+        }
+      } catch (err) {
+        document.getElementById('liftConfirmStatus').textContent = 'Keine Verbindung zum Server – Daten herunterladen:';
+        document.getElementById('liftConfirmDownload').classList.remove('hidden');
+      }
+      document.getElementById('liftConfirmUploadBtn').disabled = false;
+      try {
+        await fetchWithTimeout('/api/lift-confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      } catch (e) {}
     }
 
     async function loadUploadConfig() {
@@ -3598,6 +3692,8 @@ const char* htmlPage() {
     document.getElementById('liftAutoStopSave').addEventListener('click', saveLiftAutoStopSetting);
     document.getElementById('uploadConfigSave').addEventListener('click', saveUploadConfigSetting);
     document.getElementById('uploadNowBtn').addEventListener('click', triggerUploadNow);
+    document.getElementById('liftConfirmUploadBtn').addEventListener('click', liftConfirmUpload);
+    document.getElementById('liftConfirmCloseBtn').addEventListener('click', dismissLiftConfirm);
     document.getElementById('archiveRefresh').addEventListener('click', loadArchive);
     document.getElementById('rs485Test').addEventListener('click', runRs485Test);
     document.getElementById('rs485BaudScan').addEventListener('click', runRs485BaudScan);
@@ -4887,6 +4983,11 @@ void handleApiSensorEventsTxt() {
   server.send(200, "text/plain; charset=utf-8", text);
 }
 
+void handleApiLiftConfirm() {
+  liftAutoStopPendingConfirm = false;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleApiUploadConfig() {
   if (server.method() == HTTP_GET) {
     JsonDocument doc;
@@ -5327,6 +5428,7 @@ void setup() {
   server.on("/api/gps-log/clear", HTTP_POST, handleApiGpsLogClear);
   server.on("/api/crops", HTTP_GET, handleApiCrops);
   server.on("/api/crops", HTTP_POST, handleApiCropsPost);
+  server.on("/api/lift-confirm", HTTP_POST, handleApiLiftConfirm);
   server.on("/api/upload-config", HTTP_GET, handleApiUploadConfig);
   server.on("/api/upload-config", HTTP_POST, handleApiUploadConfig);
   server.on("/api/upload-now", HTTP_POST, handleApiUploadNow);
