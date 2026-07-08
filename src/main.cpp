@@ -12,6 +12,7 @@
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
+#include <mbedtls/sha256.h>
 
 // ---------------------------------------------------------------------------
 // Waveshare ESP32-S3-POE-ETH-8DI-8DO configuration
@@ -36,7 +37,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 static constexpr uint8_t DEVICE_NAME_LENGTH = 64;
 static const char *DEVICE_ID_DEFAULT = "Rabe Megadrill 3000-01";
 char deviceName[DEVICE_NAME_LENGTH] = "Rabe Megadrill 3000-01";
-static const char *FIRMWARE_VERSION = "2.3.0";
+static const char *FIRMWARE_VERSION = "2.4.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
@@ -80,6 +81,9 @@ static constexpr uint32_t DEFAULT_LIFT_AUTO_STOP_DELAY_MS = 600000;
 static constexpr uint32_t MIN_LIFT_AUTO_STOP_DELAY_MS = 0;
 static constexpr uint32_t MAX_LIFT_AUTO_STOP_DELAY_MS = 3600000;
 static constexpr uint32_t FILE_FLUSH_INTERVAL_MS = 30000;
+static constexpr uint32_t SESSION_TTL_MS = 8UL * 60UL * 60UL * 1000UL;
+static constexpr uint8_t MAX_USERS = 8;
+static constexpr uint8_t MAX_SESSIONS = 4;
 static constexpr uint8_t WATCHDOG_TIMEOUT_SECONDS = 8;
 static constexpr uint16_t GPS_LOG_TARGET_CAPACITY = 5000;
 static constexpr uint16_t MAIN_EVENT_LOG_CAPACITY = 512;
@@ -116,12 +120,14 @@ static constexpr uint8_t GNSS_MODBUS_FUNCTION_READ_HOLDING = 0x03;
 // On this board the digital outputs are controlled through the TCA9554. The
 // Waveshare examples initialize all outputs HIGH. Keep this configurable in
 // case your wiring expects the opposite logic.
-static constexpr bool DO_ACTIVE_HIGH = true;
+static constexpr bool DEFAULT_DO_ACTIVE_HIGH = false;
+static constexpr bool LIGHT_DO_ACTIVE_HIGH = true;
 static constexpr bool INPUT_ACTIVE_HIGH = false;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
 static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
 static constexpr uint8_t PNEUMATIC_VALVE_COUNT = 4;
-static constexpr uint8_t PNEUMATIC_VALVE_OUTPUTS[PNEUMATIC_VALVE_COUNT] = {2, 3, 4, 5};
+static constexpr uint8_t PNEUMATIC_VALVE_OUTPUTS[PNEUMATIC_VALVE_COUNT] = {8, 7, 6, 5};
+static constexpr uint32_t PNEUMATIC_VALVE_PULSE_MS = 5000;
 static const char *PNEUMATIC_VALVE_LABELS[PNEUMATIC_VALVE_COUNT] = {
     "Sensor 1-6",
     "Sensor 7-12",
@@ -248,6 +254,8 @@ char tripSensorPath[64] = "";
 char tripMetaPath[64] = "";
 uint8_t tcaOutputState = 0x00;
 bool doExpanderReady = false;
+uint8_t activePneumaticValveIndex = 255;
+uint32_t pneumaticValveOffAtMs = 0;
 uint32_t lastDebugMs = 0;
 uint32_t bootCounter = 0;
 uint32_t tripCounter = 0;
@@ -304,6 +312,37 @@ char tripStartCropName[CROP_NAME_LENGTH] = "";
 bool liftAutoStopPendingConfirm = false;
 char liftAutoStopTripId[TRIP_ID_LENGTH] = "";
 
+enum class UserRole : uint8_t {
+  Viewer = 0,
+  Operator = 1,
+  Admin = 2,
+};
+
+struct UserAccount {
+  char username[32] = "";
+  char salt[33] = "";
+  char passwordHash[65] = "";
+  UserRole role = UserRole::Viewer;
+  bool enabled = true;
+};
+
+struct SessionState {
+  bool active = false;
+  char token[65] = "";
+  char deviceBinding[65] = "";
+  char username[32] = "";
+  UserRole role = UserRole::Viewer;
+  uint32_t expiresAtMs = 0;
+  IPAddress remoteIp;
+  char userAgent[96] = "";
+};
+
+UserAccount users[MAX_USERS];
+uint8_t userCount = 0;
+SessionState sessions[MAX_SESSIONS];
+SessionState activeSession;
+bool activeSessionValid = false;
+
 void startRecording(const char *source);
 void stopRecording(const char *source);
 
@@ -322,6 +361,21 @@ bool isPneumaticValveOutput(uint8_t outputChannel) {
     }
   }
   return false;
+}
+
+int8_t pneumaticValveIndexForOutput(uint8_t outputChannel) {
+  for (uint8_t i = 0; i < PNEUMATIC_VALVE_COUNT; i++) {
+    if (PNEUMATIC_VALVE_OUTPUTS[i] == outputChannel) {
+      return static_cast<int8_t>(i);
+    }
+  }
+  return -1;
+}
+
+uint8_t tcaBitForOutputChannel(uint8_t outputChannel) {
+  // The Waveshare terminal labels DO1..DO8 are wired in reverse order on the
+  // TCA9554 expander: DO1 is bit 7, DO8 is bit 0.
+  return CHANNEL_COUNT - outputChannel;
 }
 
 bool isRotationChannel(uint8_t channelIndex) {
@@ -403,6 +457,346 @@ void sanitizeFieldName(char *name) {
   cleaned.replace(">", "");
   cleaned.replace(",", " ");
   cleaned.toCharArray(name, FIELD_NAME_LENGTH);
+}
+
+String roleToString(UserRole role) {
+  switch (role) {
+    case UserRole::Admin: return "admin";
+    case UserRole::Operator: return "operator";
+    case UserRole::Viewer:
+    default: return "viewer";
+  }
+}
+
+UserRole roleFromString(const String &value) {
+  String normalized = value;
+  normalized.toLowerCase();
+  if (normalized == "admin") return UserRole::Admin;
+  if (normalized == "operator") return UserRole::Operator;
+  return UserRole::Viewer;
+}
+
+uint8_t roleRank(UserRole role) {
+  switch (role) {
+    case UserRole::Admin: return 3;
+    case UserRole::Operator: return 2;
+    case UserRole::Viewer:
+    default: return 1;
+  }
+}
+
+String randomHex(uint8_t byteCount) {
+  static const char digits[] = "0123456789abcdef";
+  String out;
+  out.reserve(byteCount * 2);
+  for (uint8_t i = 0; i < byteCount; i++) {
+    const uint8_t value = static_cast<uint8_t>(esp_random() & 0xff);
+    out += digits[(value >> 4) & 0x0f];
+    out += digits[value & 0x0f];
+  }
+  return out;
+}
+
+String sha256Hex(const String &input) {
+  uint8_t hash[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts_ret(&ctx, 0);
+  mbedtls_sha256_update_ret(&ctx, reinterpret_cast<const unsigned char *>(input.c_str()), input.length());
+  mbedtls_sha256_finish_ret(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+
+  static const char digits[] = "0123456789abcdef";
+  String out;
+  out.reserve(64);
+  for (uint8_t b : hash) {
+    out += digits[(b >> 4) & 0x0f];
+    out += digits[b & 0x0f];
+  }
+  return out;
+}
+
+String getRequestHeader(const char *name) {
+  return server.header(name);
+}
+
+String getCookieValue(const String &cookieHeader, const char *name) {
+  const String needle = String(name) + "=";
+  int index = cookieHeader.indexOf(needle);
+  if (index < 0) {
+    return "";
+  }
+  index += needle.length();
+  int end = cookieHeader.indexOf(';', index);
+  if (end < 0) {
+    end = cookieHeader.length();
+  }
+  String value = cookieHeader.substring(index, end);
+  value.trim();
+  return value;
+}
+
+String currentDeviceBinding() {
+  String binding = getRequestHeader("X-Device-Binding");
+  binding.trim();
+  return binding;
+}
+
+void resetActiveSession() {
+  activeSessionValid = false;
+  memset(&activeSession, 0, sizeof(activeSession));
+}
+
+void clearSessions() {
+  for (SessionState &session : sessions) {
+    memset(&session, 0, sizeof(session));
+  }
+  resetActiveSession();
+}
+
+int findUserIndex(const String &username) {
+  for (uint8_t i = 0; i < userCount; i++) {
+    if (username.equalsIgnoreCase(users[i].username)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+UserAccount *findUser(const String &username) {
+  const int index = findUserIndex(username);
+  return index >= 0 ? &users[index] : nullptr;
+}
+
+bool userPasswordMatches(const UserAccount &user, const String &password) {
+  if (!user.enabled || user.username[0] == '\0') {
+    return false;
+  }
+  if (user.salt[0] == '\0' || user.passwordHash[0] == '\0') {
+    return false;
+  }
+  return sha256Hex(String(user.salt) + ":" + password) == user.passwordHash;
+}
+
+void setUserPassword(UserAccount &user, const String &password) {
+  String salt = randomHex(16);
+  salt.toCharArray(user.salt, sizeof(user.salt));
+  String hash = sha256Hex(String(user.salt) + ":" + password);
+  hash.toCharArray(user.passwordHash, sizeof(user.passwordHash));
+}
+
+void saveUsersToPreferences() {
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (uint8_t i = 0; i < userCount; i++) {
+    if (users[i].username[0] == '\0') {
+      continue;
+    }
+    JsonObject item = arr.add<JsonObject>();
+    item["username"] = users[i].username;
+    item["salt"] = users[i].salt;
+    item["password_hash"] = users[i].passwordHash;
+    item["role"] = roleToString(users[i].role);
+    item["enabled"] = users[i].enabled;
+  }
+  String json;
+  serializeJson(doc, json);
+  Preferences authPrefs;
+  authPrefs.begin("auth", false);
+  authPrefs.putString("users", json);
+  authPrefs.end();
+}
+
+void loadUsersFromPreferences() {
+  Preferences authPrefs;
+  authPrefs.begin("auth", false);
+  String stored = authPrefs.getString("users", "");
+  authPrefs.end();
+
+  userCount = 0;
+  memset(users, 0, sizeof(users));
+
+  if (stored.length() > 0) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, stored) && doc.is<JsonArray>()) {
+      for (JsonVariant variant : doc.as<JsonArray>()) {
+        if (userCount >= MAX_USERS || !variant.is<JsonObject>()) {
+          continue;
+        }
+        JsonObject obj = variant.as<JsonObject>();
+        String username = obj["username"] | "";
+        if (username.length() == 0) {
+          continue;
+        }
+        username.toCharArray(users[userCount].username, sizeof(users[userCount].username));
+        String salt = obj["salt"] | "";
+        salt.toCharArray(users[userCount].salt, sizeof(users[userCount].salt));
+        String hash = obj["password_hash"] | "";
+        hash.toCharArray(users[userCount].passwordHash, sizeof(users[userCount].passwordHash));
+        users[userCount].role = roleFromString(obj["role"] | "viewer");
+        users[userCount].enabled = obj["enabled"] | true;
+        userCount++;
+      }
+    }
+  }
+  clearSessions();
+}
+
+bool createOrUpdateUser(const String &username, const String &password, UserRole role, bool enabled) {
+  if (username.length() == 0) {
+    return false;
+  }
+
+  UserAccount *user = findUser(username);
+  if (!user) {
+    if (userCount >= MAX_USERS) {
+      return false;
+    }
+    user = &users[userCount++];
+    memset(user, 0, sizeof(UserAccount));
+    username.toCharArray(user->username, sizeof(user->username));
+  }
+
+  if (password.length() > 0) {
+    setUserPassword(*user, password);
+  } else if (user->passwordHash[0] == '\0') {
+    return false;
+  }
+  user->role = role;
+  user->enabled = enabled;
+  saveUsersToPreferences();
+  return true;
+}
+
+bool deleteUserAccount(const String &username) {
+  const int index = findUserIndex(username);
+  if (index < 0) {
+    return false;
+  }
+  for (uint8_t i = index; i + 1 < userCount; i++) {
+    users[i] = users[i + 1];
+  }
+  if (userCount > 0) {
+    userCount--;
+    memset(&users[userCount], 0, sizeof(UserAccount));
+  }
+  saveUsersToPreferences();
+  return true;
+}
+
+SessionState *findSessionByToken(const String &token) {
+  if (token.length() == 0) {
+    return nullptr;
+  }
+  for (SessionState &session : sessions) {
+    if (session.active && token.equals(session.token)) {
+      return &session;
+    }
+  }
+  return nullptr;
+}
+
+SessionState *findSessionByRequest() {
+  String cookie = getRequestHeader("Cookie");
+  String token = getCookieValue(cookie, "pm_session");
+  if (token.length() == 0) {
+    token = getRequestHeader("X-Session-Token");
+  }
+  return findSessionByToken(token);
+}
+
+String sessionBindingFromRequest() {
+  String binding = currentDeviceBinding();
+  if (binding.length() == 0) {
+    binding = getCookieValue(getRequestHeader("Cookie"), "pm_binding");
+  }
+  return binding;
+}
+
+SessionState *allocateSessionSlot() {
+  for (SessionState &session : sessions) {
+    if (!session.active) {
+      return &session;
+    }
+  }
+  return &sessions[0];
+}
+
+SessionState *createSession(const UserAccount &user) {
+  SessionState *session = allocateSessionSlot();
+  if (!session) {
+    return nullptr;
+  }
+  memset(session, 0, sizeof(SessionState));
+  String token = randomHex(32);
+  token.toCharArray(session->token, sizeof(session->token));
+  String binding = sessionBindingFromRequest();
+  if (binding.length() == 0) {
+    binding = randomHex(16);
+  }
+  binding.toCharArray(session->deviceBinding, sizeof(session->deviceBinding));
+  strncpy(session->username, user.username, sizeof(session->username) - 1);
+  session->role = user.role;
+  session->expiresAtMs = millis() + SESSION_TTL_MS;
+  session->remoteIp = server.client().remoteIP();
+  String ua = getRequestHeader("User-Agent");
+  ua.toCharArray(session->userAgent, sizeof(session->userAgent));
+  session->active = true;
+  return session;
+}
+
+void expireSession(SessionState &session) {
+  memset(&session, 0, sizeof(session));
+}
+
+bool authorize(UserRole minimumRole) {
+  resetActiveSession();
+  SessionState *session = findSessionByRequest();
+  if (!session) {
+    server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
+    return false;
+  }
+  if (millis() > session->expiresAtMs) {
+    expireSession(*session);
+    server.send(401, "application/json", "{\"error\":\"session_expired\"}");
+    return false;
+  }
+
+  const String binding = sessionBindingFromRequest();
+  if (binding.length() == 0 || binding != session->deviceBinding) {
+    server.send(401, "application/json", "{\"error\":\"session_binding_mismatch\"}");
+    return false;
+  }
+
+  const String ua = getRequestHeader("User-Agent");
+  if (ua.length() > 0 && session->userAgent[0] != '\0' && ua != session->userAgent) {
+    server.send(401, "application/json", "{\"error\":\"session_agent_mismatch\"}");
+    return false;
+  }
+
+  if (roleRank(session->role) < roleRank(minimumRole)) {
+    server.send(403, "application/json", "{\"error\":\"forbidden\"}");
+    return false;
+  }
+
+  activeSession = *session;
+  activeSessionValid = true;
+  return true;
+}
+
+void sendSessionCookie(const SessionState &session) {
+  server.sendHeader("Set-Cookie", "pm_session=" + String(session.token) + "; Path=/; Max-Age=28800; SameSite=Strict");
+  server.sendHeader("Set-Cookie", "pm_binding=" + String(session.deviceBinding) + "; Path=/; Max-Age=28800; SameSite=Strict");
+}
+
+template <typename Handler>
+void registerProtectedRoute(const char *path, HTTPMethod method, UserRole minimumRole, Handler handler) {
+  server.on(path, method, [minimumRole, handler]() {
+    if (!authorize(minimumRole)) {
+      return;
+    }
+    handler();
+  });
 }
 
 const char *resetReasonName(esp_reset_reason_t reason) {
@@ -1453,8 +1847,10 @@ bool setDigitalOutput(uint8_t channelIndex, bool on) {
     return false;
   }
 
-  const bool pinLevel = DO_ACTIVE_HIGH ? on : !on;
-  const uint8_t mask = 1 << channelIndex;
+  const uint8_t outputChannel = channelIndex + 1;
+  const bool activeHigh = (outputChannel == LIGHT_OUTPUT_CHANNEL) ? LIGHT_DO_ACTIVE_HIGH : DEFAULT_DO_ACTIVE_HIGH;
+  const bool pinLevel = activeHigh ? on : !on;
+  const uint8_t mask = 1 << tcaBitForOutputChannel(outputChannel);
   if (pinLevel) {
     tcaOutputState |= mask;
   } else {
@@ -1469,11 +1865,50 @@ bool setDigitalOutput(uint8_t channelIndex, bool on) {
   return ok;
 }
 
+bool startPneumaticValve(uint8_t valveIndex) {
+  if (valveIndex >= PNEUMATIC_VALVE_COUNT || activePneumaticValveIndex != 255 || !doExpanderReady) {
+    return false;
+  }
+
+  const uint8_t outputChannel = PNEUMATIC_VALVE_OUTPUTS[valveIndex];
+  if (!setDigitalOutput(outputChannel - 1, true)) {
+    return false;
+  }
+
+  activePneumaticValveIndex = valveIndex;
+  pneumaticValveOffAtMs = millis() + PNEUMATIC_VALVE_PULSE_MS;
+  return true;
+}
+
+void updatePneumaticValves() {
+  if (activePneumaticValveIndex >= PNEUMATIC_VALVE_COUNT) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - pneumaticValveOffAtMs) < 0) {
+    return;
+  }
+
+  const uint8_t outputChannel = PNEUMATIC_VALVE_OUTPUTS[activePneumaticValveIndex];
+  setDigitalOutput(outputChannel - 1, false);
+  activePneumaticValveIndex = 255;
+  pneumaticValveOffAtMs = 0;
+}
+
 void initDigitalOutputs() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   delay(20);
 
-  tcaOutputState = DO_ACTIVE_HIGH ? 0x00 : 0xFF;
+  tcaOutputState = 0x00;
+  for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
+    const uint8_t outputChannel = i + 1;
+    const bool activeHigh = (outputChannel == LIGHT_OUTPUT_CHANNEL) ? LIGHT_DO_ACTIVE_HIGH : DEFAULT_DO_ACTIVE_HIGH;
+    const bool offPinLevel = activeHigh ? false : true;
+    if (offPinLevel) {
+      tcaOutputState |= (1 << tcaBitForOutputChannel(outputChannel));
+    }
+  }
   tcaWrite(TCA9554_OUTPUT_REG, tcaOutputState);
   tcaWrite(TCA9554_CONFIG_REG, 0x00); // all 8 expander pins as outputs
 
@@ -1594,6 +2029,12 @@ String statusJson() {
   doc["wifi_ap_ssid"] = AP_SSID;
   doc["ip"] = WiFi.softAPIP().toString();
   doc["web_url"] = "http://" + WiFi.softAPIP().toString() + "/";
+  if (activeSessionValid) {
+    JsonObject session = doc["session"].to<JsonObject>();
+    session["username"] = activeSession.username;
+    session["role"] = roleToString(activeSession.role);
+    session["expires_in_ms"] = activeSession.expiresAtMs > now ? static_cast<int32_t>(activeSession.expiresAtMs - now) : 0;
+  }
   doc["ethernet_ready"] = ethernetReady;
   doc["ethernet_ip"] = ethernetReady ? Ethernet.localIP().toString() : "";
   doc["ethernet_link"] = Ethernet.linkStatus() == LinkON;
@@ -1603,6 +2044,18 @@ String statusJson() {
   doc["light_channel"] = LIGHT_OUTPUT_CHANNEL;
   doc["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
   doc["light_switchable"] = doExpanderReady;
+  doc["do_expander_ready"] = doExpanderReady;
+  doc["do_output_register"] = tcaOutputState;
+  uint8_t doReadback = 0;
+  if (tcaRead(TCA9554_OUTPUT_REG, doReadback)) {
+    doc["do_output_readback"] = doReadback;
+  }
+  JsonArray doMap = doc["do_tca_bit_map"].to<JsonArray>();
+  for (uint8_t outputChannel = 1; outputChannel <= CHANNEL_COUNT; outputChannel++) {
+    JsonObject item = doMap.add<JsonObject>();
+    item["do"] = outputChannel;
+    item["tca_bit"] = tcaBitForOutputChannel(outputChannel);
+  }
   JsonObject liftJson = doc["lift"].to<JsonObject>();
   liftJson["source"] = "DI7_ISO11786_PIN5";
   liftJson["is_down"] = liftIsDown();
@@ -1615,6 +2068,9 @@ String statusJson() {
   doc["lift_confirm_pending"] = liftAutoStopPendingConfirm;
   if (liftAutoStopPendingConfirm) doc["lift_confirm_trip_id"] = liftAutoStopTripId;
   JsonArray valves = doc["pneumatic_valves"].to<JsonArray>();
+  const bool valveBusy = activePneumaticValveIndex < PNEUMATIC_VALVE_COUNT;
+  const uint32_t valveRemainingMs =
+      valveBusy && static_cast<int32_t>(pneumaticValveOffAtMs - now) > 0 ? pneumaticValveOffAtMs - now : 0;
   for (uint8_t i = 0; i < PNEUMATIC_VALVE_COUNT; i++) {
     const uint8_t outputChannel = PNEUMATIC_VALVE_OUTPUTS[i];
     JsonObject valve = valves.add<JsonObject>();
@@ -1622,7 +2078,11 @@ String statusJson() {
     valve["label"] = PNEUMATIC_VALVE_LABELS[i];
     valve["output_channel"] = outputChannel;
     valve["on"] = channels[outputChannel - 1].output;
-    valve["switchable"] = doExpanderReady;
+    valve["active"] = valveBusy && activePneumaticValveIndex == i;
+    valve["locked"] = valveBusy && activePneumaticValveIndex != i;
+    valve["remaining_ms"] = valveBusy && activePneumaticValveIndex == i ? valveRemainingMs : 0;
+    valve["pulse_ms"] = PNEUMATIC_VALVE_PULSE_MS;
+    valve["switchable"] = doExpanderReady && !valveBusy;
   }
   doc["camera_name"] = HIKVISION_CAMERA_NAME;
   doc["camera_stream_url"] = CAMERA_PROXY_SUB_STREAM_URL;
@@ -1811,6 +2271,8 @@ const char* htmlPage() {
     .pill.pending { background: #ca8a04; color: #fffbeb; }
     .panel { min-width: 0; border: 1px solid #374151; border-radius: 8px; background: #1f2937; padding: 14px; margin-bottom: 14px; }
     .panel h2 { margin: 0 0 10px; font-size: 1rem; }
+    .settings-box { min-width: 0; border: 1px solid #374151; border-radius: 8px; background: #111827; padding: 14px; margin: 0 0 14px; }
+    .settings-box h3 { margin: 0 0 10px; font-size: .98rem; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .actions > * { max-width: 100%; }
     .tools-details { margin-top: 12px; }
@@ -1863,8 +2325,10 @@ const char* htmlPage() {
     .nav-action.light-unknown { background: #f59e0b; color: #111827; }
     .valve-panel { margin-bottom: 14px; }
     .valve-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
-    .valve-button { background: #374151; }
+    .valve-button { background: #374151; display: grid; gap: 2px; }
     .valve-button.active { background: #16a34a; color: #f0fdf4; }
+    .valve-button.active:disabled { opacity: 1; }
+    .valve-countdown { font-size: .78rem; font-weight: 650; color: inherit; }
     .hidden { display: none !important; }
     .map-status { margin: 0 0 10px; color: #d1d5db; font-size: .9rem; }
     .track-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; color: #d1d5db; font-size: .88rem; }
@@ -1881,6 +2345,16 @@ const char* htmlPage() {
     .modal-box { background: #1f2937; border: 1px solid #374151; border-radius: 10px; padding: 22px; max-width: 400px; width: 100%; }
     .modal-box h3 { margin: 0 0 8px; font-size: 1.1rem; }
     .modal-box p { color: #d1d5db; font-size: .92rem; margin: 0 0 16px; line-height: 1.5; }
+    .auth-overlay { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(17,24,39,.94); backdrop-filter: blur(4px); }
+    .auth-card { width: min(520px, 100%); border: 1px solid #374151; border-radius: 12px; background: #111827; padding: 22px; box-shadow: 0 24px 70px rgba(0,0,0,.35); }
+    .auth-card h2 { margin: 0 0 8px; font-size: 1.35rem; }
+    .auth-card p { margin: 0 0 16px; color: #9ca3af; line-height: 1.5; }
+    .auth-grid { display: grid; gap: 10px; }
+    .auth-grid .field-row { margin: 0; }
+    .auth-badge { display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px; border: 1px solid #374151; border-radius: 999px; background: #111827; color: #d1d5db; font-size: .82rem; font-weight: 700; }
+    .user-admin-grid { display: grid; grid-template-columns: 1.2fr 1fr .8fr auto; gap: 8px; align-items: center; }
+    .user-admin-list { display: grid; gap: 8px; margin-top: 10px; }
+    .user-admin-row { display: grid; grid-template-columns: minmax(0, 1fr) 96px 90px auto; gap: 8px; align-items: center; padding: 8px; border: 1px solid #374151; border-radius: 6px; background: #111827; }
     details { margin-top: 10px; border-top: 1px solid #374151; padding-top: 10px; }
     summary { color: #d1d5db; cursor: pointer; font-weight: 700; }
     dl { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 0; font-size: .92rem; }
@@ -1905,11 +2379,33 @@ const char* htmlPage() {
   </style>
 </head>
 <body>
+  <div id="authOverlay" class="auth-overlay">
+    <div class="auth-card">
+      <h2 id="authTitle">Anmeldung</h2>
+      <p id="authHint">Bitte mit einem berechtigten Benutzer anmelden.</p>
+      <div class="auth-grid">
+        <div class="field-row">
+          <input id="authUsername" autocomplete="username" placeholder="Benutzername">
+          <input id="authPassword" type="password" autocomplete="current-password" placeholder="Passwort">
+        </div>
+        <div class="field-row">
+          <input id="authBootstrapUsername" autocomplete="username" placeholder="Erster Admin-Benutzer">
+          <input id="authBootstrapPassword" type="password" autocomplete="new-password" placeholder="Erstpasswort">
+        </div>
+        <div class="actions">
+          <button id="authLoginBtn" type="button">Anmelden</button>
+          <button id="authBootstrapBtn" class="secondary" type="button">Erst-Admin anlegen</button>
+        </div>
+      </div>
+      <div id="authMessage" class="error" style="margin-top:12px;"></div>
+    </div>
+  </div>
   <main>
     <div style="margin-bottom:8px;"><img src="data:image/png;base64,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" alt="Logo" style="max-height:48px; background:#fff; border-radius:8px; padding:4px 10px; display:block;"></div>
     <h1 id="title">Drillmaschinenüberwachung</h1>
     <div class="meta">
       <span id="ip">IP: -</span> · <span id="version">Version: -</span> · <span id="updated">-</span>
+      · <span id="authBadge" class="auth-badge">Nicht angemeldet</span>
     </div>
     <div id="debugOverlay" class="warning hidden" style="display:none;margin-bottom:10px;font-size:.9rem;"></div>
     <div id="connection" class="connection">
@@ -1991,6 +2487,29 @@ const char* htmlPage() {
     </section>
     <section id="settingsView" class="panel hidden">
       <h2>Fehleranalyse & Einstellungen</h2>
+      <div id="userAdminPanel" class="settings-box">
+        <h3>Benutzerverwaltung</h3>
+        <div class="gps-meta" id="sessionInfo"></div>
+        <div class="user-admin-grid" style="margin-top:10px;">
+          <input id="userFormUsername" maxlength="31" placeholder="Benutzername">
+          <input id="userFormPassword" type="password" placeholder="Passwort">
+          <select id="userFormRole">
+            <option value="viewer">Viewer</option>
+            <option value="operator">Operator</option>
+            <option value="admin">Admin</option>
+          </select>
+          <label style="display:flex;align-items:center;gap:6px;color:#d1d5db;white-space:nowrap;">
+            <input id="userFormEnabled" type="checkbox" checked>
+            Aktiv
+          </label>
+        </div>
+        <div class="actions" style="margin-top:10px;">
+          <button id="userSaveBtn" type="button">Benutzer speichern</button>
+          <button id="userReloadBtn" class="secondary" type="button">Neu laden</button>
+        </div>
+        <div id="userAdminStatus" class="error" style="margin-top:10px;"></div>
+        <div id="userList" class="user-admin-list"></div>
+      </div>
       <div class="field-row">
         <div style="min-width:0;">
           <h3>Kameras</h3>
@@ -2199,6 +2718,10 @@ const char* htmlPage() {
     let followMap = true;
     let rs485TestRunning = false;
     const openDetailChannels = new Set();
+    const authStorageKey = 'pmDeviceBinding';
+    const emptyAuthState = { loggedIn: false, username: '', role: '', expiresInMs: 0, bootstrapRequired: false };
+    let authState = { ...emptyAuthState };
+    let bootCompleted = false;
 
     function escapeHtml(value) {
       var safe = (value !== undefined && value !== null) ? String(value) : '';
@@ -2209,6 +2732,110 @@ const char* htmlPage() {
 
     function visibleChannels(channels) {
       return (channels || []).filter(ch => !ch.hidden && ch.channel !== 7);
+    }
+
+    function generateBindingToken() {
+      const bytes = new Uint8Array(16);
+      if (window.crypto && window.crypto.getRandomValues) {
+        window.crypto.getRandomValues(bytes);
+      } else {
+        for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+      }
+      return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function getDeviceBinding() {
+      let binding = localStorage.getItem(authStorageKey);
+      if (!binding) {
+        binding = generateBindingToken();
+        localStorage.setItem(authStorageKey, binding);
+      }
+      return binding;
+    }
+
+    function syncAuthBadge() {
+      const badge = document.getElementById('authBadge');
+      if (!badge) return;
+      if (!authState.loggedIn) {
+        badge.textContent = 'Nicht angemeldet';
+        return;
+      }
+      badge.textContent = `${authState.username || '-'} · ${authState.role || '-'}`;
+    }
+
+    function setAuthOverlay(mode, message) {
+      const overlay = document.getElementById('authOverlay');
+      const title = document.getElementById('authTitle');
+      const hint = document.getElementById('authHint');
+      const msg = document.getElementById('authMessage');
+      const loginRow = document.getElementById('authUsername').parentElement;
+      const bootstrapRow = document.getElementById('authBootstrapUsername').parentElement;
+      const bootstrapBtn = document.getElementById('authBootstrapBtn');
+      const loginBtn = document.getElementById('authLoginBtn');
+      const bootstrapMode = mode === 'bootstrap';
+      overlay.classList.remove('hidden');
+      title.textContent = bootstrapMode ? 'Erst-Admin anlegen' : 'Anmeldung';
+      hint.textContent = bootstrapMode
+        ? 'Es existiert noch kein Benutzer. Bitte den ersten Admin anlegen.'
+        : 'Bitte mit einem berechtigten Benutzer anmelden.';
+      loginRow.classList.toggle('hidden', bootstrapMode);
+      bootstrapRow.classList.toggle('hidden', !bootstrapMode);
+      loginBtn.style.display = bootstrapMode ? 'none' : 'inline-flex';
+      bootstrapBtn.style.display = bootstrapMode ? 'inline-flex' : 'none';
+      bootstrapBtn.textContent = 'Erst-Admin anlegen';
+      loginBtn.textContent = 'Anmelden';
+      msg.textContent = message || '';
+    }
+
+    function showAuthOverlay(mode, message) {
+      authState.loggedIn = false;
+      authState.username = '';
+      authState.role = '';
+      authState.expiresInMs = 0;
+      authState.bootstrapRequired = mode === 'bootstrap';
+      setAuthOverlay(mode, message);
+      syncAuthBadge();
+    }
+
+    function hideAuthOverlay() {
+      document.getElementById('authOverlay').classList.add('hidden');
+      document.getElementById('authMessage').textContent = '';
+    }
+
+    function updateSessionPanel() {
+      const sessionInfo = document.getElementById('sessionInfo');
+      const userAdminPanel = document.getElementById('userAdminPanel');
+      if (!sessionInfo) return;
+      if (!authState.loggedIn) {
+        sessionInfo.innerHTML = '<div>Session: <strong>-</strong></div><div>Rolle: <strong>-</strong></div><div>Restlaufzeit: <strong>-</strong></div>';
+        if (userAdminPanel) userAdminPanel.classList.add('hidden');
+        return;
+      }
+      if (userAdminPanel) userAdminPanel.classList.toggle('hidden', authState.role !== 'admin');
+      sessionInfo.innerHTML = [
+        `<div>Session: <strong>${escapeHtml(authState.username || '-')}</strong></div>`,
+        `<div>Rolle: <strong>${escapeHtml(authState.role || '-')}</strong></div>`,
+        `<div>Restlaufzeit: <strong>${formatDuration(authState.expiresInMs || 0)}</strong></div>`
+      ].join('');
+    }
+
+    function renderUserRows(list) {
+      const container = document.getElementById('userList');
+      if (!container) return;
+      const users = Array.isArray(list) ? list : [];
+      container.innerHTML = users.length ? users.map(user => `
+        <div class="user-admin-row">
+          <strong>${escapeHtml(user.username || '')}</strong>
+          <span>${escapeHtml(user.role || '')}</span>
+          <span>${user.enabled ? 'Aktiv' : 'Gesperrt'}</span>
+          <button class="secondary" type="button" data-user="${escapeHtml(user.username || '')}">Löschen</button>
+        </div>
+      `).join('') : '<div style="color:#9ca3af;">Noch keine Benutzer angelegt.</div>';
+      container.querySelectorAll('button[data-user]').forEach(button => button.addEventListener('click', async event => {
+        const username = event.currentTarget.getAttribute('data-user');
+        if (!username || !confirm(`Benutzer "${username}" löschen?`)) return;
+        await deleteUser(username);
+      }));
     }
 
     function formatRpm(value) {
@@ -2422,31 +3049,35 @@ const char* htmlPage() {
       const existing = container.querySelectorAll('.valve-button');
       if (existing.length !== list.length) {
         container.innerHTML = list.map(valve => `
-          <button class="valve-button ${valve.on ? 'active' : ''}" type="button" data-channel="${valve.output_channel}" data-on="${valve.on ? '1' : '0'}" ${valve.switchable ? '' : 'disabled'}>
-            ${escapeHtml(valve.label || ('Ausgang ' + valve.output_channel))}
+          <button class="valve-button ${valve.active ? 'active' : ''}" type="button" data-index="${valve.index}" ${valve.switchable ? '' : 'disabled'}>
+            <span>${escapeHtml(valve.label || ('Ausgang ' + valve.output_channel))}</span>
+            <span class="valve-countdown">${valve.active ? Math.ceil((valve.remaining_ms || 0) / 1000) + ' s aktiv' : (valve.locked ? 'gesperrt' : '5 s schalten')}</span>
           </button>
         `).join('');
-        container.querySelectorAll('.valve-button').forEach(button => button.addEventListener('click', () => toggleValve(button)));
+        container.querySelectorAll('.valve-button').forEach(button => button.addEventListener('click', () => pulseValve(button)));
         return;
       }
       list.forEach((valve, idx) => {
         const btn = existing[idx];
-        btn.className = 'valve-button' + (valve.on ? ' active' : '');
+        btn.className = 'valve-button' + (valve.active ? ' active' : '');
         btn.disabled = !valve.switchable;
-        btn.dataset.on = valve.on ? '1' : '0';
+        btn.dataset.index = valve.index;
+        const countdown = btn.querySelector('.valve-countdown');
+        if (countdown) {
+          countdown.textContent = valve.active ? Math.ceil((valve.remaining_ms || 0) / 1000) + ' s aktiv' : (valve.locked ? 'gesperrt' : '5 s schalten');
+        }
       });
     }
 
-    async function toggleValve(button) {
+    async function pulseValve(button) {
       if (actionBusy) return;
       actionBusy = true;
-      const channel = Number(button.dataset.channel);
-      const nextState = button.dataset.on !== '1';
+      const index = Number(button.dataset.index);
       try {
-        const res = await fetchWithTimeout('/api/output', {
+        const res = await fetchWithTimeout('/api/valve', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ channel, on: nextState })
+          body: JSON.stringify({ index })
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         await refresh();
@@ -2820,7 +3451,9 @@ const char* htmlPage() {
         renderSettings(window.lastStatusData || {});
         try { loadCropSuggestions(); } catch (e) {}
         try { loadDeviceConfig(); } catch (e) {}
-        try { loadUploadConfig(); } catch (e) {}
+        if (authState.role === 'admin') {
+          try { loadUploadConfig(); } catch (e) {}
+        }
       }
     }
 
@@ -2924,13 +3557,190 @@ const char* htmlPage() {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
+        const headers = new Headers(options.headers || {});
+        headers.set('X-Device-Binding', getDeviceBinding());
         return await fetch(url, {
           cache: 'no-store',
+          credentials: 'same-origin',
           ...options,
+          headers,
           signal: controller.signal
         });
       } finally {
         clearTimeout(timer);
+      }
+    }
+
+    async function parseApiError(response) {
+      try {
+        const data = await response.json();
+        return data.error || data.message || ('HTTP ' + response.status);
+      } catch (err) {
+        return 'HTTP ' + response.status;
+      }
+    }
+
+    async function loadSession() {
+      try {
+        const res = await fetchWithTimeout('/api/session', {}, 2500);
+        if (!res.ok) {
+          const error = await parseApiError(res);
+          if (res.status === 409 || error === 'bootstrap_required') {
+            authState = { ...emptyAuthState, bootstrapRequired: true };
+            showAuthOverlay('bootstrap', 'Bitte den ersten Admin anlegen.');
+          } else {
+            authState = { ...emptyAuthState };
+            showAuthOverlay('login', 'Bitte anmelden.');
+          }
+          return false;
+        }
+        const data = await res.json();
+        authState = {
+          loggedIn: true,
+          username: data.username || '',
+          role: data.role || '',
+          expiresInMs: Number(data.expires_in_ms || 0),
+          bootstrapRequired: false
+        };
+        hideAuthOverlay();
+        syncAuthBadge();
+        updateSessionPanel();
+        if (authState.role === 'admin') {
+          await loadUsers();
+        }
+        return true;
+      } catch (err) {
+        authState = { ...emptyAuthState };
+        showAuthOverlay('login', 'Session nicht verfügbar.');
+        return false;
+      }
+    }
+
+    async function loginWithCredentials(username, password) {
+      const payload = { username, password };
+      const res = await fetchWithTimeout('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }, 5000);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (res.status === 409 || data.error === 'bootstrap_required') {
+          authState.bootstrapRequired = true;
+          showAuthOverlay('bootstrap', 'Es existiert noch kein Benutzer.');
+          return;
+        }
+        throw new Error(data.error || ('HTTP ' + res.status));
+      }
+      authState = {
+        loggedIn: true,
+        username: data.username || username,
+        role: data.role || '',
+        expiresInMs: Number(data.expires_in_ms || 0),
+        bootstrapRequired: false
+      };
+      hideAuthOverlay();
+      syncAuthBadge();
+      updateSessionPanel();
+      await refresh();
+      if (authState.role === 'admin') {
+        await loadUsers();
+      }
+    }
+
+    async function bootstrapAdmin() {
+      const username = document.getElementById('authBootstrapUsername').value.trim();
+      const password = document.getElementById('authBootstrapPassword').value;
+      if (!username || password.length < 8) {
+        throw new Error('Bitte Benutzername und ein Passwort mit mindestens 8 Zeichen angeben.');
+      }
+      const res = await fetchWithTimeout('/api/bootstrap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      }, 5000);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || ('HTTP ' + res.status));
+      }
+      await loginWithCredentials(username, password);
+    }
+
+    async function logout() {
+      try {
+        await fetchWithTimeout('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }, 2500);
+      } catch (err) {}
+      authState = { ...emptyAuthState };
+      showAuthOverlay('login', 'Bitte erneut anmelden.');
+      updateSessionPanel();
+      syncAuthBadge();
+    }
+
+    async function loadUsers() {
+      const container = document.getElementById('userList');
+      const status = document.getElementById('userAdminStatus');
+      if (!container || !status) return;
+      if (authState.role !== 'admin') {
+        container.innerHTML = '';
+        status.textContent = 'Nur Administratoren können Benutzer verwalten.';
+        return;
+      }
+      try {
+        const res = await fetchWithTimeout('/api/users', {}, 2500);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        renderUserRows(data.users || []);
+        status.textContent = '';
+      } catch (err) {
+        status.textContent = 'Benutzerliste konnte nicht geladen werden: ' + err.message;
+      }
+    }
+
+    async function saveUser() {
+      const status = document.getElementById('userAdminStatus');
+      const payload = {
+        username: document.getElementById('userFormUsername').value.trim(),
+        password: document.getElementById('userFormPassword').value,
+        role: document.getElementById('userFormRole').value,
+        enabled: document.getElementById('userFormEnabled').checked
+      };
+      if (!payload.username) {
+        status.textContent = 'Bitte einen Benutzernamen angeben.';
+        return;
+      }
+      if (payload.password.length === 0) {
+        delete payload.password;
+      }
+      try {
+        const res = await fetchWithTimeout('/api/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }, 5000);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        document.getElementById('userFormPassword').value = '';
+        status.textContent = 'Benutzer gespeichert.';
+        await loadUsers();
+      } catch (err) {
+        status.textContent = 'Benutzer konnte nicht gespeichert werden: ' + err.message;
+      }
+    }
+
+    async function deleteUser(username) {
+      const status = document.getElementById('userAdminStatus');
+      try {
+        const res = await fetchWithTimeout('/api/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'delete', username })
+        }, 5000);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        status.textContent = 'Benutzer gelöscht.';
+        await loadUsers();
+      } catch (err) {
+        status.textContent = 'Benutzer konnte nicht gelöscht werden: ' + err.message;
       }
     }
 
@@ -3112,7 +3922,7 @@ const char* htmlPage() {
     }
 
     async function refresh() {
-      if (refreshBusy || !pageActive) return;
+      if (refreshBusy || !pageActive || !authState.loggedIn) return;
       if (isCameraStreamOpen()) {
         document.getElementById('error').textContent = '';
         hideDebugOverlay();
@@ -3125,6 +3935,11 @@ const char* htmlPage() {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         window.lastStatusData = data;
+        if (data.session) {
+          authState.expiresInMs = Number(data.session.expires_in_ms || authState.expiresInMs || 0);
+          syncAuthBadge();
+          updateSessionPanel();
+        }
         window.mainSignalHoldMs = data.quality_signal_hold_ms || data.main_signal_hold_ms || 1500;
         lastSuccessfulContactMs = Date.now();
         setConnectionState('online');
@@ -3221,6 +4036,10 @@ const char* htmlPage() {
         document.getElementById('error').textContent = '';
         hideDebugOverlay();
       } catch (err) {
+        if (err && err.message && /HTTP 401|HTTP 403/.test(err.message)) {
+          await logout();
+          return;
+        }
         if (isCameraStreamOpen()) {
           document.getElementById('error').textContent = '';
           hideDebugOverlay();
@@ -3772,6 +4591,29 @@ const char* htmlPage() {
     document.getElementById('liftConfirmUploadBtn').addEventListener('click', liftConfirmUpload);
     document.getElementById('liftConfirmCloseBtn').addEventListener('click', dismissLiftConfirm);
     document.getElementById('archiveRefresh').addEventListener('click', loadArchive);
+    document.getElementById('authLoginBtn').addEventListener('click', async () => {
+      const message = document.getElementById('authMessage');
+      message.textContent = '';
+      try {
+        await loginWithCredentials(
+          document.getElementById('authUsername').value.trim(),
+          document.getElementById('authPassword').value
+        );
+      } catch (err) {
+        message.textContent = err.message || 'Anmeldung fehlgeschlagen';
+      }
+    });
+    document.getElementById('authBootstrapBtn').addEventListener('click', async () => {
+      const message = document.getElementById('authMessage');
+      message.textContent = '';
+      try {
+        await bootstrapAdmin();
+      } catch (err) {
+        message.textContent = err.message || 'Erst-Admin konnte nicht angelegt werden';
+      }
+    });
+    document.getElementById('userSaveBtn').addEventListener('click', saveUser);
+    document.getElementById('userReloadBtn').addEventListener('click', loadUsers);
     document.getElementById('rs485Test').addEventListener('click', runRs485Test);
     document.getElementById('rs485BaudScan').addEventListener('click', runRs485BaudScan);
     document.getElementById('rs485AddressScan').addEventListener('click', runRs485AddressScan);
@@ -3813,13 +4655,35 @@ const char* htmlPage() {
         openDetailChannels.delete(channel);
       }
     }, true);
-    refresh();
-    loadCropSuggestions();
-    refreshTrack();
-    window.addEventListener('resize', () => drawTrack());
-    connectionTimer = setInterval(updateLastContact, 1000);
-    setInterval(refresh, 1000);
-    setInterval(refreshTrack, 3000);
+
+    async function bootApp() {
+      syncAuthBadge();
+      updateSessionPanel();
+      const sessionOk = await loadSession();
+      if (!sessionOk) {
+        return;
+      }
+      bootCompleted = true;
+      await Promise.allSettled([
+        refresh(),
+        loadCropSuggestions(),
+        refreshTrack(),
+        loadArchive(),
+        loadDeviceConfig()
+      ]);
+      if (authState.role === 'admin') {
+        await loadUploadConfig();
+      }
+      window.addEventListener('resize', () => drawTrack());
+      connectionTimer = setInterval(updateLastContact, 1000);
+      setInterval(refresh, 1000);
+      setInterval(refreshTrack, 3000);
+      if (authState.role === 'admin') {
+        await loadUsers();
+      }
+    }
+
+    bootApp();
   </script>
 </body>
 </html>
@@ -3830,6 +4694,162 @@ const char* htmlPage() {
 void handleRoot() {
   server.sendHeader("Cache-Control", "no-store");
   server.send_P(200, "text/html; charset=utf-8", htmlPage());
+}
+
+void handleApiSession() {
+  if (!authorize(UserRole::Viewer)) {
+    return;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["username"] = activeSession.username;
+  doc["role"] = roleToString(activeSession.role);
+  doc["expires_in_ms"] = activeSession.expiresAtMs > millis() ? static_cast<int32_t>(activeSession.expiresAtMs - millis()) : 0;
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleApiLogin() {
+  if (userCount == 0) {
+    server.send(409, "application/json", "{\"error\":\"bootstrap_required\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+
+  const String username = doc["username"] | "";
+  const String password = doc["password"] | "";
+  if (username.length() == 0 || password.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"missing_credentials\"}");
+    return;
+  }
+
+  UserAccount *user = findUser(username);
+  if (!user || !user->enabled || !userPasswordMatches(*user, password)) {
+    server.send(401, "application/json", "{\"error\":\"invalid_credentials\"}");
+    return;
+  }
+
+  SessionState *session = createSession(*user);
+  if (!session) {
+    server.send(500, "application/json", "{\"error\":\"session_allocation_failed\"}");
+    return;
+  }
+
+  sendSessionCookie(*session);
+  appendSystemEvent("auth,login," + String(user->username) + "," + roleToString(user->role));
+  JsonDocument response;
+  response["ok"] = true;
+  response["username"] = user->username;
+  response["role"] = roleToString(user->role);
+  response["expires_in_ms"] = SESSION_TTL_MS;
+  String json;
+  serializeJson(response, json);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleApiBootstrap() {
+  if (userCount > 0) {
+    server.send(409, "application/json", "{\"error\":\"users_already_configured\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+
+  const String username = doc["username"] | "";
+  const String password = doc["password"] | "";
+  if (username.length() == 0 || password.length() < 8) {
+    server.send(400, "application/json", "{\"error\":\"invalid_bootstrap_data\"}");
+    return;
+  }
+
+  if (!createOrUpdateUser(username, password, UserRole::Admin, true)) {
+    server.send(500, "application/json", "{\"error\":\"bootstrap_failed\"}");
+    return;
+  }
+
+  appendSystemEvent("auth,bootstrap," + username);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiLogout() {
+  if (!authorize(UserRole::Viewer)) {
+    return;
+  }
+
+  String token = getCookieValue(getRequestHeader("Cookie"), "pm_session");
+  SessionState *session = findSessionByToken(token);
+  if (session) {
+    appendSystemEvent("auth,logout," + String(session->username));
+    expireSession(*session);
+  }
+  server.sendHeader("Set-Cookie", "pm_session=; Path=/; Max-Age=0; SameSite=Strict");
+  server.sendHeader("Set-Cookie", "pm_binding=; Path=/; Max-Age=0; SameSite=Strict");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiUsers() {
+  if (!authorize(UserRole::Admin)) {
+    return;
+  }
+
+  if (server.method() == HTTP_GET) {
+    JsonDocument doc;
+    JsonArray arr = doc["users"].to<JsonArray>();
+    for (uint8_t i = 0; i < userCount; i++) {
+      if (users[i].username[0] == '\0') {
+        continue;
+      }
+      JsonObject item = arr.add<JsonObject>();
+      item["username"] = users[i].username;
+      item["role"] = roleToString(users[i].role);
+      item["enabled"] = users[i].enabled;
+    }
+    String json;
+    serializeJson(doc, json);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
+    return;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+  const String action = doc["action"] | "upsert";
+  const String username = doc["username"] | "";
+  const String password = doc["password"] | "";
+  const bool enabled = doc["enabled"] | true;
+  const UserRole role = roleFromString(doc["role"] | "viewer");
+
+  if (action == "delete") {
+    if (!deleteUserAccount(username)) {
+      server.send(404, "application/json", "{\"error\":\"user_not_found\"}");
+      return;
+    }
+    appendSystemEvent("auth,user_delete," + username);
+    server.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+
+  if (!createOrUpdateUser(username, password, role, enabled)) {
+    server.send(400, "application/json", "{\"error\":\"user_save_failed\"}");
+    return;
+  }
+  appendSystemEvent("auth,user_save," + username + "," + roleToString(role));
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleApiStatus() {
@@ -4651,6 +5671,43 @@ void handleApiOutput() {
   if (channel == LIGHT_OUTPUT_CHANNEL) {
     resp["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
   }
+  String out;
+  serializeJson(resp, out);
+  server.send(ok ? 200 : 500, "application/json", out);
+}
+
+void handleApiValve() {
+  const String body = server.arg("plain");
+  if (body.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"missing_body\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, body);
+  if (error) {
+    server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    return;
+  }
+
+  const int index = doc["index"] | -1;
+  if (index < 0 || index >= PNEUMATIC_VALVE_COUNT) {
+    server.send(400, "application/json", "{\"error\":\"invalid_valve\"}");
+    return;
+  }
+
+  if (activePneumaticValveIndex < PNEUMATIC_VALVE_COUNT) {
+    server.send(409, "application/json", "{\"error\":\"valve_busy\"}");
+    return;
+  }
+
+  const bool ok = startPneumaticValve(static_cast<uint8_t>(index));
+  JsonDocument resp;
+  resp["ok"] = ok;
+  resp["index"] = index;
+  resp["output_channel"] = PNEUMATIC_VALVE_OUTPUTS[index];
+  resp["pulse_ms"] = PNEUMATIC_VALVE_PULSE_MS;
+  resp["active_index"] = activePneumaticValveIndex < PNEUMATIC_VALVE_COUNT ? activePneumaticValveIndex : -1;
   String out;
   serializeJson(resp, out);
   server.send(ok ? 200 : 500, "application/json", out);
@@ -5482,6 +6539,7 @@ void setup() {
   loadLiftAutoStopDelay();
   loadUploadConfig();
   loadDeviceConfig();
+  loadUsersFromPreferences();
   bootCounter = preferences.getUInt("boot_counter", 0) + 1;
   tripCounter = preferences.getUInt("trip_counter", 0);
   preferences.putUInt("boot_counter", bootCounter);
@@ -5494,49 +6552,59 @@ void setup() {
   startEthernet();
   initDigitalOutputs();
 
+  const char *headerKeys[] = {"Cookie", "User-Agent", "X-Device-Binding", "X-Session-Token"};
+  server.collectHeaders(headerKeys, sizeof(headerKeys) / sizeof(headerKeys[0]));
+
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/camera/1/substream", HTTP_GET, []() { handleCameraProxy(0, HIKVISION_CAMERA_SUB_STREAM_PATH); });
-  server.on("/camera/1/mainstream", HTTP_GET, []() { handleCameraProxy(0, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
-  server.on("/camera/2/substream", HTTP_GET, []() { handleCameraProxy(1, HIKVISION_CAMERA_SUB_STREAM_PATH); });
-  server.on("/camera/2/mainstream", HTTP_GET, []() { handleCameraProxy(1, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
-  server.on("/camera/3/substream", HTTP_GET, []() { handleCameraProxy(2, HIKVISION_CAMERA_SUB_STREAM_PATH); });
-  server.on("/camera/3/mainstream", HTTP_GET, []() { handleCameraProxy(2, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
-  server.on("/camera/4/substream", HTTP_GET, []() { handleCameraProxy(3, HIKVISION_CAMERA_SUB_STREAM_PATH); });
-  server.on("/camera/4/mainstream", HTTP_GET, []() { handleCameraProxy(3, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
-  server.on("/api/status", HTTP_GET, handleApiStatus);
-  server.on("/api/rs485-scan", HTTP_GET, handleApiRs485Scan);
-  server.on("/api/rs485-address-scan", HTTP_GET, handleApiRs485AddressScan);
-  server.on("/api/rs485-register-scan", HTTP_GET, handleApiRs485RegisterScan);
-  server.on("/api/camera-test", HTTP_GET, handleApiCameraTest);
-  server.on("/api/alarm/ack", HTTP_POST, handleApiAlarmAck);
-  server.on("/api/channel-name", HTTP_POST, handleApiChannelName);
-  server.on("/api/crop", HTTP_POST, handleApiCrop);
-  server.on("/api/field", HTTP_POST, handleApiField);
-  server.on("/api/sensitivity", HTTP_POST, handleApiSensitivity);
-  server.on("/api/lift-autostop", HTTP_POST, handleApiLiftAutoStop);
-  server.on("/api/camera-settings", HTTP_POST, handleApiCameraSettings);
-  server.on("/api/recording", HTTP_POST, handleApiRecording);
-  server.on("/api/output", HTTP_POST, handleApiOutput);
-  server.on("/api/track", HTTP_GET, handleApiTrack);
-  server.on("/api/gps-log.csv", HTTP_GET, handleApiGpsLogCsv);
-  server.on("/api/gps-log.geojson", HTTP_GET, handleApiGpsLogGeoJson);
-  server.on("/api/main-events.csv", HTTP_GET, handleApiMainEventsCsv);
-  server.on("/api/main-events.geojson", HTTP_GET, handleApiMainEventsGeoJson);
-  server.on("/api/sensor-events.csv", HTTP_GET, handleApiSensorEventsCsv);
-  server.on("/api/sensor-events.txt", HTTP_GET, handleApiSensorEventsTxt);
-  server.on("/api/combined.geojson", HTTP_GET, handleApiCombinedGeoJson);
-  server.on("/api/archive", HTTP_GET, handleApiArchive);
-  server.on("/api/archive/download", HTTP_GET, handleApiArchiveDownload);
-  server.on("/api/system-events.log", HTTP_GET, handleApiSystemEvents);
-  server.on("/api/gps-log/clear", HTTP_POST, handleApiGpsLogClear);
-  server.on("/api/crops", HTTP_GET, handleApiCrops);
-  server.on("/api/crops", HTTP_POST, handleApiCropsPost);
-  server.on("/api/device-config", HTTP_GET,  handleApiDeviceConfig);
-  server.on("/api/device-config", HTTP_POST, handleApiDeviceConfig);
-  server.on("/api/lift-confirm", HTTP_POST, handleApiLiftConfirm);
-  server.on("/api/upload-config", HTTP_GET, handleApiUploadConfig);
-  server.on("/api/upload-config", HTTP_POST, handleApiUploadConfig);
-  server.on("/api/upload-now", HTTP_POST, handleApiUploadNow);
+  server.on("/api/session", HTTP_GET, handleApiSession);
+  server.on("/api/login", HTTP_POST, handleApiLogin);
+  server.on("/api/bootstrap", HTTP_POST, handleApiBootstrap);
+  server.on("/api/logout", HTTP_POST, handleApiLogout);
+  server.on("/api/users", HTTP_GET, handleApiUsers);
+  server.on("/api/users", HTTP_POST, handleApiUsers);
+  registerProtectedRoute("/camera/1/substream", HTTP_GET, UserRole::Viewer, []() { handleCameraProxy(0, HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  registerProtectedRoute("/camera/1/mainstream", HTTP_GET, UserRole::Viewer, []() { handleCameraProxy(0, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
+  registerProtectedRoute("/camera/2/substream", HTTP_GET, UserRole::Viewer, []() { handleCameraProxy(1, HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  registerProtectedRoute("/camera/2/mainstream", HTTP_GET, UserRole::Viewer, []() { handleCameraProxy(1, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
+  registerProtectedRoute("/camera/3/substream", HTTP_GET, UserRole::Viewer, []() { handleCameraProxy(2, HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  registerProtectedRoute("/camera/3/mainstream", HTTP_GET, UserRole::Viewer, []() { handleCameraProxy(2, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
+  registerProtectedRoute("/camera/4/substream", HTTP_GET, UserRole::Viewer, []() { handleCameraProxy(3, HIKVISION_CAMERA_SUB_STREAM_PATH); });
+  registerProtectedRoute("/camera/4/mainstream", HTTP_GET, UserRole::Viewer, []() { handleCameraProxy(3, HIKVISION_CAMERA_MAIN_STREAM_PATH); });
+  registerProtectedRoute("/api/status", HTTP_GET, UserRole::Viewer, handleApiStatus);
+  registerProtectedRoute("/api/rs485-scan", HTTP_GET, UserRole::Operator, handleApiRs485Scan);
+  registerProtectedRoute("/api/rs485-address-scan", HTTP_GET, UserRole::Operator, handleApiRs485AddressScan);
+  registerProtectedRoute("/api/rs485-register-scan", HTTP_GET, UserRole::Operator, handleApiRs485RegisterScan);
+  registerProtectedRoute("/api/camera-test", HTTP_GET, UserRole::Operator, handleApiCameraTest);
+  registerProtectedRoute("/api/alarm/ack", HTTP_POST, UserRole::Operator, handleApiAlarmAck);
+  registerProtectedRoute("/api/channel-name", HTTP_POST, UserRole::Operator, handleApiChannelName);
+  registerProtectedRoute("/api/crop", HTTP_POST, UserRole::Operator, handleApiCrop);
+  registerProtectedRoute("/api/field", HTTP_POST, UserRole::Operator, handleApiField);
+  registerProtectedRoute("/api/sensitivity", HTTP_POST, UserRole::Operator, handleApiSensitivity);
+  registerProtectedRoute("/api/lift-autostop", HTTP_POST, UserRole::Operator, handleApiLiftAutoStop);
+  registerProtectedRoute("/api/camera-settings", HTTP_POST, UserRole::Admin, handleApiCameraSettings);
+  registerProtectedRoute("/api/recording", HTTP_POST, UserRole::Operator, handleApiRecording);
+  registerProtectedRoute("/api/output", HTTP_POST, UserRole::Operator, handleApiOutput);
+  registerProtectedRoute("/api/valve", HTTP_POST, UserRole::Operator, handleApiValve);
+  registerProtectedRoute("/api/track", HTTP_GET, UserRole::Viewer, handleApiTrack);
+  registerProtectedRoute("/api/gps-log.csv", HTTP_GET, UserRole::Viewer, handleApiGpsLogCsv);
+  registerProtectedRoute("/api/gps-log.geojson", HTTP_GET, UserRole::Viewer, handleApiGpsLogGeoJson);
+  registerProtectedRoute("/api/main-events.csv", HTTP_GET, UserRole::Viewer, handleApiMainEventsCsv);
+  registerProtectedRoute("/api/main-events.geojson", HTTP_GET, UserRole::Viewer, handleApiMainEventsGeoJson);
+  registerProtectedRoute("/api/sensor-events.csv", HTTP_GET, UserRole::Viewer, handleApiSensorEventsCsv);
+  registerProtectedRoute("/api/sensor-events.txt", HTTP_GET, UserRole::Viewer, handleApiSensorEventsTxt);
+  registerProtectedRoute("/api/combined.geojson", HTTP_GET, UserRole::Viewer, handleApiCombinedGeoJson);
+  registerProtectedRoute("/api/archive", HTTP_GET, UserRole::Viewer, handleApiArchive);
+  registerProtectedRoute("/api/archive/download", HTTP_GET, UserRole::Viewer, handleApiArchiveDownload);
+  registerProtectedRoute("/api/system-events.log", HTTP_GET, UserRole::Admin, handleApiSystemEvents);
+  registerProtectedRoute("/api/gps-log/clear", HTTP_POST, UserRole::Admin, handleApiGpsLogClear);
+  registerProtectedRoute("/api/crops", HTTP_GET, UserRole::Viewer, handleApiCrops);
+  registerProtectedRoute("/api/crops", HTTP_POST, UserRole::Operator, handleApiCropsPost);
+  registerProtectedRoute("/api/device-config", HTTP_GET, UserRole::Viewer, handleApiDeviceConfig);
+  registerProtectedRoute("/api/device-config", HTTP_POST, UserRole::Admin, handleApiDeviceConfig);
+  registerProtectedRoute("/api/lift-confirm", HTTP_POST, UserRole::Operator, handleApiLiftConfirm);
+  registerProtectedRoute("/api/upload-config", HTTP_GET, UserRole::Admin, handleApiUploadConfig);
+  registerProtectedRoute("/api/upload-config", HTTP_POST, UserRole::Admin, handleApiUploadConfig);
+  registerProtectedRoute("/api/upload-now", HTTP_POST, UserRole::Operator, handleApiUploadNow);
   server.onNotFound([]() {
     server.send(404, "application/json", "{\"error\":\"not_found\"}");
   });
@@ -5553,6 +6621,7 @@ void loop() {
   readDigitalInputs();
   pollGnss();
   updateGnssHealthAndRecording();
+  updatePneumaticValves();
   server.handleClient();
   if (recordingActive && millis() - lastFileFlushMs >= FILE_FLUSH_INTERVAL_MS) {
     flushPersistentGpsBuffer();

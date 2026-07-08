@@ -29,7 +29,9 @@ API: http://192.168.4.1/api/status
 - Hauptsignal-Erkennung mit konfigurierbarer Empfindlichkeit
 - Alarmton im Tablet-/Smartphone-Browser mit Quittierung
 - Lichtausgang direkt auf der Mainpage schaltbar
-- Pneumatikventile auf Ausgang `DO2..DO5` direkt auf der Mainpage schaltbar
+- Pneumatikventile auf Ausgang `DO5..DO8` direkt auf der Mainpage schaltbar
+- Pneumatikventile schalten als 5-Sekunden-Puls; waehrenddessen sind die
+  anderen Ventile gesperrt
 - Fahrtaufzeichnung mit Ebyte EWD108-GN05(485) per RS485/Modbus RTU
 - Auto-Start der Fahrtaufzeichnung nach stabilem GNSS-Fix
 - Fahrtarchiv in LittleFS
@@ -283,12 +285,15 @@ Der elektronische DI/DO-Schaltplan liegt als HTML-Datei unter
 Er ist auf E3F-DS30C4 Sensoren, ein 12V-Lichtrelais, EWD108-GN05(485)
 GNSS und Heschen 3V210-08 DC12V Pneumatikventile ausgelegt.
 
+Das Betriebshandbuch mit Bedienung, Anschlussbeschreibung und Fehlersuche liegt
+unter [`docs/betriebshandbuch.md`](docs/betriebshandbuch.md).
+
 | Klemme | Funktion | Bemerkung |
 |--------|----------|-----------|
 | DO1 | Licht | Schaltet den Lichtausgang der Maschine |
-| DO2 | Pneumatikventil 1 | Ventilgruppe/Sensorbereich 1 |
-| DO3 | Pneumatikventil 2 | Ventilgruppe/Sensorbereich 2 |
-| DO4 | Pneumatikventil 3 | Ventilgruppe/Sensorbereich 3 |
+| DO8 | Pneumatikventil 1 | Ventilgruppe/Sensorbereich 1 |
+| DO7 | Pneumatikventil 2 | Ventilgruppe/Sensorbereich 2 |
+| DO6 | Pneumatikventil 3 | Ventilgruppe/Sensorbereich 3 |
 | DO5 | Pneumatikventil 4 | Ventilgruppe/Sensorbereich 4 |
 | DI1 | Sensor 1 | Saat-/Durchflussueberwachung |
 | DI2 | Sensor 2 | Saat-/Durchflussueberwachung |
@@ -310,13 +315,14 @@ DI aktiv ab 1,5 s                -> Status Erkannt / Hauptsignal
 Konfiguration in `src/main.cpp`:
 
 ```cpp
-static constexpr bool DO_ACTIVE_HIGH = true;
+static constexpr bool DEFAULT_DO_ACTIVE_HIGH = false;
+static constexpr bool LIGHT_DO_ACTIVE_HIGH = true;
 static constexpr bool INPUT_ACTIVE_HIGH = false;
 static constexpr bool MIRROR_RED_TO_OUTPUT = true;
 static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
 ```
 
-`DO2..DO5` sind fuer Pneumatikventile reserviert und werden nicht automatisch
+`DO5..DO8` sind fuer Pneumatikventile reserviert und werden nicht automatisch
 durch Hauptsignale gespiegelt.
 
 ## API
@@ -344,6 +350,7 @@ http://192.168.4.1
 | `/api/sensitivity` | POST | Hauptsignal-Haltezeit speichern |
 | `/api/recording` | POST | Aufzeichnung starten/stoppen |
 | `/api/output` | POST | Ausgang schalten |
+| `/api/valve` | POST | Pneumatikventil fuer 5 Sekunden schalten |
 | `/api/track` | GET | kompakte Live-Fahrt |
 | `/api/gps-log.csv` | GET | GPS-Live-Log als CSV |
 | `/api/gps-log.geojson` | GET | GPS-Live-Log als GeoJSON |
