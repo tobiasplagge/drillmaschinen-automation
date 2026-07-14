@@ -3,7 +3,7 @@
 Firmware fuer das Waveshare ESP32-S3-POE-ETH-8DI-8DO Board zur
 Ueberwachung einer Drillmaschine.
 
-Aktuelle Firmware-Version: **2.2.0**
+Aktuelle Firmware-Version: **2.5.0**
 
 ## Kurzueberblick
 
@@ -213,8 +213,9 @@ Automatik:
 
 - Sobald ein GNSS-Fix mindestens 3 Sekunden stabil ist, startet die
   Fahrtaufzeichnung automatisch.
-- Eine manuell gestoppte Fahrt wird erst nach erneutem GNSS-Fix wieder
-  automatisch gestartet.
+- Eine manuell gestoppte Fahrt bleibt trotz Dauersignal `Hubwerk unten`
+  gestoppt. Erst `Hubwerk oben` entriegelt den Auto-Start fuer das naechste
+  Absenken.
 - GPS-Schreibzugriffe werden gepuffert und spaetestens alle 30 Sekunden in
   LittleFS geschrieben.
 
@@ -236,6 +237,23 @@ Im Webinterface unter **Dateien und Wartung** stehen bereit:
 - Sensorlog TXT
 - Neustart-Log
 - Fahrtarchiv
+
+## Portal-Upload ueber Tablet oder Mobiltelefon
+
+Der ESP32 greift nicht selbst auf das Internet zu. Die geoeffnete Bedienseite
+laedt die abgeschlossenen Fahrtdateien lokal vom ESP32 und sendet sie ueber die
+Internetverbindung des Tablets oder Mobiltelefons an das Portal.
+
+Unter **Einstellungen → Cloud-Upload** werden eingetragen:
+
+- Portal-URL mit Endung `/api/trips/upload`
+- Bearer-API-Token des Portals
+- optional `Automatisch nach Fahrtende hochladen`
+
+`Verbindung testen` prueft Portal und Token ohne Fahrt-Upload. Bei manuellem
+Fahrtende oder fehlgeschlagenem automatischem Upload zeigt ein Dialog die
+Fahrt-ID sowie GPS-, Sensor- und GeoJSON-Downloads. Fuer einen automatischen
+Upload muss die Bedienseite auf dem Mobilgeraet geoeffnet bleiben.
 
 Das Loeschen des Live-Logs ist waehrend einer aktiven Aufzeichnung gesperrt.
 Archivierte Fahrtdateien bleiben dabei erhalten.
@@ -291,6 +309,9 @@ unter [`docs/betriebshandbuch.md`](docs/betriebshandbuch.md).
 | Klemme | Funktion | Bemerkung |
 |--------|----------|-----------|
 | DO1 | Licht | Schaltet den Lichtausgang der Maschine |
+| DO2 | Reserve | Bleibt ausgeschaltet |
+| DO3 | Reserve | Bleibt ausgeschaltet |
+| DO4 | Lüfter | Automatisch ein über 43 °C, aus bei 41 °C |
 | DO8 | Pneumatikventil 1 | Ventilgruppe/Sensorbereich 1 |
 | DO7 | Pneumatikventil 2 | Ventilgruppe/Sensorbereich 2 |
 | DO6 | Pneumatikventil 3 | Ventilgruppe/Sensorbereich 3 |
@@ -316,13 +337,13 @@ Konfiguration in `src/main.cpp`:
 
 ```cpp
 static constexpr bool DEFAULT_DO_ACTIVE_HIGH = false;
-static constexpr bool LIGHT_DO_ACTIVE_HIGH = true;
+static constexpr bool LIGHT_DO_ACTIVE_HIGH = false;
 static constexpr bool INPUT_ACTIVE_HIGH = false;
-static constexpr bool MIRROR_RED_TO_OUTPUT = true;
+static constexpr bool MIRROR_RED_TO_OUTPUT = false;
 static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
 ```
 
-`DO5..DO8` sind fuer Pneumatikventile reserviert und werden nicht automatisch
+`DO4` ist fuer den Lüfter und `DO5..DO8` sind fuer Pneumatikventile reserviert. Sie werden nicht automatisch
 durch Hauptsignale gespiegelt.
 
 ## API

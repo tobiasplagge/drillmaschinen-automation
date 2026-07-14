@@ -37,9 +37,9 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 static constexpr uint8_t DEVICE_NAME_LENGTH = 64;
 static const char *DEVICE_ID_DEFAULT = "Rabe Megadrill 3000-01";
 char deviceName[DEVICE_NAME_LENGTH] = "Rabe Megadrill 3000-01";
-static const char *FIRMWARE_VERSION = "2.4.0";
+static const char *FIRMWARE_VERSION = "2.5.0";
 static const char *MODULE_ID = "M01";
-static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Raps\",\"Senf\",\"Mais\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
+static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Roggen\",\"Hafer\",\"Dinkel\",\"Triticale\",\"Raps\",\"Mais\",\"Senf\",\"Pfeffer\",\"Hirse\",\"Buchweizen\",\"Erbsen\",\"Ackerbohnen\",\"Soja\",\"Sonnenblumen\",\"Lein\",\"Luzerne\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
 // Häufige Varianten sind /ISAPI/Streaming/channels/101/httpPreview für Mainstream
 // oder /ISAPI/Streaming/channels/102/httpPreview für Substream.
@@ -84,6 +84,7 @@ static constexpr uint32_t FILE_FLUSH_INTERVAL_MS = 30000;
 static constexpr uint32_t SESSION_TTL_MS = 8UL * 60UL * 60UL * 1000UL;
 static constexpr uint8_t MAX_USERS = 8;
 static constexpr uint8_t MAX_SESSIONS = 4;
+static constexpr bool AUTHENTICATION_REQUIRED = false;
 static constexpr uint8_t WATCHDOG_TIMEOUT_SECONDS = 8;
 static constexpr uint16_t GPS_LOG_TARGET_CAPACITY = 5000;
 static constexpr uint16_t MAIN_EVENT_LOG_CAPACITY = 512;
@@ -121,10 +122,15 @@ static constexpr uint8_t GNSS_MODBUS_FUNCTION_READ_HOLDING = 0x03;
 // Waveshare examples initialize all outputs HIGH. Keep this configurable in
 // case your wiring expects the opposite logic.
 static constexpr bool DEFAULT_DO_ACTIVE_HIGH = false;
-static constexpr bool LIGHT_DO_ACTIVE_HIGH = true;
+static constexpr bool LIGHT_DO_ACTIVE_HIGH = false;
 static constexpr bool INPUT_ACTIVE_HIGH = false;
-static constexpr bool MIRROR_RED_TO_OUTPUT = true;
+// DO2 and DO3 are currently unused. No sensor state may switch them.
+static constexpr bool MIRROR_RED_TO_OUTPUT = false;
 static constexpr uint8_t LIGHT_OUTPUT_CHANNEL = 1;
+static constexpr uint8_t FAN_OUTPUT_CHANNEL = 4;
+static constexpr float FAN_ON_TEMPERATURE_C = 43.0f;
+static constexpr float FAN_OFF_TEMPERATURE_C = 41.0f;
+static constexpr uint32_t FAN_TEMPERATURE_CHECK_INTERVAL_MS = 2000;
 static constexpr uint8_t PNEUMATIC_VALVE_COUNT = 4;
 static constexpr uint8_t PNEUMATIC_VALVE_OUTPUTS[PNEUMATIC_VALVE_COUNT] = {8, 7, 6, 5};
 static constexpr uint32_t PNEUMATIC_VALVE_PULSE_MS = 5000;
@@ -256,6 +262,7 @@ uint8_t tcaOutputState = 0x00;
 bool doExpanderReady = false;
 uint8_t activePneumaticValveIndex = 255;
 uint32_t pneumaticValveOffAtMs = 0;
+uint32_t lastFanTemperatureCheckMs = 0;
 uint32_t lastDebugMs = 0;
 uint32_t bootCounter = 0;
 uint32_t tripCounter = 0;
@@ -267,6 +274,7 @@ uint32_t cachedFsUsedBytes = 0;
 uint32_t cachedFsTotalBytes = 0;
 bool autoStartEnabled = true;
 bool autoStartArmed = true;
+bool manualAutoStartLock = false;
 uint32_t liftAutoStopDelayMs = DEFAULT_LIFT_AUTO_STOP_DELAY_MS;
 uint32_t liftRaisedSinceMs = 0;
 String persistentGpsBuffer;
@@ -373,9 +381,9 @@ int8_t pneumaticValveIndexForOutput(uint8_t outputChannel) {
 }
 
 uint8_t tcaBitForOutputChannel(uint8_t outputChannel) {
-  // The Waveshare terminal labels DO1..DO8 are wired in reverse order on the
-  // TCA9554 expander: DO1 is bit 7, DO8 is bit 0.
-  return CHANNEL_COUNT - outputChannel;
+  // Waveshare terminal labels map directly to the TCA9554 bits:
+  // DO1 is bit 0, DO2 is bit 1, ... DO8 is bit 7.
+  return outputChannel - 1;
 }
 
 bool isRotationChannel(uint8_t channelIndex) {
@@ -751,6 +759,14 @@ void expireSession(SessionState &session) {
 
 bool authorize(UserRole minimumRole) {
   resetActiveSession();
+  if (!AUTHENTICATION_REQUIRED) {
+    activeSession.active = true;
+    strncpy(activeSession.username, "Lokal", sizeof(activeSession.username) - 1);
+    activeSession.role = UserRole::Admin;
+    activeSession.expiresAtMs = millis() + SESSION_TTL_MS;
+    activeSessionValid = true;
+    return true;
+  }
   SessionState *session = findSessionByRequest();
   if (!session) {
     server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
@@ -1578,7 +1594,17 @@ void updateGnssHealthAndRecording() {
   if (gnss.lastFixMs == 0 || now - gnss.lastFixMs > GNSS_STALE_MS) {
     gnss.fix = false;
     gnss.fixAvailableSinceMs = 0;
-    autoStartArmed = true;
+    if (!manualAutoStartLock) autoStartArmed = true;
+  }
+  // Nach einem manuellen Stopp darf ein dauerhaftes Hubwerk-unten-Signal die
+  // Aufzeichnung nicht erneut starten. Erst Hubwerk oben gibt den Auto-Start
+  // für das nächste Absenken wieder frei.
+  if (manualAutoStartLock) {
+    autoStartArmed = false;
+    if (liftIsUp()) {
+      manualAutoStartLock = false;
+      autoStartArmed = true;
+    }
   }
   if (recordingActive) {
     if (liftIsUp()) {
@@ -1671,7 +1697,7 @@ void finishSensorTriggerEvent(uint8_t channelIndex) {
 
   if (recordingActive && tripSensorPath[0] != '\0') {
     String line = String(event.startUptimeMs) + "," + String(event.endUptimeMs) + "," +
-                  String(event.durationMs) + "," + String(event.channel) + "," +
+                  String(event.durationMs) + "," + String(event.durationMs / 1000.0f, 2) + "," + String(event.channel) + "," +
                   event.channelName + "," + event.crop + "," + fieldName + ",";
     if (event.startHasGps) {
       line += String(event.startLatitude, 7) + "," + String(event.startLongitude, 7);
@@ -1718,7 +1744,7 @@ void createTripFiles() {
   LittleFS.remove(tripSensorPath);
   LittleFS.remove(tripMetaPath);
   appendFile(tripGpsPath, "uptime_ms,crop_name,field_name,latitude,longitude,accuracy_m,speed_mps,heading_deg,satellites,live_mask,main_mask\n");
-  appendFile(tripSensorPath, "start_uptime_ms,end_uptime_ms,duration_ms,channel,channel_name,crop_name,field_name,start_latitude,start_longitude,end_latitude,end_longitude\n");
+  appendFile(tripSensorPath, "start_uptime_ms,end_uptime_ms,duration_ms,duration_s,channel,channel_name,crop_name,field_name,start_latitude,start_longitude,end_latitude,end_longitude\n");
   // Write initial metadata as JSON (will be overwritten with final values on stopRecording)
   JsonDocument metaDoc;
   metaDoc["trip_id"] = tripId;
@@ -1760,6 +1786,7 @@ void startRecording(const char *source) {
   persistentGpsBuffer = "";
   lastFileFlushMs = millis();
   recordingActive = true;
+  if (strcmp(source, "manual") == 0) manualAutoStartLock = false;
   autoStartArmed = false;
   appendSystemEvent("recording_start," + String(source) + "," + tripId);
   for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
@@ -1808,15 +1835,11 @@ void stopRecording(const char *source) {
     liftAutoStopTripId[TRIP_ID_LENGTH - 1] = '\0';
   }
   if (strcmp(source, "manual") == 0) {
+    manualAutoStartLock = true;
     autoStartArmed = false;
   }
-  if (autoUpload) {
-    strncpy(pendingUploadTripId, tripId, TRIP_ID_LENGTH - 1);
-    pendingUploadTripId[TRIP_ID_LENGTH - 1] = '\0';
-    pendingUpload = true;
-    uploadRetryCount = 0;
-    uploadRetryNextMs = millis() + 2000;
-  }
+  // Der Browser auf Tablet/Telefon übernimmt den Portal-Upload. Der ESP32
+  // stellt dafür nur die lokal gespeicherten Fahrtdateien bereit.
   Serial.printf("Fahrtaufzeichnung beendet: %s (%s)\n", tripId, source);
 }
 
@@ -1894,6 +1917,20 @@ void updatePneumaticValves() {
   setDigitalOutput(outputChannel - 1, false);
   activePneumaticValveIndex = 255;
   pneumaticValveOffAtMs = 0;
+}
+
+void updateFanTemperatureControl() {
+  const uint32_t now = millis();
+  if (now - lastFanTemperatureCheckMs < FAN_TEMPERATURE_CHECK_INTERVAL_MS) {
+    return;
+  }
+  lastFanTemperatureCheckMs = now;
+  const float temperatureC = temperatureRead();
+  if (!channels[FAN_OUTPUT_CHANNEL - 1].output && temperatureC > FAN_ON_TEMPERATURE_C) {
+    setDigitalOutput(FAN_OUTPUT_CHANNEL - 1, true);
+  } else if (channels[FAN_OUTPUT_CHANNEL - 1].output && temperatureC <= FAN_OFF_TEMPERATURE_C) {
+    setDigitalOutput(FAN_OUTPUT_CHANNEL - 1, false);
+  }
 }
 
 void initDigitalOutputs() {
@@ -1981,7 +2018,7 @@ void readDigitalInputs() {
     }
     channels[i].status = isRotationChannel(i) ? (rotationMoving(now) ? "rotating" : "stopped") : (mainSignal ? "red" : "none");
 
-    if (seedChannel && i != LIGHT_OUTPUT_CHANNEL - 1 && !isPneumaticValveOutput(i + 1)) {
+    if (seedChannel && i != LIGHT_OUTPUT_CHANNEL - 1 && i != FAN_OUTPUT_CHANNEL - 1 && !isPneumaticValveOutput(i + 1)) {
       const bool outputOn = MIRROR_RED_TO_OUTPUT && mainSignal;
       if (channels[i].output != outputOn) {
         setDigitalOutput(i, outputOn);
@@ -2044,6 +2081,11 @@ String statusJson() {
   doc["light_channel"] = LIGHT_OUTPUT_CHANNEL;
   doc["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
   doc["light_switchable"] = doExpanderReady;
+  doc["fan_channel"] = FAN_OUTPUT_CHANNEL;
+  doc["fan_on"] = channels[FAN_OUTPUT_CHANNEL - 1].output;
+  doc["fan_switchable"] = doExpanderReady;
+  doc["fan_on_temperature_c"] = FAN_ON_TEMPERATURE_C;
+  doc["fan_off_temperature_c"] = FAN_OFF_TEMPERATURE_C;
   doc["do_expander_ready"] = doExpanderReady;
   doc["do_output_register"] = tcaOutputState;
   uint8_t doReadback = 0;
@@ -2065,6 +2107,7 @@ String statusJson() {
   liftJson["auto_stop_remaining_ms"] = liftAutoStopRemainingMs(now);
   liftJson["auto_stop_timer_active"] = recordingActive && liftIsUp() && liftRaisedSinceMs > 0;
   liftJson["auto_start_ready"] = autoStartEnabled && autoStartArmed && liftIsDown() && gnss.fix;
+  liftJson["auto_start_manual_lock"] = manualAutoStartLock;
   doc["lift_confirm_pending"] = liftAutoStopPendingConfirm;
   if (liftAutoStopPendingConfirm) doc["lift_confirm_trip_id"] = liftAutoStopTripId;
   JsonArray valves = doc["pneumatic_valves"].to<JsonArray>();
@@ -2273,6 +2316,11 @@ const char* htmlPage() {
     .panel h2 { margin: 0 0 10px; font-size: 1rem; }
     .settings-box { min-width: 0; border: 1px solid #374151; border-radius: 8px; background: #111827; padding: 14px; margin: 0 0 14px; }
     .settings-box h3 { margin: 0 0 10px; font-size: .98rem; }
+    .admin-section { min-width: 0; margin: 0 0 10px; border: 1px solid #374151; border-radius: 8px; background: #111827; padding: 0; }
+    .admin-section > summary { padding: 13px 14px; color: #f9fafb; font-size: .98rem; font-weight: 800; list-style-position: inside; }
+    .admin-section[open] > summary { border-bottom: 1px solid #374151; }
+    .admin-section-content { min-width: 0; padding: 14px; }
+    .admin-section-content > .field-row:last-child { margin-bottom: 0; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .actions > * { max-width: 100%; }
     .tools-details { margin-top: 12px; }
@@ -2319,10 +2367,11 @@ const char* htmlPage() {
     .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
     .tab-button { background: #374151; }
     .tab-button.active { background: #2563eb; }
-    .nav-action { background: #4b5563; }
+    .nav-action { min-height: 40px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 6px; background: #4b5563; color: white; padding: 9px 12px; font: inherit; font-weight: 750; white-space: nowrap; box-sizing: border-box; }
     .nav-action.light-on { background: #16a34a; color: #f0fdf4; }
     .nav-action.light-off { background: #991b1b; color: #fef2f2; }
     .nav-action.light-unknown { background: #f59e0b; color: #111827; }
+    .nav-action.fan-on { background: #16a34a; color: #f0fdf4; }
     .valve-panel { margin-bottom: 14px; }
     .valve-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
     .valve-button { background: #374151; display: grid; gap: 2px; }
@@ -2379,7 +2428,7 @@ const char* htmlPage() {
   </style>
 </head>
 <body>
-  <div id="authOverlay" class="auth-overlay">
+  <div id="authOverlay" class="auth-overlay hidden">
     <div class="auth-card">
       <h2 id="authTitle">Anmeldung</h2>
       <p id="authHint">Bitte mit einem berechtigten Benutzer anmelden.</p>
@@ -2418,6 +2467,7 @@ const char* htmlPage() {
       <button id="monitoringTab" class="tab-button active" type="button">Überwachung</button>
       <button id="mapTab" class="tab-button" type="button">Karte</button>
       <button id="lightOn" class="nav-action light-unknown" type="button">Licht</button>
+      <span id="fanStatus" class="nav-action secondary">Lüfter aus</span>
       <button id="alarmEnable" class="nav-action secondary" type="button">Ton aktivieren</button>
       <button id="alarmAck" class="nav-action secondary" type="button">Alarm quittieren</button>
       <button id="settingsTab" class="tab-button" type="button">Einstellungen</button>
@@ -2468,16 +2518,17 @@ const char* htmlPage() {
         <span id="trackInfo">Warte auf GNSS-Daten</span>
       </div>
     </section>
-    <section class="panel settings-only">
-      <h2>Saat</h2>
+    <section class="panel monitoring-view">
+      <h2>Was wird gedrillt?</h2>
       <div class="field-row">
         <input id="fieldInput" maxlength="31" value="Feld" placeholder="Feldname">
         <button id="fieldSave" type="button">Feld speichern</button>
       </div>
       <div class="field-row">
-        <input id="cropInput" list="cropSuggestions" maxlength="23" value="Weizen">
-        <datalist id="cropSuggestions"></datalist>
-        <button id="cropSave" type="button">Speichern</button>
+        <select id="cropInput" aria-label="Saat auswählen">
+          <option value="">Saat auswählen …</option>
+        </select>
+        <button id="cropSave" type="button">Auswahl speichern</button>
       </div>
       <div id="cropQuickList" class="crop-chip-row"></div>
       <div class="gps-meta">
@@ -2487,8 +2538,9 @@ const char* htmlPage() {
     </section>
     <section id="settingsView" class="panel hidden">
       <h2>Fehleranalyse & Einstellungen</h2>
-      <div id="userAdminPanel" class="settings-box">
-        <h3>Benutzerverwaltung</h3>
+      <details id="userAdminPanel" class="admin-section">
+        <summary>Benutzerverwaltung</summary>
+        <div class="admin-section-content">
         <div class="gps-meta" id="sessionInfo"></div>
         <div class="user-admin-grid" style="margin-top:10px;">
           <input id="userFormUsername" maxlength="31" placeholder="Benutzername">
@@ -2509,26 +2561,29 @@ const char* htmlPage() {
         </div>
         <div id="userAdminStatus" class="error" style="margin-top:10px;"></div>
         <div id="userList" class="user-admin-list"></div>
-      </div>
-      <div class="field-row">
-        <div style="min-width:0;">
-          <h3>Kameras</h3>
+        </div>
+      </details>
+      <details class="admin-section">
+        <summary>Kameras</summary>
+        <div class="admin-section-content">
           <div id="cameraSettingsGrid" class="camera-settings-grid"></div>
         </div>
-      </div>
-      <div class="settings-only">
-        <h3>Kanaldetails</h3>
+      </details>
+      <details class="admin-section settings-only">
+        <summary>Kanaldetails</summary>
+        <div class="admin-section-content">
         <div id="sensorDetailsGrid" class="sensor-table"></div>
-      </div>
-      <div class="field-row">
-        <div style="min-width:0;">
-          <h3>Systemauslastung</h3>
+        </div>
+      </details>
+      <details class="admin-section">
+        <summary>Systemauslastung</summary>
+        <div class="admin-section-content">
           <div id="systemLoadGrid" class="sensor-table"></div>
         </div>
-      </div>
-      <div class="field-row">
-        <div style="min-width:0;">
-          <h3>Empfindlichkeit</h3>
+      </details>
+      <details class="admin-section" open>
+        <summary>Empfindlichkeit</summary>
+        <div class="admin-section-content">
           <div class="field-row">
             <input id="sensitivityInput" type="number" min="300" max="10000" step="100" value="1500">
             <button id="sensitivitySave" type="button">Speichern</button>
@@ -2538,10 +2593,10 @@ const char* htmlPage() {
             <div>Rot/Alarm ab: <strong id="redSignalCurrent">-</strong></div>
           </div>
         </div>
-      </div>
-      <div class="field-row">
-        <div style="min-width:0;">
-          <h3>Hubwerk (ISO 11786 PIN 5 · DI7)</h3>
+      </details>
+      <details class="admin-section" open>
+        <summary>Hubwerk (ISO 11786 PIN 5 · DI7)</summary>
+        <div class="admin-section-content">
           <div class="gps-meta">
             <div>Position: <strong id="liftStatusSettings">-</strong></div>
             <div>Auto-Stop nach Ausheben nach: <strong id="liftAutoStopCurrent">-</strong></div>
@@ -2552,10 +2607,10 @@ const char* htmlPage() {
           </div>
           <div class="gps-meta" style="color:#9ca3af;font-size:.82rem;">0 ms = kein Auto-Stop · Wert in Millisekunden</div>
         </div>
-      </div>
-      <div class="field-row">
-        <div style="min-width:0;">
-          <h3>GNSS Diagnose</h3>
+      </details>
+      <details class="admin-section">
+        <summary>GNSS-Diagnose</summary>
+        <div class="admin-section-content">
           <div class="rs485-test-panel">
             <div class="actions">
               <button id="rs485Test" class="secondary" type="button">RS485 Test starten</button>
@@ -2572,30 +2627,30 @@ const char* htmlPage() {
           </div>
           <pre id="gnssDebug" style="white-space:pre-wrap; font-size:.85rem; color:#d1d5db;"></pre>
         </div>
-      </div>
-      <div class="field-row">
-        <div style="min-width:0;">
-          <h3>Saat-Vorschläge verwalten</h3>
+      </details>
+      <details id="cropAdminPanel" class="admin-section">
+        <summary>Saat-Vorschläge verwalten</summary>
+        <div class="admin-section-content">
           <div style="display:flex;gap:8px;margin-bottom:8px;">
             <input id="cropAddInput" placeholder="Neue Saat hinzufügen" style="flex:1; height:36px;" />
             <button id="cropAddBtn" class="secondary" type="button">Hinzufügen</button>
           </div>
           <div id="cropSuggestionsList" style="color:#d1d5db;font-size:.95rem;"></div>
         </div>
-      </div>
-      <div class="field-row">
-        <div style="min-width:0;">
-          <h3>Ger&auml;tename</h3>
+      </details>
+      <details class="admin-section" open>
+        <summary>Gerätename</summary>
+        <div class="admin-section-content">
           <div class="field-row" style="margin-bottom:6px;">
             <input id="deviceNameInput" maxlength="63" placeholder="z.B. Rabe Megadrill 3000-01" style="flex:1;" />
             <button id="deviceNameSave" type="button">Speichern</button>
           </div>
           <div class="gps-meta" id="deviceNameStatus"></div>
         </div>
-      </div>
-      <div class="field-row">
-        <div style="min-width:0;">
-          <h3>Cloud-Upload (Landmaschinenmanager)</h3>
+      </details>
+      <details class="admin-section">
+        <summary>Cloud-Upload (Landmaschinenmanager)</summary>
+        <div class="admin-section-content">
           <div class="field-row" style="margin-bottom:6px;">
             <input id="uploadUrlInput" placeholder="https://server/api/trips/upload" style="flex:1; min-width:220px;" />
           </div>
@@ -2610,14 +2665,15 @@ const char* htmlPage() {
           </div>
           <div class="actions">
             <button id="uploadConfigSave" type="button">Speichern</button>
+            <button id="uploadConfigTest" class="secondary" type="button">Verbindung testen</button>
             <button id="uploadNowBtn" class="secondary" type="button">Jetzt hochladen</button>
           </div>
           <div class="gps-meta" id="uploadConfigStatus"></div>
         </div>
-      </div>
-      <details>
+      </details>
+      <details class="admin-section">
         <summary>Dateien und Logs</summary>
-        <div class="actions">
+        <div class="admin-section-content actions">
           <a class="link-button secondary" href="/api/gps-log.csv">CSV</a>
           <a class="link-button secondary" href="/api/gps-log.geojson">GeoJSON</a>
           <a class="link-button secondary" href="/api/combined.geojson">Route + Sensoren</a>
@@ -2646,8 +2702,8 @@ const char* htmlPage() {
     </section>
     <div id="liftConfirmModal" class="modal-overlay hidden">
       <div class="modal-box">
-        <h3>Arbeit abgeschlossen?</h3>
-        <p>Das Hubwerk war l&auml;ngere Zeit oben – die Aufzeichnung wurde automatisch beendet.<br>
+        <h3 id="liftConfirmTitle">Fahrt abgeschlossen</h3>
+        <p><span id="liftConfirmMessage">Die Aufzeichnung wurde beendet und steht zum Download bereit.</span><br>
            Fahrt: <strong id="liftConfirmTripId">–</strong></p>
         <div class="actions">
           <button id="liftConfirmUploadBtn" type="button">&#8679; Jetzt hochladen</button>
@@ -2706,6 +2762,15 @@ const char* htmlPage() {
     let renderingGrid = false;
     let lightOnState = false;
     let lightSwitchable = false;
+    let fanOnState = false;
+    let fanSwitchable = false;
+    let portalUploadUrl = '';
+    let portalUploadToken = '';
+    let portalAutoUpload = false;
+    let browserUploadBusy = false;
+    let recordingStateKnown = false;
+    let lastRecordingActive = false;
+    let lastAutoUploadTripId = '';
     let cameraStreamModes = JSON.parse(localStorage.getItem('cameraStreamModes') || '{}');
     let trackBusy = false;
     let lastTrackData = { points: [], events: [], current: null };
@@ -2805,13 +2870,16 @@ const char* htmlPage() {
     function updateSessionPanel() {
       const sessionInfo = document.getElementById('sessionInfo');
       const userAdminPanel = document.getElementById('userAdminPanel');
+      const cropAdminPanel = document.getElementById('cropAdminPanel');
       if (!sessionInfo) return;
       if (!authState.loggedIn) {
         sessionInfo.innerHTML = '<div>Session: <strong>-</strong></div><div>Rolle: <strong>-</strong></div><div>Restlaufzeit: <strong>-</strong></div>';
         if (userAdminPanel) userAdminPanel.classList.add('hidden');
+        if (cropAdminPanel) cropAdminPanel.classList.add('hidden');
         return;
       }
       if (userAdminPanel) userAdminPanel.classList.toggle('hidden', authState.role !== 'admin');
+      if (cropAdminPanel) cropAdminPanel.classList.toggle('hidden', authState.role !== 'admin');
       sessionInfo.innerHTML = [
         `<div>Session: <strong>${escapeHtml(authState.username || '-')}</strong></div>`,
         `<div>Rolle: <strong>${escapeHtml(authState.role || '-')}</strong></div>`,
@@ -3041,6 +3109,14 @@ const char* htmlPage() {
         button.classList.add('light-off');
         button.title = 'Licht ist ausgeschaltet';
       }
+    }
+
+    function updateFanButton() {
+      const status = document.getElementById('fanStatus');
+      status.classList.toggle('fan-on', fanOnState);
+      status.classList.toggle('secondary', !fanOnState);
+      status.textContent = fanOnState ? 'Lüfter an' : 'Lüfter aus';
+      status.title = fanSwitchable ? 'Automatik: Ein über 43 °C, Aus bei 41 °C' : 'Lüfterausgang nicht erreichbar';
     }
 
     function updateValveButtons(valves) {
@@ -3956,6 +4032,9 @@ const char* htmlPage() {
         lightOnState = Boolean(data.light_on);
         lightSwitchable = Boolean(data.light_switchable);
         updateLightButton();
+        fanOnState = Boolean(data.fan_on);
+        fanSwitchable = Boolean(data.fan_switchable);
+        updateFanButton();
         updateValveButtons(data.pneumatic_valves || []);
         updateCamera(data);
         if (document.activeElement !== document.getElementById('sensitivityInput')) {
@@ -3986,6 +4065,14 @@ const char* htmlPage() {
         document.getElementById('sensorEventCount').textContent = `${data.sensor_event_count || 0} / ${data.sensor_event_capacity || 0}`;
         document.getElementById('gpsLast').textContent = data.last_gps_log_age_ms >= 0 ? data.last_gps_log_age_ms + ' ms' : '-';
         const recActive = Boolean(data.recording_active);
+        if (recordingStateKnown && lastRecordingActive && !recActive && portalAutoUpload && data.trip_id && data.trip_id !== lastAutoUploadTripId) {
+          lastAutoUploadTripId = data.trip_id;
+          uploadTripViaBrowser(data.trip_id, document.getElementById('uploadConfigStatus')).catch(err => {
+            showLiftConfirmModal(data.trip_id, 'auto_failed', err.message);
+          });
+        }
+        lastRecordingActive = recActive;
+        recordingStateKnown = true;
         const statusEl = document.getElementById('gpsStatus');
         statusEl.textContent = recActive ? 'Aktiv ●' : 'Gestoppt';
         const labelEl = document.getElementById('recStatusLabel');
@@ -4060,7 +4147,7 @@ const char* htmlPage() {
     }
 
     async function setRecording(active) {
-      if (actionBusy) return;
+      if (actionBusy) return false;
       actionBusy = true;
       try {
         const res = await fetchWithTimeout('/api/recording', {
@@ -4070,8 +4157,10 @@ const char* htmlPage() {
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         await refresh();
+        return true;
       } catch (err) {
         document.getElementById('gpsStatus').textContent = 'Schalten fehlgeschlagen';
+        return false;
       } finally {
         actionBusy = false;
       }
@@ -4081,8 +4170,12 @@ const char* htmlPage() {
       setRecording(true);
     }
 
-    function stopGps() {
-      setRecording(false);
+    async function stopGps() {
+      const stopped = await setRecording(false);
+      if (stopped) {
+        const tripId = (window.lastStatusData || {}).trip_id || '';
+        showLiftConfirmModal(tripId, 'manual');
+      }
     }
 
     async function clearGpsLog() {
@@ -4163,10 +4256,23 @@ const char* htmlPage() {
       } catch (e) {}
     }
 
-    function showLiftConfirmModal(tid) {
+    function showLiftConfirmModal(tid, reason = 'automatic', detail = '') {
       document.getElementById('liftConfirmTripId').textContent = tid || '–';
-      document.getElementById('liftConfirmStatus').textContent = '';
-      document.getElementById('liftConfirmDownload').classList.add('hidden');
+      const title = document.getElementById('liftConfirmTitle');
+      const message = document.getElementById('liftConfirmMessage');
+      const status = document.getElementById('liftConfirmStatus');
+      title.textContent = reason === 'manual' ? 'Aufzeichnung manuell beendet' : 'Aufzeichnung automatisch beendet';
+      if (reason === 'auto_failed') {
+        message.textContent = 'Keine Internetverbindung zum Portal. Die Fahrt steht zum Download bereit.';
+        status.textContent = detail ? 'Upload fehlgeschlagen: ' + detail : '';
+      } else if (reason === 'manual') {
+        message.textContent = 'Die Fahrt wurde gespeichert und steht zum Download oder Upload bereit.';
+        status.textContent = '';
+      } else {
+        message.textContent = 'Die Fahrt wurde automatisch beendet und steht zum Download oder Upload bereit.';
+        status.textContent = '';
+      }
+      document.getElementById('liftConfirmDownload').classList.remove('hidden');
       document.getElementById('liftConfirmModal').classList.remove('hidden');
       playConfirmBeep();
     }
@@ -4182,17 +4288,11 @@ const char* htmlPage() {
       document.getElementById('liftConfirmStatus').textContent = 'Upload wird gestartet …';
       document.getElementById('liftConfirmUploadBtn').disabled = true;
       try {
-        const res = await fetchWithTimeout('/api/upload-now', { method: 'POST' });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          document.getElementById('liftConfirmStatus').textContent = 'Upload nicht möglich (' + (data.error || 'HTTP ' + res.status) + ') – Daten herunterladen:';
-          document.getElementById('liftConfirmDownload').classList.remove('hidden');
-        } else {
-          document.getElementById('liftConfirmStatus').textContent = 'Upload gestartet.';
-          setTimeout(() => dismissLiftConfirm(), 2500);
-        }
+        const tripId = (window.lastStatusData || {}).lift_confirm_trip_id || (window.lastStatusData || {}).trip_id || '';
+        await uploadTripViaBrowser(tripId, document.getElementById('liftConfirmStatus'));
+        setTimeout(() => dismissLiftConfirm(), 2500);
       } catch (err) {
-        document.getElementById('liftConfirmStatus').textContent = 'Keine Verbindung zum Server – Daten herunterladen:';
+        document.getElementById('liftConfirmStatus').textContent = 'Upload fehlgeschlagen: ' + err.message + ' – Daten herunterladen:';
         document.getElementById('liftConfirmDownload').classList.remove('hidden');
       }
       document.getElementById('liftConfirmUploadBtn').disabled = false;
@@ -4236,6 +4336,9 @@ const char* htmlPage() {
         const res = await fetchWithTimeout('/api/upload-config');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
+        portalUploadUrl = data.upload_url || '';
+        portalUploadToken = data.upload_token || '';
+        portalAutoUpload = Boolean(data.auto_upload);
         if (document.activeElement !== document.getElementById('uploadUrlInput')) {
           document.getElementById('uploadUrlInput').value = data.upload_url || '';
         }
@@ -4259,21 +4362,116 @@ const char* htmlPage() {
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         document.getElementById('uploadTokenInput').value = '';
+        portalUploadUrl = url;
+        if (token.length > 0) portalUploadToken = token;
+        portalAutoUpload = autoUpload;
         document.getElementById('uploadConfigStatus').textContent = 'Gespeichert.';
       } catch (err) {
         document.getElementById('uploadConfigStatus').textContent = 'Speichern fehlgeschlagen';
       }
     }
 
-    async function triggerUploadNow() {
-      document.getElementById('uploadConfigStatus').textContent = 'Upload wird gestartet ...';
+    async function testUploadConfig() {
+      const target = document.getElementById('uploadConfigStatus');
+      const button = document.getElementById('uploadConfigTest');
+      const configuredUrl = document.getElementById('uploadUrlInput').value.trim() || portalUploadUrl;
+      const enteredToken = document.getElementById('uploadTokenInput').value;
+      const token = enteredToken || portalUploadToken;
+      if (!configuredUrl) {
+        target.textContent = 'Test fehlgeschlagen: Portal-URL fehlt.';
+        return;
+      }
+      if (!token) {
+        target.textContent = 'Test fehlgeschlagen: API-Token fehlt.';
+        return;
+      }
+      let testUrl;
       try {
-        const res = await fetchWithTimeout('/api/upload-now', { method: 'POST' });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
-        document.getElementById('uploadConfigStatus').textContent = 'Upload gestartet (Fahrt ' + (data.trip_id || '') + ').';
+        const url = new URL(configuredUrl);
+        if (!/\/api\/trips\/upload\/?$/.test(url.pathname)) throw new Error('URL muss mit /api/trips/upload enden');
+        url.pathname = url.pathname.replace(/\/api\/trips\/upload\/?$/, '/api/v1/trips');
+        url.search = '?limit=1';
+        testUrl = url.toString();
       } catch (err) {
-        document.getElementById('uploadConfigStatus').textContent = 'Upload fehlgeschlagen: ' + err.message;
+        target.textContent = 'Test fehlgeschlagen: ' + err.message;
+        return;
+      }
+      button.disabled = true;
+      target.textContent = 'Portal und API-Token werden geprüft ...';
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch(testUrl, {
+          headers: { 'Authorization': 'Bearer ' + token },
+          signal: controller.signal
+        });
+        const result = await response.json().catch(() => ({}));
+        if (response.status === 401 || response.status === 403) throw new Error('API-Token ungültig oder abgelaufen');
+        if (!response.ok) throw new Error(result.error || `Portal HTTP ${response.status}`);
+        target.textContent = 'Verbindung erfolgreich: Portal erreichbar, API-Token gültig.';
+      } catch (err) {
+        const message = err.name === 'AbortError'
+          ? 'Zeitüberschreitung – keine Internetverbindung oder Portal nicht erreichbar'
+          : (err.message || 'Keine Internetverbindung oder Portal nicht erreichbar');
+        target.textContent = 'Test fehlgeschlagen: ' + message;
+      } finally {
+        clearTimeout(timer);
+        button.disabled = false;
+      }
+    }
+
+    async function fetchTripFile(tripId, suffix) {
+      const path = `/trip-${tripId}-${suffix}`;
+      const res = await fetch('/api/archive/download?path=' + encodeURIComponent(path));
+      if (!res.ok) throw new Error(`${suffix} nicht vom Gerät abrufbar`);
+      return await res.blob();
+    }
+
+    async function uploadTripViaBrowser(tripId, statusTarget) {
+      if (browserUploadBusy) throw new Error('Ein Upload läuft bereits');
+      if (!tripId || tripId === '-') throw new Error('Keine abgeschlossene Fahrt vorhanden');
+      if (!portalUploadUrl) throw new Error('Portal-URL fehlt');
+      if (!portalUploadToken) throw new Error('API-Token fehlt');
+      browserUploadBusy = true;
+      if (statusTarget) statusTarget.textContent = `Tablet lädt Fahrt ${tripId} vom Gerät ...`;
+      try {
+        const [metadata, gpsCsv, sensorCsv, mainEventsRes] = await Promise.all([
+          fetchTripFile(tripId, 'meta.txt'),
+          fetchTripFile(tripId, 'gps.csv'),
+          fetchTripFile(tripId, 'sensor.csv'),
+          fetch('/api/main-events.csv')
+        ]);
+        if (!mainEventsRes.ok) throw new Error('Hauptsignal-Datei nicht abrufbar');
+        const mainCsv = await mainEventsRes.blob();
+        const status = window.lastStatusData || {};
+        const form = new FormData();
+        form.append('trip_id', tripId);
+        form.append('device_id', status.device_name || status.device_id || 'ESP32');
+        form.append('metadata', metadata, 'meta.json');
+        form.append('gps_csv', gpsCsv, 'gps.csv');
+        form.append('main_events_csv', mainCsv, 'main-events.csv');
+        form.append('sensor_events_csv', sensorCsv, 'sensor-events.csv');
+        if (statusTarget) statusTarget.textContent = 'Mobilgerät übermittelt die Fahrt an das Portal ...';
+        const portalResponse = await fetch(portalUploadUrl, {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + portalUploadToken },
+          body: form
+        });
+        const result = await portalResponse.json().catch(() => ({}));
+        if (!portalResponse.ok) throw new Error(result.error || `Portal HTTP ${portalResponse.status}`);
+        if (statusTarget) statusTarget.textContent = `Fahrt ${tripId} erfolgreich übermittelt.`;
+        return result;
+      } finally {
+        browserUploadBusy = false;
+      }
+    }
+
+    async function triggerUploadNow() {
+      const target = document.getElementById('uploadConfigStatus');
+      try {
+        await uploadTripViaBrowser((window.lastStatusData || {}).trip_id || '', target);
+      } catch (err) {
+        target.textContent = 'Upload fehlgeschlagen: ' + err.message;
       }
     }
 
@@ -4512,11 +4710,18 @@ const char* htmlPage() {
         const res = await fetchWithTimeout('/api/crops');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const list = await res.json();
-        const datalist = document.getElementById('cropSuggestions');
         const suggestions = Array.isArray(list) ? list : [];
-        datalist.innerHTML = suggestions.map(v => `<option value="${escapeHtml(v)}"></option>`).join('');
+        const cropSelect = document.getElementById('cropInput');
+        const currentCrop = (window.lastStatusData || {}).crop_name || cropSelect.value;
+        const options = currentCrop && !suggestions.includes(currentCrop)
+          ? [currentCrop, ...suggestions]
+          : suggestions;
+        cropSelect.innerHTML = '<option value="">Saat auswählen …</option>' + options.map(v =>
+          `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
+        ).join('');
+        cropSelect.value = currentCrop || '';
         const quick = document.getElementById('cropQuickList');
-        const current = document.getElementById('cropInput').value;
+        const current = cropSelect.value;
         quick.innerHTML = suggestions.map(v =>
           `<button type="button" class="crop-chip ${v === current ? 'active' : ''}" data-name="${escapeHtml(v)}">${escapeHtml(v)}</button>`
         ).join('');
@@ -4587,6 +4792,7 @@ const char* htmlPage() {
     document.getElementById('liftAutoStopSave').addEventListener('click', saveLiftAutoStopSetting);
     document.getElementById('deviceNameSave').addEventListener('click', saveDeviceNameSetting);
     document.getElementById('uploadConfigSave').addEventListener('click', saveUploadConfigSetting);
+    document.getElementById('uploadConfigTest').addEventListener('click', testUploadConfig);
     document.getElementById('uploadNowBtn').addEventListener('click', triggerUploadNow);
     document.getElementById('liftConfirmUploadBtn').addEventListener('click', liftConfirmUpload);
     document.getElementById('liftConfirmCloseBtn').addEventListener('click', dismissLiftConfirm);
@@ -6151,6 +6357,7 @@ void handleApiUploadConfig() {
   if (server.method() == HTTP_GET) {
     JsonDocument doc;
     doc["upload_url"]  = uploadUrl;
+    doc["upload_token"] = uploadToken;
     doc["auto_upload"] = autoUpload;
     String out;
     serializeJson(doc, out);
@@ -6598,7 +6805,7 @@ void setup() {
   registerProtectedRoute("/api/system-events.log", HTTP_GET, UserRole::Admin, handleApiSystemEvents);
   registerProtectedRoute("/api/gps-log/clear", HTTP_POST, UserRole::Admin, handleApiGpsLogClear);
   registerProtectedRoute("/api/crops", HTTP_GET, UserRole::Viewer, handleApiCrops);
-  registerProtectedRoute("/api/crops", HTTP_POST, UserRole::Operator, handleApiCropsPost);
+  registerProtectedRoute("/api/crops", HTTP_POST, UserRole::Admin, handleApiCropsPost);
   registerProtectedRoute("/api/device-config", HTTP_GET, UserRole::Viewer, handleApiDeviceConfig);
   registerProtectedRoute("/api/device-config", HTTP_POST, UserRole::Admin, handleApiDeviceConfig);
   registerProtectedRoute("/api/lift-confirm", HTTP_POST, UserRole::Operator, handleApiLiftConfirm);
@@ -6622,6 +6829,7 @@ void loop() {
   pollGnss();
   updateGnssHealthAndRecording();
   updatePneumaticValves();
+  updateFanTemperatureControl();
   server.handleClient();
   if (recordingActive && millis() - lastFileFlushMs >= FILE_FLUSH_INTERVAL_MS) {
     flushPersistentGpsBuffer();

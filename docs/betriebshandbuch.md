@@ -127,24 +127,24 @@ Die Ausgaenge werden ueber den TCA9554-Ausgangsexpander des Waveshare-Boards
 geschaltet. In der Firmware gilt:
 
 ```text
-DEFAULT_DO_ACTIVE_HIGH = false, LIGHT_DO_ACTIVE_HIGH = true
+DEFAULT_DO_ACTIVE_HIGH = false, LIGHT_DO_ACTIVE_HIGH = false
 ```
 
 Damit schalten die Pneumatikventile aktiv-low und bleiben im Ruhezustand aus.
-DO1 fuer das Licht wird separat aktiv-high geschaltet.
+Alle belegten Digitalausgänge werden mit derselben Active-Low-Logik geschaltet.
 
 ### 6.1 DO-Klemmenbelegung
 
 | Klemme | Funktion | Last |
 |--------|----------|------|
 | DO1 | Licht | 12V-Relais fuer Licht |
+| DO4 | Lüfter | Automatisch ein über 43 °C, aus bei 41 °C |
 | DO8 | Pneumatikventil 1 | Heschen 3V210-08 DC12V |
 | DO7 | Pneumatikventil 2 | Heschen 3V210-08 DC12V |
 | DO6 | Pneumatikventil 3 | Heschen 3V210-08 DC12V |
 | DO5 | Pneumatikventil 4 | Heschen 3V210-08 DC12V |
 | DO2 | Reserve | frei |
 | DO3 | Reserve | frei |
-| DO4 | Reserve | frei |
 
 ### 6.2 Licht ueber DO1
 
@@ -283,6 +283,34 @@ Die Pneumatikventile werden ueber die Webseite geschaltet. Die Zuordnung ist:
 Ventil 1 auf DO8, Ventil 2 auf DO7, Ventil 3 auf DO6 und Ventil 4 auf DO5.
 Ein Ventil wird jeweils fuer 5 Sekunden eingeschaltet. Waehrend dieser Zeit
 laeuft auf der Webseite ein Countdown und die anderen Ventile sind gesperrt.
+
+### 9.6 Luefter
+
+`DO4` steuert den Luefter automatisch anhand der internen ESP-Temperatur. Bei
+mehr als `43 °C` wird der Luefter eingeschaltet, bei `41 °C` oder weniger wird
+er ausgeschaltet. Die Anzeige `Luefter an` beziehungsweise `Luefter aus` ist
+eine reine Statusanzeige und kein Bedienelement.
+
+### 9.7 Fahrtende, Download und Portal-Upload
+
+Wird eine Fahrt manuell beendet, erscheint ein Abschlussdialog mit Fahrt-ID,
+Uploadmoeglichkeit und direkten Downloads. Scheitert ein automatischer Upload,
+weil das Portal ueber das Mobilgeraet nicht erreichbar ist, bleibt die Fahrt im
+ESP32 gespeichert und derselbe Dialog bietet die Dateien zum Download an.
+
+Der Portal-Upload wird vom Browser auf dem Tablet oder Mobiltelefon ausgefuehrt:
+
+1. Fahrtdateien lokal vom ESP32 abrufen.
+2. Multipart-Paket mit Metadaten, GPS-, Hauptsignal- und Sensor-CSV bilden.
+3. Paket mit Bearer-Token ueber die Internetverbindung des Mobilgeraets senden.
+
+Die Portal-URL muss auf `/api/trips/upload` enden. Mit `Verbindung testen`
+werden URL, Erreichbarkeit und Token ohne Fahrt-Upload geprueft. Der automatische
+Upload funktioniert nur, solange die Bedienseite geoeffnet ist.
+
+Nach einem manuellen Stopp bleibt der Auto-Start verriegelt, solange das
+Hubwerk-unten-Signal dauerhaft anliegt. Erst ein erkanntes `Hubwerk oben` gibt
+den Auto-Start fuer das naechste Absenken wieder frei.
 
 ## 10. Wartung
 

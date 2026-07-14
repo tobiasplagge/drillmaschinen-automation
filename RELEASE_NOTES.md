@@ -1,5 +1,53 @@
 # Release Notes
 
+## 2.5.0 - 2026-07-14
+
+### Digitalausgaenge
+
+- TCA9554-Hardwarezuordnung korrigiert: `DO1` entspricht Bit 0 bis `DO8` entspricht Bit 7. Die zuvor irrtuemlich umgekehrte Bitreihenfolge wurde entfernt.
+- Ausgangsbelegung festgelegt: `DO1` Licht, `DO2/DO3` Reserve, `DO4` Luefter, `DO5` Ventil 4, `DO6` Ventil 3, `DO7` Ventil 2 und `DO8` Ventil 1.
+- Alle belegten Ausgaenge verwenden Active-Low-Logik und werden beim Start ausgeschaltet initialisiert.
+- Automatische Sensorspiegelung auf `DO2` und `DO3` deaktiviert; beide Reserveausgaenge bleiben aus.
+
+### Lueftersteuerung
+
+- Temperaturgesteuerten Luefter auf `DO4` ergaenzt.
+- Luefter schaltet bei einer ESP-Temperatur ueber `43 °C` ein und bei `41 °C` oder weniger wieder aus.
+- Temperatur wird alle zwei Sekunden geprueft; die Hysterese verhindert schnelles Umschalten.
+- Manuelle Luefterbedienung entfernt und durch die reine Statusanzeige `Luefter an` beziehungsweise `Luefter aus` ersetzt.
+- Statusanzeige optisch an die Navigationsbuttons angepasst.
+
+### Fahrtaufzeichnung und Hubwerk
+
+- Nach einem manuellen Stopp verriegelt die Firmware den automatischen Neustart.
+- Ein dauerhaftes Signal `Hubwerk unten` und ein zwischenzeitlich veralteter GNSS-Fix koennen diese Verriegelung nicht aufheben.
+- Auto-Start wird erst wieder freigegeben, nachdem mindestens einmal `Hubwerk oben` erkannt wurde; das anschliessende Absenken darf eine neue Fahrt starten.
+- Bei manuellem Fahrtende erscheint immer ein Abschlussdialog mit Fahrt-ID, erneutem Upload und Downloads.
+- Bei automatisch beendeter Fahrt und fehlgeschlagenem Portal-Upload erscheint ein Hinweis auf die fehlende Portalverbindung mit Download-Angebot.
+
+### Portal- und API-Upload
+
+- Uploadarchitektur auf das vereinbarte Vermittlermodell umgestellt: Der ESP32 stellt die Fahrtdateien lokal bereit, der Browser auf Tablet oder Mobiltelefon uebermittelt sie ueber dessen Internetverbindung an das Portal.
+- Direkter automatischer Internet-Upload des ESP32 nach Fahrtende deaktiviert.
+- Browser erstellt ein Portal-kompatibles `multipart/form-data` mit `trip_id`, `device_id`, Metadaten, GPS-CSV, Hauptsignal-CSV und Sensorereignis-CSV.
+- Automatischer Browser-Upload nach Fahrtende sowie manueller Upload und Upload aus dem Abschlussdialog ergaenzt.
+- Sensorarchiv um die Spalte `duration_s` erweitert.
+- API-Einrichtung um `Verbindung testen` ergaenzt. Der Test prueft URL-Format, Portal-Erreichbarkeit und Bearer-Token, ohne eine Fahrt hochzuladen.
+- Portal-URL muss mit `/api/trips/upload` enden. Fuer den automatischen Upload muss die Bedienseite auf dem Mobilgeraet geoeffnet bleiben.
+
+### Bedienung und Zugriff
+
+- Lokale Anmeldepflicht der ESP32-Weboberflaeche deaktiviert; das Anmeldefenster wird nicht mehr eingeblendet.
+- Vorhandene Benutzer-/Sessionimplementierung ist weiterhin im Quellcode enthalten, wird fuer lokale Zugriffe aber umgangen.
+- Saat und Feld koennen direkt auf dem Dashboard ausgewaehlt werden. Die Saat steht als Dropdown mit erweiterten Standardkulturen bereit.
+- Saat-Vorschlaege koennen im Adminbereich hinzugefuegt und entfernt werden.
+- Den Adminbereich in einklappbare Abschnitte fuer Benutzer, Kameras, Kanaele, System, Maschinenparameter, GNSS, Saat, Cloud-Upload und Dateien gegliedert.
+
+### Validierung
+
+- Firmware nach jeder Aenderungsgruppe erfolgreich mit PlatformIO gebaut und auf das angeschlossene ESP32-S3-Board uebertragen.
+- Physische Digitalausgangszuordnung nach Wiederherstellung der direkten TCA9554-Bitreihenfolge am Board bestaetigt.
+
 ## 2.1.0 - 2026-06-12
 
 ### Neu
