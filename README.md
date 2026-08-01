@@ -3,7 +3,7 @@
 Firmware fuer das Waveshare ESP32-S3-POE-ETH-8DI-8DO Board zur
 Ueberwachung einer Drillmaschine.
 
-Aktuelle Firmware-Version: **2.5.0**
+Aktuelle Firmware-Version: **2.6.0**
 
 ## Kurzueberblick
 

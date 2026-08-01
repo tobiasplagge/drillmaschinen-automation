@@ -1,5 +1,11 @@
 # Release Notes
 
+## 2.6.0 - 2026-08-01
+
+### Release
+
+- Aktuellen Entwicklungsstand als produktive Version freigegeben.
+
 ## 2.5.0 - 2026-07-14
 
 ### Digitalausgaenge

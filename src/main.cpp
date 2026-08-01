@@ -37,7 +37,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 static constexpr uint8_t DEVICE_NAME_LENGTH = 64;
 static const char *DEVICE_ID_DEFAULT = "Rabe Megadrill 3000-01";
 char deviceName[DEVICE_NAME_LENGTH] = "Rabe Megadrill 3000-01";
-static const char *FIRMWARE_VERSION = "2.5.0";
+static const char *FIRMWARE_VERSION = "2.6.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Roggen\",\"Hafer\",\"Dinkel\",\"Triticale\",\"Raps\",\"Mais\",\"Senf\",\"Pfeffer\",\"Hirse\",\"Buchweizen\",\"Erbsen\",\"Ackerbohnen\",\"Soja\",\"Sonnenblumen\",\"Lein\",\"Luzerne\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
