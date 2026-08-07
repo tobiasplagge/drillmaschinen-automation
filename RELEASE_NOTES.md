@@ -1,5 +1,13 @@
 # Release Notes
 
+## 2.6.1 - 2026-08-07
+
+### Kanaluebersicht
+
+- Fehlerhafte Signalqualitaetsanzeige korrigiert: Kurze Sensorimpulse verschwanden sofort wieder aus der Prozentanzeige, da der Wert beim Abfallen des Eingangs unmittelbar auf `0` zurueckgesetzt wurde.
+- Der zuletzt erreichte Qualitaetswert bleibt jetzt bis zu 10 Sekunden nach der letzten Detektion sichtbar (`SIGNAL_READY_TIMEOUT_MS`), analog zum Verhalten vor der letzten Ueberarbeitung der Kanaluebersicht.
+- Saateingabe im Dashboard von einem reinen Dropdown auf ein Freitextfeld mit Vorschlagsliste (`datalist`) umgestellt; bestehende Saatvorschlaege bleiben als Auswahlhilfe erhalten, freie Eingabe (bis 23 Zeichen) ist zusaetzlich moeglich.
+
 ## 2.6.0 - 2026-08-01
 
 ### Release

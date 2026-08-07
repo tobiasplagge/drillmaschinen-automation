@@ -37,7 +37,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 static constexpr uint8_t DEVICE_NAME_LENGTH = 64;
 static const char *DEVICE_ID_DEFAULT = "Rabe Megadrill 3000-01";
 char deviceName[DEVICE_NAME_LENGTH] = "Rabe Megadrill 3000-01";
-static const char *FIRMWARE_VERSION = "2.6.0";
+static const char *FIRMWARE_VERSION = "2.6.1";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Roggen\",\"Hafer\",\"Dinkel\",\"Triticale\",\"Raps\",\"Mais\",\"Senf\",\"Pfeffer\",\"Hirse\",\"Buchweizen\",\"Erbsen\",\"Ackerbohnen\",\"Soja\",\"Sonnenblumen\",\"Lein\",\"Luzerne\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
@@ -2525,10 +2525,9 @@ const char* htmlPage() {
         <button id="fieldSave" type="button">Feld speichern</button>
       </div>
       <div class="field-row">
-        <select id="cropInput" aria-label="Saat auswählen">
-          <option value="">Saat auswählen …</option>
-        </select>
-        <button id="cropSave" type="button">Auswahl speichern</button>
+        <input id="cropInput" list="cropSuggestions" maxlength="23" placeholder="Saat auswählen oder frei eingeben" aria-label="Saat auswählen oder frei eingeben">
+        <datalist id="cropSuggestions"></datalist>
+        <button id="cropSave" type="button">Saat speichern</button>
       </div>
       <div id="cropQuickList" class="crop-chip-row"></div>
       <div class="gps-meta">
@@ -4711,17 +4710,14 @@ const char* htmlPage() {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const list = await res.json();
         const suggestions = Array.isArray(list) ? list : [];
-        const cropSelect = document.getElementById('cropInput');
-        const currentCrop = (window.lastStatusData || {}).crop_name || cropSelect.value;
-        const options = currentCrop && !suggestions.includes(currentCrop)
-          ? [currentCrop, ...suggestions]
-          : suggestions;
-        cropSelect.innerHTML = '<option value="">Saat auswählen …</option>' + options.map(v =>
-          `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
+        const cropInput = document.getElementById('cropInput');
+        const currentCrop = (window.lastStatusData || {}).crop_name || cropInput.value;
+        document.getElementById('cropSuggestions').innerHTML = suggestions.map(v =>
+          `<option value="${escapeHtml(v)}"></option>`
         ).join('');
-        cropSelect.value = currentCrop || '';
+        cropInput.value = currentCrop || '';
         const quick = document.getElementById('cropQuickList');
-        const current = cropSelect.value;
+        const current = cropInput.value;
         quick.innerHTML = suggestions.map(v =>
           `<button type="button" class="crop-chip ${v === current ? 'active' : ''}" data-name="${escapeHtml(v)}">${escapeHtml(v)}</button>`
         ).join('');
