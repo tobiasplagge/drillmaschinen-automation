@@ -1,5 +1,26 @@
 # Release Notes
 
+## 2.6.4 - 2026-08-15
+
+### Einstellungen
+
+- Erklaerungstext im Bereich "Empfindlichkeit" ergaenzt: erklaert, dass der Wert die Dauer bis zum Dauersignal-Alarm regelt (nicht die Sensorempfindlichkeit selbst) und gibt eine Faustregel fuer feine vs. grobe Saat.
+
+## 2.6.3 - 2026-08-15
+
+### Kanaluebersicht
+
+- Traege Signalqualitaetsanzeige behoben: Jeder noch so kurze Aussetzer am Digitaleingang setzte die Rampenbasis (`activeSinceMs`) zurueck, wodurch die Prozentanzeige nach einem kurzen Wackler nahezu wieder bei 0 % begann, statt an der letzten Position weiterzuwachsen.
+- Kurze Aussetzer bis 2 Sekunden (`SIGNAL_GAP_GRACE_MS`) unterbrechen die Rampe jetzt nicht mehr; die Anzeige waechst nach einem kurzen Wackler ohne Ruecksprung weiter.
+- Nach einem echten, laengeren Signalausfall (weiterhin `SIGNAL_READY_TIMEOUT_MS` = 10 s) werden Anzeige und Rampenbasis vollstaendig auf 0 zurueckgesetzt, sodass die Anzeige nicht mehr dauerhaft auf einem alten Wert haengen bleiben kann.
+
+## 2.6.2 - 2026-08-15
+
+### Kanaluebersicht
+
+- Alarm (roter Rahmen, Alarmton, `main_signal`/`latched_alarm`) wurde bisher erst nach einer fest verdrahteten Haltezeit von 15 Sekunden ausgeloest, waehrend die Prozentanzeige bereits nach der einstellbaren Haltezeit (maximal 10 Sekunden) 100 % erreichte. Dadurch blieb die Anzeige bei 100 %, ohne dass Alarm oder roter Rahmen ausgeloest wurden.
+- Der Alarmzustand wird jetzt anhand derselben einstellbaren Haltezeit (`mainSignalHoldMs`) ausgeloest wie die Prozentanzeige, sodass roter Rahmen und Alarmton exakt beim Erreichen von 100 % erscheinen. Die feste Konstante `RED_SIGNAL_HOLD_MS` wurde entfernt.
+
 ## 2.6.1 - 2026-08-07
 
 ### Kanaluebersicht

@@ -37,7 +37,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 static constexpr uint8_t DEVICE_NAME_LENGTH = 64;
 static const char *DEVICE_ID_DEFAULT = "Rabe Megadrill 3000-01";
 char deviceName[DEVICE_NAME_LENGTH] = "Rabe Megadrill 3000-01";
-static const char *FIRMWARE_VERSION = "2.6.1";
+static const char *FIRMWARE_VERSION = "2.6.4";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Roggen\",\"Hafer\",\"Dinkel\",\"Triticale\",\"Raps\",\"Mais\",\"Senf\",\"Pfeffer\",\"Hirse\",\"Buchweizen\",\"Erbsen\",\"Ackerbohnen\",\"Soja\",\"Sonnenblumen\",\"Lein\",\"Luzerne\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
@@ -70,7 +70,7 @@ static constexpr uint32_t DEFAULT_MAIN_SIGNAL_HOLD_MS = 1500;
 static constexpr uint32_t MIN_MAIN_SIGNAL_HOLD_MS = 300;
 static constexpr uint32_t MAX_MAIN_SIGNAL_HOLD_MS = 10000;
 static constexpr uint32_t SIGNAL_READY_TIMEOUT_MS = 10000;
-static constexpr uint32_t RED_SIGNAL_HOLD_MS = 15000;
+static constexpr uint32_t SIGNAL_GAP_GRACE_MS = 2000;
 static constexpr uint32_t ROTATION_PULSE_TIMEOUT_MS = 3000;
 static constexpr uint8_t ROTATION_PULSES_PER_REV = 1;
 static constexpr uint32_t GPS_LOG_INTERVAL_MS = 3000;
@@ -1981,26 +1981,31 @@ void readDigitalInputs() {
     if (active != channels[i].active) {
       channels[i].changes++;
       if (active) {
+        const bool resumedWithinGrace = channels[i].activeSinceMs > 0 && channels[i].lastDetectionMs > 0 &&
+                                         (now - channels[i].lastDetectionMs) <= SIGNAL_GAP_GRACE_MS;
         if (channels[i].lastDetectionMs > 0) {
           channels[i].pulseIntervalMs = now - channels[i].lastDetectionMs;
         }
         channels[i].detectionCount++;
         channels[i].lastDetectionMs = now;
+        if (!resumedWithinGrace) {
+          channels[i].activeSinceMs = now;
+        }
       }
       channels[i].lastChangeMs = now;
-      channels[i].activeSinceMs = active ? now : 0;
     }
 
     channels[i].inputRaw = raw;
     channels[i].active = active;
 
     const bool seedChannel = isSeedChannel(i);
-    const bool mainSignal = seedChannel && active && channels[i].activeSinceMs > 0 && (now - channels[i].activeSinceMs >= RED_SIGNAL_HOLD_MS);
+    const bool mainSignal = seedChannel && active && channels[i].activeSinceMs > 0 && (now - channels[i].activeSinceMs >= mainSignalHoldMs);
     if (seedChannel && active) {
       const uint32_t activeMs = channels[i].activeSinceMs > 0 ? now - channels[i].activeSinceMs : 0;
       channels[i].signalQualityPct = static_cast<uint8_t>(constrain((activeMs * 100UL) / max<uint32_t>(mainSignalHoldMs, 1), 1UL, 100UL));
     } else if (channels[i].lastDetectionMs == 0 || now - channels[i].lastDetectionMs > SIGNAL_READY_TIMEOUT_MS) {
       channels[i].signalQualityPct = 0;
+      channels[i].activeSinceMs = 0;
     }
     if (mainSignal != channels[i].mainSignal) {
       channels[i].mainSignal = mainSignal;
@@ -2077,7 +2082,7 @@ String statusJson() {
   doc["ethernet_link"] = Ethernet.linkStatus() == LinkON;
   doc["main_signal_hold_ms"] = mainSignalHoldMs;
   doc["quality_signal_hold_ms"] = mainSignalHoldMs;
-  doc["red_signal_hold_ms"] = RED_SIGNAL_HOLD_MS;
+  doc["red_signal_hold_ms"] = mainSignalHoldMs;
   doc["light_channel"] = LIGHT_OUTPUT_CHANNEL;
   doc["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
   doc["light_switchable"] = doExpanderReady;
@@ -2361,6 +2366,10 @@ const char* htmlPage() {
     .gps-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 14px; margin-top: 12px; color: #d1d5db; font-size: .92rem; }
     .gps-meta strong { color: #f9fafb; }
     .gps-meta > div { min-width: 0; overflow-wrap: anywhere; }
+    .setting-hint { margin: 10px 0 0; padding: 10px 12px; border-radius: 6px; background: #111827; border: 1px solid #374151; color: #d1d5db; font-size: .88rem; line-height: 1.5; }
+    .setting-hint strong { color: #f9fafb; }
+    .setting-hint ul { margin: 6px 0 0; padding-left: 18px; }
+    .setting-hint li { margin-bottom: 4px; }
     .track-wrap { position: relative; overflow: hidden; min-height: 280px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
     #trackCanvas { display: block; width: 100%; height: 360px; }
     #topoMap { width: 100%; height: 520px; border: 1px solid #374151; border-radius: 6px; background: #e5e7eb; }
@@ -2590,6 +2599,14 @@ const char* htmlPage() {
           <div class="gps-meta">
             <div>Signalpegel 100 % bei: <strong id="sensitivityCurrent">-</strong></div>
             <div>Rot/Alarm ab: <strong id="redSignalCurrent">-</strong></div>
+          </div>
+          <div class="setting-hint">
+            <strong>Was stellt man hier ein?</strong> Die Zeit, die der Lichttaster (Sensor) <strong>ununterbrochen</strong> ein Signal melden muss, bevor Alarm (roter Rahmen + Ton, "Dauersignal") ausgelöst wird. Ein Dauersignal bedeutet Verstopfung/Störung, keine normale Kornerkennung.
+            <ul>
+              <li><strong>Feine, dicht fließende Saat</strong> (z.B. Raps): Wert eher <strong>erhöhen</strong>. Bei feiner Saat kann der Lichtstrahl auch im normalen Betrieb länger am Stück unterbrochen sein &ndash; ein zu niedriger Wert löst dann fälschlich Alarm aus.</li>
+              <li><strong>Grobe, einzeln fallende Saat</strong> (z.B. Bohnen, Mais): Wert kann niedrig bleiben &ndash; eine echte Verstopfung wird dann schneller erkannt.</li>
+            </ul>
+            Hinweis: Diese Einstellung regelt nicht, wie empfindlich der Sensor selbst einzelne Körner erkennt. Erkennt der Sensor feine Saat generell zu selten/schwach, hilft nur der Empfindlichkeits-Regler direkt am Lichttaster bzw. dessen Montageposition &ndash; nicht dieser Wert.
           </div>
         </div>
       </details>
@@ -5755,7 +5772,7 @@ void handleApiSensitivity() {
   response["ok"] = true;
   response["main_signal_hold_ms"] = mainSignalHoldMs;
   response["quality_signal_hold_ms"] = mainSignalHoldMs;
-  response["red_signal_hold_ms"] = RED_SIGNAL_HOLD_MS;
+  response["red_signal_hold_ms"] = mainSignalHoldMs;
   String json;
   serializeJson(response, json);
   server.send(200, "application/json", json);
