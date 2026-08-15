@@ -69,8 +69,6 @@ static constexpr uint32_t UPLOAD_RETRY_DELAY_MS = 60000;
 static constexpr uint32_t DEFAULT_MAIN_SIGNAL_HOLD_MS = 1500;
 static constexpr uint32_t MIN_MAIN_SIGNAL_HOLD_MS = 300;
 static constexpr uint32_t MAX_MAIN_SIGNAL_HOLD_MS = 10000;
-static constexpr uint32_t SIGNAL_READY_TIMEOUT_MS = 10000;
-static constexpr uint32_t SIGNAL_GAP_GRACE_MS = 2000;
 static constexpr uint32_t ROTATION_PULSE_TIMEOUT_MS = 3000;
 static constexpr uint8_t ROTATION_PULSES_PER_REV = 1;
 static constexpr uint32_t GPS_LOG_INTERVAL_MS = 3000;
@@ -1981,18 +1979,19 @@ void readDigitalInputs() {
     if (active != channels[i].active) {
       channels[i].changes++;
       if (active) {
-        const bool resumedWithinGrace = channels[i].activeSinceMs > 0 && channels[i].lastDetectionMs > 0 &&
-                                         (now - channels[i].lastDetectionMs) <= SIGNAL_GAP_GRACE_MS;
         if (channels[i].lastDetectionMs > 0) {
           channels[i].pulseIntervalMs = now - channels[i].lastDetectionMs;
         }
         channels[i].detectionCount++;
         channels[i].lastDetectionMs = now;
-        if (!resumedWithinGrace) {
-          channels[i].activeSinceMs = now;
-        }
       }
       channels[i].lastChangeMs = now;
+      // Jeden Impuls direkt und unabhaengig vom vorherigen Impuls auswerten.
+      // Beim Signalabfall darf kein alter Prozentwert stehen bleiben.
+      channels[i].activeSinceMs = active ? now : 0;
+      if (!active) {
+        channels[i].signalQualityPct = 0;
+      }
     }
 
     channels[i].inputRaw = raw;
@@ -2003,9 +2002,8 @@ void readDigitalInputs() {
     if (seedChannel && active) {
       const uint32_t activeMs = channels[i].activeSinceMs > 0 ? now - channels[i].activeSinceMs : 0;
       channels[i].signalQualityPct = static_cast<uint8_t>(constrain((activeMs * 100UL) / max<uint32_t>(mainSignalHoldMs, 1), 1UL, 100UL));
-    } else if (channels[i].lastDetectionMs == 0 || now - channels[i].lastDetectionMs > SIGNAL_READY_TIMEOUT_MS) {
+    } else {
       channels[i].signalQualityPct = 0;
-      channels[i].activeSinceMs = 0;
     }
     if (mainSignal != channels[i].mainSignal) {
       channels[i].mainSignal = mainSignal;
