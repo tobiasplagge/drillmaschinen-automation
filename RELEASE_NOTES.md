@@ -1,5 +1,13 @@
 # Release Notes
 
+## 2.6.5 - 2026-08-15
+
+### Fahrtaufzeichnung
+
+- Verlassen-Warnung bei aktiver Aufzeichnung ergaenzt: Browser-Zurueck (inkl. Zurueck-Geste auf Tablet/Smartphone) zeigt jetzt einen Bestaetigungsdialog ("Auf der Seite bleiben" / "Trotzdem verlassen"), bevor die Live-Ansicht verlassen wird.
+- Zusaetzlich native Browser-Warnung beim Schliessen des Tabs, Neuladen oder Eingabe einer anderen URL (beforeunload), sofern der jeweilige Browser das unterstuetzt.
+- Klarstellung: Die Aufzeichnung selbst laeuft weiterhin auf dem Geraet, auch wenn die Seite verlassen wird - die Warnung verhindert nur den versehentlichen Verlust der Live-Ansicht (Karte, Kamera, Status).
+
 ## 2.6.4 - 2026-08-15
 
 ### Einstellungen

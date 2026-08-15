@@ -37,7 +37,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 static constexpr uint8_t DEVICE_NAME_LENGTH = 64;
 static const char *DEVICE_ID_DEFAULT = "Rabe Megadrill 3000-01";
 char deviceName[DEVICE_NAME_LENGTH] = "Rabe Megadrill 3000-01";
-static const char *FIRMWARE_VERSION = "2.6.4";
+static const char *FIRMWARE_VERSION = "2.6.5";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Roggen\",\"Hafer\",\"Dinkel\",\"Triticale\",\"Raps\",\"Mais\",\"Senf\",\"Pfeffer\",\"Hirse\",\"Buchweizen\",\"Erbsen\",\"Ackerbohnen\",\"Soja\",\"Sonnenblumen\",\"Lein\",\"Luzerne\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
@@ -2736,6 +2736,16 @@ const char* htmlPage() {
         <div id="liftConfirmStatus" class="gps-meta" style="margin-top:8px;"></div>
       </div>
     </div>
+    <div id="leaveConfirmModal" class="modal-overlay hidden">
+      <div class="modal-box">
+        <h3>Aufzeichnung l&auml;uft</h3>
+        <p>Es l&auml;uft gerade eine Fahrtaufzeichnung. Sie l&auml;uft auf dem Ger&auml;t weiter, auch wenn du diese Seite verl&auml;sst &ndash; du verlierst dabei aber die Live-Ansicht (Karte, Kamera, Status), bis du die Seite wieder &ouml;ffnest.</p>
+        <div class="actions">
+          <button id="leaveConfirmStayBtn" type="button">Auf der Seite bleiben</button>
+          <button id="leaveConfirmLeaveBtn" class="secondary" type="button">Trotzdem verlassen</button>
+        </div>
+      </div>
+    </div>
     <div class="hidden" aria-hidden="true">
       <span id="gnssSource"></span>
       <span id="gpsCount"></span>
@@ -2786,6 +2796,23 @@ const char* htmlPage() {
     let browserUploadBusy = false;
     let recordingStateKnown = false;
     let lastRecordingActive = false;
+    let leaveGuardArmed = false;
+
+    function isRecordingActive() {
+      return Boolean((window.lastStatusData || {}).recording_active);
+    }
+
+    function syncLeaveGuard(active) {
+      if (active && !leaveGuardArmed) {
+        leaveGuardArmed = true;
+        history.pushState({ leaveGuard: true }, '', location.href);
+      } else if (!active && leaveGuardArmed) {
+        leaveGuardArmed = false;
+        if (history.state && history.state.leaveGuard) {
+          history.back();
+        }
+      }
+    }
     let lastAutoUploadTripId = '';
     let cameraStreamModes = JSON.parse(localStorage.getItem('cameraStreamModes') || '{}');
     let trackBusy = false;
@@ -4089,6 +4116,7 @@ const char* htmlPage() {
         }
         lastRecordingActive = recActive;
         recordingStateKnown = true;
+        syncLeaveGuard(recActive);
         const statusEl = document.getElementById('gpsStatus');
         statusEl.textContent = recActive ? 'Aktiv ●' : 'Gestoppt';
         const labelEl = document.getElementById('recStatusLabel');
@@ -4847,6 +4875,25 @@ const char* htmlPage() {
     window.addEventListener('pagehide', () => {
       pageActive = false;
       document.querySelectorAll('.camera-panel img').forEach(image => image.removeAttribute('src'));
+    });
+    window.addEventListener('beforeunload', event => {
+      if (isRecordingActive()) {
+        event.preventDefault();
+        event.returnValue = '';
+      }
+    });
+    window.addEventListener('popstate', () => {
+      if (!isRecordingActive()) return;
+      document.getElementById('leaveConfirmModal').classList.remove('hidden');
+      history.pushState({ leaveGuard: true }, '', location.href);
+    });
+    document.getElementById('leaveConfirmStayBtn').addEventListener('click', () => {
+      document.getElementById('leaveConfirmModal').classList.add('hidden');
+    });
+    document.getElementById('leaveConfirmLeaveBtn').addEventListener('click', () => {
+      document.getElementById('leaveConfirmModal').classList.add('hidden');
+      leaveGuardArmed = false;
+      history.go(-2);
     });
     document.getElementById('grid').addEventListener('click', event => {
       if (event.target.tagName !== 'SUMMARY') return;
