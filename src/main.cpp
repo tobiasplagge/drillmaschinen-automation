@@ -142,7 +142,10 @@ static constexpr float FAN_OFF_TEMPERATURE_C = 41.0f;
 static constexpr uint32_t FAN_TEMPERATURE_CHECK_INTERVAL_MS = 2000;
 static constexpr uint8_t PNEUMATIC_VALVE_COUNT = 4;
 static constexpr uint8_t PNEUMATIC_VALVE_OUTPUTS[PNEUMATIC_VALVE_COUNT] = {8, 7, 6, 5};
-static constexpr uint32_t PNEUMATIC_VALVE_PULSE_MS = 5000;
+static constexpr uint32_t PNEUMATIC_BURST_ON_MS = 2000;
+static constexpr uint32_t PNEUMATIC_BURST_PAUSE_MS = 500;
+static constexpr uint32_t PNEUMATIC_VALVE_PULSE_MS = PNEUMATIC_BURST_ON_MS * 2;
+static constexpr uint32_t PNEUMATIC_RECHARGE_LOCK_MS = 5000;
 static const char *PNEUMATIC_VALVE_LABELS[PNEUMATIC_VALVE_COUNT] = {
     "Sensor 1-6",
     "Sensor 7-12",
@@ -291,6 +294,8 @@ uint8_t tcaOutputState = 0x00;
 bool doExpanderReady = false;
 uint8_t activePneumaticValveIndex = 255;
 uint32_t pneumaticValveOffAtMs = 0;
+uint32_t pneumaticValveLockedUntilMs = 0;
+uint8_t pneumaticBurstPhase = 0; // 0=aus, 1=erster Stoß, 2=Stoßpause, 3=zweiter Stoß
 uint32_t lastFanTemperatureCheckMs = 0;
 uint32_t lastDebugMs = 0;
 uint32_t bootCounter = 0;
@@ -1967,7 +1972,10 @@ bool setDigitalOutput(uint8_t channelIndex, bool on) {
 }
 
 bool startPneumaticValve(uint8_t valveIndex) {
-  if (valveIndex >= PNEUMATIC_VALVE_COUNT || activePneumaticValveIndex != 255 || !doExpanderReady) {
+  const uint32_t now = millis();
+  if (valveIndex >= PNEUMATIC_VALVE_COUNT || activePneumaticValveIndex != 255 ||
+      (pneumaticValveLockedUntilMs != 0 && static_cast<int32_t>(now - pneumaticValveLockedUntilMs) < 0) ||
+      !doExpanderReady) {
     return false;
   }
 
@@ -1977,24 +1985,46 @@ bool startPneumaticValve(uint8_t valveIndex) {
   }
 
   activePneumaticValveIndex = valveIndex;
-  pneumaticValveOffAtMs = millis() + PNEUMATIC_VALVE_PULSE_MS;
+  pneumaticBurstPhase = 1;
+  pneumaticValveOffAtMs = now + PNEUMATIC_BURST_ON_MS;
   return true;
 }
 
 void updatePneumaticValves() {
+  const uint32_t now = millis();
+  if (pneumaticValveLockedUntilMs != 0 && static_cast<int32_t>(now - pneumaticValveLockedUntilMs) >= 0) {
+    pneumaticValveLockedUntilMs = 0;
+  }
   if (activePneumaticValveIndex >= PNEUMATIC_VALVE_COUNT) {
     return;
   }
 
-  const uint32_t now = millis();
   if (static_cast<int32_t>(now - pneumaticValveOffAtMs) < 0) {
     return;
   }
 
   const uint8_t outputChannel = PNEUMATIC_VALVE_OUTPUTS[activePneumaticValveIndex];
-  setDigitalOutput(outputChannel - 1, false);
-  activePneumaticValveIndex = 255;
-  pneumaticValveOffAtMs = 0;
+  if (pneumaticBurstPhase == 1) {
+    setDigitalOutput(outputChannel - 1, false);
+    pneumaticBurstPhase = 2;
+    pneumaticValveOffAtMs = now + PNEUMATIC_BURST_PAUSE_MS;
+  } else if (pneumaticBurstPhase == 2) {
+    if (setDigitalOutput(outputChannel - 1, true)) {
+      pneumaticBurstPhase = 3;
+      pneumaticValveOffAtMs = now + PNEUMATIC_BURST_ON_MS;
+    } else {
+      pneumaticBurstPhase = 0;
+      activePneumaticValveIndex = 255;
+      pneumaticValveOffAtMs = 0;
+      pneumaticValveLockedUntilMs = now + PNEUMATIC_RECHARGE_LOCK_MS;
+    }
+  } else {
+    setDigitalOutput(outputChannel - 1, false);
+    pneumaticBurstPhase = 0;
+    activePneumaticValveIndex = 255;
+    pneumaticValveOffAtMs = 0;
+    pneumaticValveLockedUntilMs = now + PNEUMATIC_RECHARGE_LOCK_MS;
+  }
 }
 
 // Zeit laeuft nur waehrend aktiver Aufzeichnung UND Hubwerk unten (echte Feldarbeit);
@@ -2271,8 +2301,11 @@ String statusJson() {
   if (liftAutoStopPendingConfirm) doc["lift_confirm_trip_id"] = liftAutoStopTripId;
   JsonArray valves = doc["pneumatic_valves"].to<JsonArray>();
   const bool valveBusy = activePneumaticValveIndex < PNEUMATIC_VALVE_COUNT;
+  const bool rechargeLocked = pneumaticValveLockedUntilMs != 0 &&
+                              static_cast<int32_t>(pneumaticValveLockedUntilMs - now) > 0;
   const uint32_t valveRemainingMs =
       valveBusy && static_cast<int32_t>(pneumaticValveOffAtMs - now) > 0 ? pneumaticValveOffAtMs - now : 0;
+  const uint32_t rechargeRemainingMs = rechargeLocked ? pneumaticValveLockedUntilMs - now : 0;
   for (uint8_t i = 0; i < PNEUMATIC_VALVE_COUNT; i++) {
     const uint8_t outputChannel = PNEUMATIC_VALVE_OUTPUTS[i];
     JsonObject valve = valves.add<JsonObject>();
@@ -2281,10 +2314,18 @@ String statusJson() {
     valve["output_channel"] = outputChannel;
     valve["on"] = channels[outputChannel - 1].output;
     valve["active"] = valveBusy && activePneumaticValveIndex == i;
-    valve["locked"] = valveBusy && activePneumaticValveIndex != i;
+    valve["burst_phase"] = valveBusy && activePneumaticValveIndex == i ? pneumaticBurstPhase : 0;
+    valve["burst_phase_name"] = !valveBusy || activePneumaticValveIndex != i ? "idle" :
+                                 (pneumaticBurstPhase == 1 ? "burst_1" :
+                                  (pneumaticBurstPhase == 2 ? "pause" : "burst_2"));
+    valve["locked"] = rechargeLocked || (valveBusy && activePneumaticValveIndex != i);
     valve["remaining_ms"] = valveBusy && activePneumaticValveIndex == i ? valveRemainingMs : 0;
+    valve["lock_remaining_ms"] = rechargeRemainingMs;
     valve["pulse_ms"] = PNEUMATIC_VALVE_PULSE_MS;
-    valve["switchable"] = doExpanderReady && !valveBusy;
+    valve["burst_on_ms"] = PNEUMATIC_BURST_ON_MS;
+    valve["burst_pause_ms"] = PNEUMATIC_BURST_PAUSE_MS;
+    valve["recharge_lock_ms"] = PNEUMATIC_RECHARGE_LOCK_MS;
+    valve["switchable"] = doExpanderReady && !valveBusy && !rechargeLocked;
     valve["automatic_enabled"] = (autoAirGroupMask & (1U << i)) != 0;
   }
   JsonObject autoAirJson = doc["auto_air"].to<JsonObject>();
@@ -2834,7 +2875,7 @@ const char* htmlPage() {
             <div>N&auml;chster Ausl&ouml;ser in: <strong id="autoAirRemaining">-</strong></div>
           </div>
           <div class="setting-hint">
-            Bl&auml;st bei aktiver Fahrtaufzeichnung und Hubwerk unten die ausgew&auml;hlten Ventile nacheinander kurz durch, um die Sensoren freizuhalten. Der Wert ist die Zeit in Minuten zwischen zwei Ausl&ouml;sungen.
+            Bl&auml;st bei aktiver Fahrtaufzeichnung und Hubwerk unten die ausgew&auml;hlten Ventile nacheinander durch. Jede Gruppe erh&auml;lt einen Doppelsto&szlig;: 2 Sekunden Druckluft, 0,5 Sekunden Pause und nochmals 2 Sekunden Druckluft. Danach folgen 5 Sekunden Nachladepause f&uuml;r den Druckluftvorrat des Treckers. Der Intervallwert bestimmt die Zeit zwischen zwei vollst&auml;ndigen Reinigungsabl&auml;ufen.
             <ul>
               <li>Der Timer l&auml;uft nur w&auml;hrend tats&auml;chlicher Feldarbeit (Aufzeichnung aktiv und Hubwerk unten).</li>
               <li>Bei ausgehobenem Hubwerk oder gestoppter Aufzeichnung bleibt der erreichte Wert stehen und l&auml;uft erst danach weiter &ndash; er springt nicht zur&uuml;ck auf 0.</li>
@@ -3380,6 +3421,16 @@ const char* htmlPage() {
       status.title = fanSwitchable ? 'Automatik: Ein über 43 °C, Aus bei 41 °C' : 'Lüfterausgang nicht erreichbar';
     }
 
+    function valveStatusText(valve) {
+      if (valve.active) {
+        const seconds = Math.max(0.1, Number(valve.remaining_ms || 0) / 1000).toFixed(1).replace('.0', '');
+        if (valve.burst_phase_name === 'pause') return seconds + ' s Stoßpause';
+        return seconds + ' s Druckluft ' + (valve.burst_phase_name === 'burst_2' ? '(2/2)' : '(1/2)');
+      }
+      if ((valve.lock_remaining_ms || 0) > 0) return Math.ceil(valve.lock_remaining_ms / 1000) + ' s Nachladen';
+      return valve.locked ? 'gesperrt' : 'Doppelstoß starten';
+    }
+
     function updateValveButtons(valves) {
       const container = document.getElementById('valveActions');
       const list = valves || [];
@@ -3388,7 +3439,7 @@ const char* htmlPage() {
         container.innerHTML = list.map(valve => `
           <button class="valve-button ${valve.active ? 'active' : ''}" type="button" data-index="${valve.index}" ${valve.switchable ? '' : 'disabled'}>
             <span>${escapeHtml(valve.label || ('Ausgang ' + valve.output_channel))}</span>
-            <span class="valve-countdown">${valve.active ? Math.ceil((valve.remaining_ms || 0) / 1000) + ' s aktiv' : (valve.locked ? 'gesperrt' : '5 s schalten')}</span>
+            <span class="valve-countdown">${valveStatusText(valve)}</span>
           </button>
         `).join('');
         container.querySelectorAll('.valve-button').forEach(button => button.addEventListener('click', () => pulseValve(button)));
@@ -3401,7 +3452,7 @@ const char* htmlPage() {
         btn.dataset.index = valve.index;
         const countdown = btn.querySelector('.valve-countdown');
         if (countdown) {
-          countdown.textContent = valve.active ? Math.ceil((valve.remaining_ms || 0) / 1000) + ' s aktiv' : (valve.locked ? 'gesperrt' : '5 s schalten');
+          countdown.textContent = valveStatusText(valve);
         }
       });
     }
@@ -6303,6 +6354,16 @@ void handleApiValve() {
 
   if (activePneumaticValveIndex < PNEUMATIC_VALVE_COUNT) {
     server.send(409, "application/json", "{\"error\":\"valve_busy\"}");
+    return;
+  }
+  const uint32_t now = millis();
+  if (pneumaticValveLockedUntilMs != 0 && static_cast<int32_t>(now - pneumaticValveLockedUntilMs) < 0) {
+    JsonDocument lockedResponse;
+    lockedResponse["error"] = "air_recharge_locked";
+    lockedResponse["remaining_ms"] = pneumaticValveLockedUntilMs - now;
+    String lockedJson;
+    serializeJson(lockedResponse, lockedJson);
+    server.send(409, "application/json", lockedJson);
     return;
   }
 
