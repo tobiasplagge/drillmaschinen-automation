@@ -1,5 +1,31 @@
 # Release Notes
 
+## 2.8.0 - 2026-08-18
+
+### Sensorauswertung
+
+- Umschaltbare Prozentanzeige zwischen bisheriger Impulsdauer und Impulsen pro Sekunde.
+- Einstellbarer Referenzwert, wie viele Impulse pro Sekunde 100 % entsprechen.
+- Separat einstellbares Messfenster von 100-3000 ms mit Empfehlungen für feine, normale und grobe Saat direkt in der Einstellungsmaske.
+- Die einstellbare Dauersignalzeit bleibt unabhängig davon für den Verstopfungsalarm erhalten; 100 % Impulsrate allein lösen keinen Alarm aus.
+- Kurze Sensorimpulse werden per Hardware-Interrupt erfasst und dadurch auch während GNSS- oder Webverarbeitung zuverlässig gezählt.
+- Sensorberechnung und Webanzeige wurden für eine deutlich schnellere Reaktion beschleunigt.
+
+### Automatische Druckluft
+
+- Frei auswählbare Sensorgruppen 1-6, 7-12, 13-18 und 19-24 für das automatische Durchblasen.
+- Nicht ausgewählte Gruppen werden in der automatischen Sequenz übersprungen; die manuelle Ventilsteuerung bleibt vollständig verfügbar.
+- Gruppenauswahl und Sensoreinstellungen werden dauerhaft gespeichert.
+
+## 2.7.0 - 2026-08-15
+
+### Automatische Druckluft
+
+- Neue Einstellung "Automatische Druckluft": l&ouml;st in einem einstellbaren Intervall (1-60 Minuten, Standard 15 Minuten) alle 4 Pneumatikventile nacheinander aus, um die Sensoren freizublasen.
+- Die Automatisation ist standardm&auml;&szlig;ig deaktiviert und kann in den Einstellungen ein-/ausgeschaltet werden.
+- Der Timer l&auml;uft nur w&auml;hrend aktiver Fahrtaufzeichnung und Hubwerk unten (echte Feldarbeit). Bei ausgehobenem Hubwerk oder gestoppter Aufzeichnung bleibt der erreichte Wert eingefroren und l&auml;uft beim n&auml;chsten Mal an derselben Stelle weiter, statt auf 0 zur&uuml;ckzuspringen.
+- Neuer API-Endpunkt `POST /api/auto-air` mit `{"enabled": bool, "interval_ms": number}`.
+
 ## 2.6.5 - 2026-08-15
 
 ### Fahrtaufzeichnung

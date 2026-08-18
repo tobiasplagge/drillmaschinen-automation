@@ -37,7 +37,7 @@ static const IPAddress ETHERNET_SUBNET(255, 255, 255, 0);
 static constexpr uint8_t DEVICE_NAME_LENGTH = 64;
 static const char *DEVICE_ID_DEFAULT = "Rabe Megadrill 3000-01";
 char deviceName[DEVICE_NAME_LENGTH] = "Rabe Megadrill 3000-01";
-static const char *FIRMWARE_VERSION = "2.6.5";
+static const char *FIRMWARE_VERSION = "2.8.0";
 static const char *MODULE_ID = "M01";
 static const char *DEFAULT_CROP_SUGGESTIONS_JSON = "[\"Weizen\",\"Gerste\",\"Roggen\",\"Hafer\",\"Dinkel\",\"Triticale\",\"Raps\",\"Mais\",\"Senf\",\"Pfeffer\",\"Hirse\",\"Buchweizen\",\"Erbsen\",\"Ackerbohnen\",\"Soja\",\"Sonnenblumen\",\"Lein\",\"Luzerne\",\"Gras\",\"Kleegras\",\"Zwischenfrucht\"]";
 // Hikvision HTTP/MJPEG preview. IP, Kanal und Zugangsdaten bei Bedarf anpassen.
@@ -69,6 +69,14 @@ static constexpr uint32_t UPLOAD_RETRY_DELAY_MS = 60000;
 static constexpr uint32_t DEFAULT_MAIN_SIGNAL_HOLD_MS = 1500;
 static constexpr uint32_t MIN_MAIN_SIGNAL_HOLD_MS = 300;
 static constexpr uint32_t MAX_MAIN_SIGNAL_HOLD_MS = 10000;
+static constexpr uint16_t DEFAULT_PULSE_RATE_100_PCT = 20;
+static constexpr uint16_t MIN_PULSE_RATE_100_PCT = 1;
+static constexpr uint16_t MAX_PULSE_RATE_100_PCT = 1000;
+// Kurzes Messfenster, damit die Impulsanzeige nicht erst nach einer ganzen
+// Sekunde reagiert. Die Rate wird weiterhin auf Impulse pro Sekunde skaliert.
+static constexpr uint32_t DEFAULT_PULSE_RATE_WINDOW_MS = 250;
+static constexpr uint32_t MIN_PULSE_RATE_WINDOW_MS = 100;
+static constexpr uint32_t MAX_PULSE_RATE_WINDOW_MS = 3000;
 static constexpr uint32_t ROTATION_PULSE_TIMEOUT_MS = 3000;
 static constexpr uint8_t ROTATION_PULSES_PER_REV = 1;
 static constexpr uint32_t GPS_LOG_INTERVAL_MS = 3000;
@@ -78,6 +86,9 @@ static constexpr uint32_t GNSS_AUTO_START_HOLD_MS = 3000;
 static constexpr uint32_t DEFAULT_LIFT_AUTO_STOP_DELAY_MS = 600000;
 static constexpr uint32_t MIN_LIFT_AUTO_STOP_DELAY_MS = 0;
 static constexpr uint32_t MAX_LIFT_AUTO_STOP_DELAY_MS = 3600000;
+static constexpr uint32_t DEFAULT_AUTO_AIR_INTERVAL_MS = 900000;
+static constexpr uint32_t MIN_AUTO_AIR_INTERVAL_MS = 60000;
+static constexpr uint32_t MAX_AUTO_AIR_INTERVAL_MS = 3600000;
 static constexpr uint32_t FILE_FLUSH_INTERVAL_MS = 30000;
 static constexpr uint32_t SESSION_TTL_MS = 8UL * 60UL * 60UL * 1000UL;
 static constexpr uint8_t MAX_USERS = 8;
@@ -162,9 +173,29 @@ struct ChannelState {
   uint32_t mainSignalChanges = 0;
   uint32_t lastMainSignalChangeMs = 0;
   uint8_t signalQualityPct = 0;
+  uint16_t pulseWindowCount = 0;
+  uint32_t pulseWindowStartMs = 0;
+  float pulsesPerSecond = 0.0f;
 };
 
 ChannelState channels[CHANNEL_COUNT];
+volatile uint32_t interruptPulseCount[CHANNEL_COUNT] = {};
+volatile uint32_t interruptLastPulseUs[CHANNEL_COUNT] = {};
+volatile uint32_t interruptPulseIntervalUs[CHANNEL_COUNT] = {};
+uint32_t consumedInterruptPulseCount[CHANNEL_COUNT] = {};
+
+void IRAM_ATTR sensorPulseInterrupt(void *arg) {
+  const uint8_t channelIndex = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(arg));
+  if (channelIndex >= CHANNEL_COUNT) return;
+  const uint32_t nowUs = micros();
+  const uint32_t previousUs = interruptLastPulseUs[channelIndex];
+  if (previousUs > 0) {
+    interruptPulseIntervalUs[channelIndex] = nowUs - previousUs;
+  }
+  interruptLastPulseUs[channelIndex] = nowUs;
+  interruptPulseCount[channelIndex]++;
+}
+
 struct GpsLogEntry {
   uint32_t uptimeMs = 0;
   double latitude = 0;
@@ -265,6 +296,9 @@ uint32_t lastDebugMs = 0;
 uint32_t bootCounter = 0;
 uint32_t tripCounter = 0;
 uint32_t mainSignalHoldMs = DEFAULT_MAIN_SIGNAL_HOLD_MS;
+bool pulseRateDisplayMode = false;
+uint16_t pulseRate100Pct = DEFAULT_PULSE_RATE_100_PCT;
+uint32_t pulseRateWindowMs = DEFAULT_PULSE_RATE_WINDOW_MS;
 const char *resetReason = "unknown";
 bool filesystemReady = false;
 uint32_t lastFsCheckMs = 0;
@@ -275,6 +309,13 @@ bool autoStartArmed = true;
 bool manualAutoStartLock = false;
 uint32_t liftAutoStopDelayMs = DEFAULT_LIFT_AUTO_STOP_DELAY_MS;
 uint32_t liftRaisedSinceMs = 0;
+bool autoAirEnabled = false;
+uint32_t autoAirIntervalMs = DEFAULT_AUTO_AIR_INTERVAL_MS;
+uint8_t autoAirGroupMask = (1U << PNEUMATIC_VALVE_COUNT) - 1U;
+uint32_t autoAirElapsedMs = 0;
+uint32_t autoAirLastTickMs = 0;
+bool autoAirSequencing = false;
+uint8_t autoAirSequenceIndex = 0;
 String persistentGpsBuffer;
 uint32_t lastFileFlushMs = 0;
 GpsLogEntry *gpsLog = nullptr;
@@ -936,6 +977,11 @@ void loadCameraSettings() {
 void loadSensitivity() {
   mainSignalHoldMs = preferences.getUInt("hold_ms", DEFAULT_MAIN_SIGNAL_HOLD_MS);
   mainSignalHoldMs = constrain(mainSignalHoldMs, MIN_MAIN_SIGNAL_HOLD_MS, MAX_MAIN_SIGNAL_HOLD_MS);
+  pulseRateDisplayMode = preferences.getBool("quality_pps", false);
+  pulseRate100Pct = constrain(preferences.getUShort("pps_100", DEFAULT_PULSE_RATE_100_PCT),
+                              MIN_PULSE_RATE_100_PCT, MAX_PULSE_RATE_100_PCT);
+  pulseRateWindowMs = constrain(preferences.getUInt("pps_window", DEFAULT_PULSE_RATE_WINDOW_MS),
+                                MIN_PULSE_RATE_WINDOW_MS, MAX_PULSE_RATE_WINDOW_MS);
 }
 
 bool saveChannelName(uint8_t channelIndex, const String &name) {
@@ -972,6 +1018,29 @@ void loadLiftAutoStopDelay() {
 void saveLiftAutoStopDelay(uint32_t delayMs) {
   liftAutoStopDelayMs = constrain(delayMs, MIN_LIFT_AUTO_STOP_DELAY_MS, MAX_LIFT_AUTO_STOP_DELAY_MS);
   preferences.putUInt("lift_stop_ms", liftAutoStopDelayMs);
+}
+
+void loadAutoAirConfig() {
+  autoAirEnabled = preferences.getBool("air_en", false);
+  autoAirIntervalMs = preferences.getUInt("air_ms", DEFAULT_AUTO_AIR_INTERVAL_MS);
+  autoAirIntervalMs = constrain(autoAirIntervalMs, MIN_AUTO_AIR_INTERVAL_MS, MAX_AUTO_AIR_INTERVAL_MS);
+  autoAirGroupMask = preferences.getUChar("air_groups", (1U << PNEUMATIC_VALVE_COUNT) - 1U);
+  autoAirGroupMask &= (1U << PNEUMATIC_VALVE_COUNT) - 1U;
+}
+
+void saveAutoAirConfig(bool enabled, uint32_t intervalMs, uint8_t groupMask) {
+  autoAirEnabled = enabled;
+  autoAirIntervalMs = constrain(intervalMs, MIN_AUTO_AIR_INTERVAL_MS, MAX_AUTO_AIR_INTERVAL_MS);
+  autoAirGroupMask = groupMask & ((1U << PNEUMATIC_VALVE_COUNT) - 1U);
+  preferences.putBool("air_en", autoAirEnabled);
+  preferences.putUInt("air_ms", autoAirIntervalMs);
+  preferences.putUChar("air_groups", autoAirGroupMask);
+  if (!autoAirEnabled) {
+    autoAirElapsedMs = 0;
+    autoAirLastTickMs = 0;
+    autoAirSequencing = false;
+    autoAirSequenceIndex = 0;
+  }
 }
 
 void loadUploadConfig() {
@@ -1041,9 +1110,20 @@ String cameraAuthHeader(uint8_t cameraIndex) {
   return "Basic " + base64::encode(String(cameraUsernames[cameraIndex]) + ":" + String(cameraPasswords[cameraIndex]));
 }
 
-void saveSensitivity(uint32_t holdMs) {
+void saveSensitivity(uint32_t holdMs, bool usePulseRate, uint16_t pulsesAt100Pct, uint32_t rateWindowMs) {
   mainSignalHoldMs = constrain(holdMs, MIN_MAIN_SIGNAL_HOLD_MS, MAX_MAIN_SIGNAL_HOLD_MS);
+  pulseRateDisplayMode = usePulseRate;
+  pulseRate100Pct = constrain(pulsesAt100Pct, MIN_PULSE_RATE_100_PCT, MAX_PULSE_RATE_100_PCT);
+  pulseRateWindowMs = constrain(rateWindowMs, MIN_PULSE_RATE_WINDOW_MS, MAX_PULSE_RATE_WINDOW_MS);
   preferences.putUInt("hold_ms", mainSignalHoldMs);
+  preferences.putBool("quality_pps", pulseRateDisplayMode);
+  preferences.putUShort("pps_100", pulseRate100Pct);
+  preferences.putUInt("pps_window", pulseRateWindowMs);
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
+    channels[i].pulseWindowCount = 0;
+    channels[i].pulseWindowStartMs = now;
+  }
 }
 
 void initGpsLog() {
@@ -1917,6 +1997,57 @@ void updatePneumaticValves() {
   pneumaticValveOffAtMs = 0;
 }
 
+// Zeit laeuft nur waehrend aktiver Aufzeichnung UND Hubwerk unten (echte Feldarbeit);
+// bei Hubwerk oben oder gestoppter Aufzeichnung bleibt der erreichte Wert eingefroren.
+uint32_t autoAirRemainingMs(uint32_t now) {
+  if (!autoAirEnabled) return 0;
+  uint32_t elapsed = autoAirElapsedMs;
+  if (recordingActive && liftIsDown() && autoAirLastTickMs > 0) {
+    elapsed += now - autoAirLastTickMs;
+  }
+  return elapsed >= autoAirIntervalMs ? 0 : autoAirIntervalMs - elapsed;
+}
+
+void updateAutoAirBlast() {
+  if (!autoAirEnabled) {
+    autoAirLastTickMs = 0;
+    autoAirSequencing = false;
+    autoAirSequenceIndex = 0;
+    return;
+  }
+
+  const uint32_t now = millis();
+  const bool active = recordingActive && liftIsDown();
+  if (active) {
+    if (autoAirLastTickMs > 0) {
+      autoAirElapsedMs += now - autoAirLastTickMs;
+    }
+    autoAirLastTickMs = now;
+  } else {
+    autoAirLastTickMs = 0;
+  }
+
+  if (!autoAirSequencing && active && autoAirElapsedMs >= autoAirIntervalMs) {
+    autoAirSequencing = true;
+    autoAirSequenceIndex = 0;
+    autoAirElapsedMs = 0;
+  }
+
+  if (autoAirSequencing && activePneumaticValveIndex == 255) {
+    while (autoAirSequenceIndex < PNEUMATIC_VALVE_COUNT &&
+           (autoAirGroupMask & (1U << autoAirSequenceIndex)) == 0) {
+      autoAirSequenceIndex++;
+    }
+    if (autoAirSequenceIndex < PNEUMATIC_VALVE_COUNT) {
+      if (startPneumaticValve(autoAirSequenceIndex)) {
+        autoAirSequenceIndex++;
+      }
+    } else {
+      autoAirSequencing = false;
+    }
+  }
+}
+
 void updateFanTemperatureControl() {
   const uint32_t now = millis();
   if (now - lastFanTemperatureCheckMs < FAN_TEMPERATURE_CHECK_INTERVAL_MS) {
@@ -1957,15 +2088,20 @@ void initDigitalOutputs() {
 }
 
 void initDigitalInputs() {
+  const uint32_t now = millis();
   for (uint8_t i = 0; i < CHANNEL_COUNT; i++) {
     pinMode(DI_PINS[i], INPUT_PULLUP);
     channels[i].inputRaw = digitalRead(DI_PINS[i]) == HIGH;
     channels[i].active = INPUT_ACTIVE_HIGH ? channels[i].inputRaw : !channels[i].inputRaw;
-    channels[i].activeSinceMs = channels[i].active ? millis() : 0;
-    channels[i].lastDetectionMs = channels[i].active ? millis() : 0;
+    channels[i].activeSinceMs = channels[i].active ? now : 0;
+    channels[i].lastDetectionMs = channels[i].active ? now : 0;
+    channels[i].pulseWindowStartMs = now;
     channels[i].signalQualityPct = channels[i].active ? 1 : 0;
     channels[i].mainSignal = false;
     channels[i].status = "none";
+    attachInterruptArg(digitalPinToInterrupt(DI_PINS[i]), sensorPulseInterrupt,
+                       reinterpret_cast<void *>(static_cast<uintptr_t>(i)),
+                       INPUT_ACTIVE_HIGH ? RISING : FALLING);
   }
 }
 
@@ -1976,15 +2112,23 @@ void readDigitalInputs() {
     const bool raw = digitalRead(DI_PINS[i]) == HIGH;
     const bool active = INPUT_ACTIVE_HIGH ? raw : !raw;
 
+    noInterrupts();
+    const uint32_t capturedPulseCount = interruptPulseCount[i];
+    const uint32_t capturedPulseIntervalUs = interruptPulseIntervalUs[i];
+    interrupts();
+    const uint32_t newPulseCount = capturedPulseCount - consumedInterruptPulseCount[i];
+    if (newPulseCount > 0) {
+      consumedInterruptPulseCount[i] = capturedPulseCount;
+      channels[i].detectionCount += newPulseCount;
+      channels[i].pulseWindowCount += static_cast<uint16_t>(min<uint32_t>(newPulseCount, UINT16_MAX));
+      channels[i].lastDetectionMs = now;
+      if (capturedPulseIntervalUs > 0) {
+        channels[i].pulseIntervalMs = capturedPulseIntervalUs / 1000UL;
+      }
+    }
+
     if (active != channels[i].active) {
       channels[i].changes++;
-      if (active) {
-        if (channels[i].lastDetectionMs > 0) {
-          channels[i].pulseIntervalMs = now - channels[i].lastDetectionMs;
-        }
-        channels[i].detectionCount++;
-        channels[i].lastDetectionMs = now;
-      }
       channels[i].lastChangeMs = now;
       // Jeden Impuls direkt und unabhaengig vom vorherigen Impuls auswerten.
       // Beim Signalabfall darf kein alter Prozentwert stehen bleiben.
@@ -1998,8 +2142,17 @@ void readDigitalInputs() {
     channels[i].active = active;
 
     const bool seedChannel = isSeedChannel(i);
+    const uint32_t pulseWindowElapsedMs = now - channels[i].pulseWindowStartMs;
+    if (pulseWindowElapsedMs >= pulseRateWindowMs) {
+      channels[i].pulsesPerSecond = channels[i].pulseWindowCount * 1000.0f / pulseWindowElapsedMs;
+      channels[i].pulseWindowCount = 0;
+      channels[i].pulseWindowStartMs = now;
+    }
     const bool mainSignal = seedChannel && active && channels[i].activeSinceMs > 0 && (now - channels[i].activeSinceMs >= mainSignalHoldMs);
-    if (seedChannel && active) {
+    if (seedChannel && pulseRateDisplayMode) {
+      channels[i].signalQualityPct = static_cast<uint8_t>(constrain(
+          static_cast<uint32_t>(channels[i].pulsesPerSecond * 100.0f / max<uint16_t>(pulseRate100Pct, 1)), 0UL, 100UL));
+    } else if (seedChannel && active) {
       const uint32_t activeMs = channels[i].activeSinceMs > 0 ? now - channels[i].activeSinceMs : 0;
       channels[i].signalQualityPct = static_cast<uint8_t>(constrain((activeMs * 100UL) / max<uint32_t>(mainSignalHoldMs, 1), 1UL, 100UL));
     } else {
@@ -2081,6 +2234,9 @@ String statusJson() {
   doc["main_signal_hold_ms"] = mainSignalHoldMs;
   doc["quality_signal_hold_ms"] = mainSignalHoldMs;
   doc["red_signal_hold_ms"] = mainSignalHoldMs;
+  doc["signal_quality_mode"] = pulseRateDisplayMode ? "pulses_per_second" : "pulse_duration";
+  doc["pulse_rate_100_pct"] = pulseRate100Pct;
+  doc["pulse_rate_window_ms"] = pulseRateWindowMs;
   doc["light_channel"] = LIGHT_OUTPUT_CHANNEL;
   doc["light_on"] = channels[LIGHT_OUTPUT_CHANNEL - 1].output;
   doc["light_switchable"] = doExpanderReady;
@@ -2129,7 +2285,15 @@ String statusJson() {
     valve["remaining_ms"] = valveBusy && activePneumaticValveIndex == i ? valveRemainingMs : 0;
     valve["pulse_ms"] = PNEUMATIC_VALVE_PULSE_MS;
     valve["switchable"] = doExpanderReady && !valveBusy;
+    valve["automatic_enabled"] = (autoAirGroupMask & (1U << i)) != 0;
   }
+  JsonObject autoAirJson = doc["auto_air"].to<JsonObject>();
+  autoAirJson["enabled"] = autoAirEnabled;
+  autoAirJson["interval_ms"] = autoAirIntervalMs;
+  autoAirJson["group_mask"] = autoAirGroupMask;
+  autoAirJson["remaining_ms"] = autoAirRemainingMs(now);
+  autoAirJson["timer_active"] = autoAirEnabled && recordingActive && liftIsDown();
+  autoAirJson["sequencing"] = autoAirSequencing;
   doc["camera_name"] = HIKVISION_CAMERA_NAME;
   doc["camera_stream_url"] = CAMERA_PROXY_SUB_STREAM_URL;
   doc["camera_main_stream_url"] = CAMERA_PROXY_MAIN_STREAM_URL;
@@ -2229,6 +2393,7 @@ String statusJson() {
     ch["changes"] = channels[i].changes;
     ch["detection_count"] = channels[i].detectionCount;
     ch["pulse_interval_ms"] = channels[i].pulseIntervalMs;
+    ch["pulses_per_second"] = serialized(String(channels[i].pulsesPerSecond, 1));
     const bool isRot = isRotationChannel(i);
     ch["rotation_moving"] = isRot ? rotMoving : false;
     ch["rotation_rpm"] = isRot ? rotRpm : 0.0f;
@@ -2591,20 +2756,41 @@ const char* htmlPage() {
         <summary>Empfindlichkeit</summary>
         <div class="admin-section-content">
           <div class="field-row">
+            <label for="qualityModeInput">Prozentanzeige:</label>
+            <select id="qualityModeInput">
+              <option value="pulse_duration">Impulsdauer (wie bisher)</option>
+              <option value="pulses_per_second">Impulse pro Sekunde</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <label for="sensitivityInput">Alarm nach Dauersignal (ms):</label>
             <input id="sensitivityInput" type="number" min="300" max="10000" step="100" value="1500">
+          </div>
+          <div class="field-row" id="pulseRateSettingRow">
+            <label for="pulseRate100Input">100 % bei (Impulse/s):</label>
+            <input id="pulseRate100Input" type="number" min="1" max="1000" step="1" value="20">
+          </div>
+          <div class="field-row" id="pulseRateWindowSettingRow">
+            <label for="pulseRateWindowInput">Messfenster Impulsrate (ms):</label>
+            <input id="pulseRateWindowInput" type="number" min="100" max="3000" step="50" value="250">
+          </div>
+          <div class="field-row">
             <button id="sensitivitySave" type="button">Speichern</button>
           </div>
           <div class="gps-meta">
+            <div>Auswertung: <strong id="qualityModeCurrent">-</strong></div>
             <div>Signalpegel 100 % bei: <strong id="sensitivityCurrent">-</strong></div>
+            <div>Messfenster Impulsrate: <strong id="pulseRateWindowCurrent">-</strong></div>
             <div>Rot/Alarm ab: <strong id="redSignalCurrent">-</strong></div>
           </div>
           <div class="setting-hint">
-            <strong>Was stellt man hier ein?</strong> Die Zeit, die der Lichttaster (Sensor) <strong>ununterbrochen</strong> ein Signal melden muss, bevor Alarm (roter Rahmen + Ton, "Dauersignal") ausgelöst wird. Ein Dauersignal bedeutet Verstopfung/Störung, keine normale Kornerkennung.
+            <strong>Zwei getrennte Zeitwerte:</strong>
             <ul>
-              <li><strong>Feine, dicht fließende Saat</strong> (z.B. Raps): Wert eher <strong>erhöhen</strong>. Bei feiner Saat kann der Lichtstrahl auch im normalen Betrieb länger am Stück unterbrochen sein &ndash; ein zu niedriger Wert löst dann fälschlich Alarm aus.</li>
-              <li><strong>Grobe, einzeln fallende Saat</strong> (z.B. Bohnen, Mais): Wert kann niedrig bleiben &ndash; eine echte Verstopfung wird dann schneller erkannt.</li>
+              <li><strong>Alarm nach Dauersignal:</strong> Zeit, die der Sensor ununterbrochen aktiv sein muss, bevor eine Verstopfung/Störung gemeldet wird. Einzelne 100-%-Anzeigen lösen keinen Alarm aus.</li>
+              <li><strong>Messfenster Impulsrate:</strong> Zeitraum, über den Impulse gezählt und auf Impulse/s umgerechnet werden. Ein kleiner Wert reagiert schneller auf feine Saat; ein größerer Wert zeigt grobe, unregelmäßig fallende Saat ruhiger an.</li>
+              <li><strong>Startwerte:</strong> 250 ms für feine Saat, 500-1000 ms für normale bis grobe Saat. Bei größerem Messfenster reagiert die Anzeige entsprechend langsamer.</li>
             </ul>
-            Hinweis: Diese Einstellung regelt nicht, wie empfindlich der Sensor selbst einzelne Körner erkennt. Erkennt der Sensor feine Saat generell zu selten/schwach, hilft nur der Empfindlichkeits-Regler direkt am Lichttaster bzw. dessen Montageposition &ndash; nicht dieser Wert.
+            Hinweis: Diese Werte verändern nicht die elektrische Empfindlichkeit des Lichttasters. Dafür bleibt dessen eigener Regler bzw. die Montageposition zuständig.
           </div>
         </div>
       </details>
@@ -2620,6 +2806,40 @@ const char* htmlPage() {
             <button id="liftAutoStopSave" type="button">Speichern</button>
           </div>
           <div class="gps-meta" style="color:#9ca3af;font-size:.82rem;">0 ms = kein Auto-Stop · Wert in Millisekunden</div>
+        </div>
+      </details>
+      <details class="admin-section" open>
+        <summary>Automatische Druckluft</summary>
+        <div class="admin-section-content">
+          <div class="field-row" style="margin-bottom:6px; align-items:center;">
+            <label style="display:flex; align-items:center; gap:6px;">
+              <input id="autoAirEnabledInput" type="checkbox" />
+              Automatische Druckluft aktiv
+            </label>
+          </div>
+          <div class="field-row">
+            <input id="autoAirIntervalInput" type="number" min="1" max="60" step="1" value="15">
+            <button id="autoAirSave" type="button">Speichern</button>
+          </div>
+          <div style="margin:10px 0 6px;color:#d1d5db;">Automatisch durchblasen:</div>
+          <div class="field-row" id="autoAirGroups" style="align-items:center;">
+            <label><input class="auto-air-group" type="checkbox" value="0" checked> Sensor 1-6</label>
+            <label><input class="auto-air-group" type="checkbox" value="1" checked> Sensor 7-12</label>
+            <label><input class="auto-air-group" type="checkbox" value="2" checked> Sensor 13-18</label>
+            <label><input class="auto-air-group" type="checkbox" value="3" checked> Sensor 19-24</label>
+          </div>
+          <div class="gps-meta">
+            <div>Intervall: <strong id="autoAirIntervalCurrent">-</strong></div>
+            <div>Gruppen: <strong id="autoAirGroupsCurrent">-</strong></div>
+            <div>N&auml;chster Ausl&ouml;ser in: <strong id="autoAirRemaining">-</strong></div>
+          </div>
+          <div class="setting-hint">
+            Bl&auml;st bei aktiver Fahrtaufzeichnung und Hubwerk unten die ausgew&auml;hlten Ventile nacheinander kurz durch, um die Sensoren freizuhalten. Der Wert ist die Zeit in Minuten zwischen zwei Ausl&ouml;sungen.
+            <ul>
+              <li>Der Timer l&auml;uft nur w&auml;hrend tats&auml;chlicher Feldarbeit (Aufzeichnung aktiv und Hubwerk unten).</li>
+              <li>Bei ausgehobenem Hubwerk oder gestoppter Aufzeichnung bleibt der erreichte Wert stehen und l&auml;uft erst danach weiter &ndash; er springt nicht zur&uuml;ck auf 0.</li>
+            </ul>
+          </div>
         </div>
       </details>
       <details class="admin-section">
@@ -4068,7 +4288,12 @@ const char* htmlPage() {
         document.getElementById('espTemp').textContent = Number.isFinite(data.esp_temperature_c) ? data.esp_temperature_c.toFixed(1) + ' °C' : '-';
         document.getElementById('cropCurrent').textContent = data.crop_name || '-';
         document.getElementById('fieldCurrent').textContent = data.field_name || '-';
-        document.getElementById('sensitivityCurrent').textContent = (data.quality_signal_hold_ms || data.main_signal_hold_ms || 0) + ' ms';
+        const qualityMode = data.signal_quality_mode || 'pulse_duration';
+        document.getElementById('qualityModeCurrent').textContent = qualityMode === 'pulses_per_second' ? 'Impulse pro Sekunde' : 'Impulsdauer';
+        document.getElementById('sensitivityCurrent').textContent = qualityMode === 'pulses_per_second'
+          ? (data.pulse_rate_100_pct || 20) + ' Impulse/s'
+          : (data.quality_signal_hold_ms || data.main_signal_hold_ms || 0) + ' ms';
+        document.getElementById('pulseRateWindowCurrent').textContent = (data.pulse_rate_window_ms || 250) + ' ms';
         document.getElementById('redSignalCurrent').textContent = (data.red_signal_hold_ms || 15000) + ' ms';
         lightOnState = Boolean(data.light_on);
         lightSwitchable = Boolean(data.light_switchable);
@@ -4081,6 +4306,18 @@ const char* htmlPage() {
         if (document.activeElement !== document.getElementById('sensitivityInput')) {
           document.getElementById('sensitivityInput').value = data.quality_signal_hold_ms || data.main_signal_hold_ms || 1500;
         }
+        if (document.activeElement !== document.getElementById('qualityModeInput')) {
+          document.getElementById('qualityModeInput').value = qualityMode;
+        }
+        if (document.activeElement !== document.getElementById('pulseRate100Input')) {
+          document.getElementById('pulseRate100Input').value = data.pulse_rate_100_pct || 20;
+        }
+        if (document.activeElement !== document.getElementById('pulseRateWindowInput')) {
+          document.getElementById('pulseRateWindowInput').value = data.pulse_rate_window_ms || 250;
+        }
+        const pulseRateSettingDisplay = qualityMode === 'pulses_per_second' ? '' : 'none';
+        document.getElementById('pulseRateSettingRow').style.display = pulseRateSettingDisplay;
+        document.getElementById('pulseRateWindowSettingRow').style.display = pulseRateSettingDisplay;
         const liftSettings = data.lift || {};
         document.getElementById('liftStatusSettings').textContent =
           liftSettings.is_down ? 'Unten' : (liftSettings.is_up ? 'Oben' : '-');
@@ -4090,6 +4327,30 @@ const char* htmlPage() {
             : 'Deaktiviert';
         if (document.activeElement !== document.getElementById('liftAutoStopInput')) {
           document.getElementById('liftAutoStopInput').value = liftSettings.auto_stop_delay_ms ?? 600000;
+        }
+        const autoAir = data.auto_air || {};
+        document.getElementById('autoAirIntervalCurrent').textContent =
+          Math.round((autoAir.interval_ms || 0) / 60000) + ' min';
+        const autoAirGroupMask = Number(autoAir.group_mask ?? 15);
+        const autoAirGroupLabels = ['1-6', '7-12', '13-18', '19-24'];
+        document.getElementById('autoAirGroupsCurrent').textContent = autoAirGroupLabels
+          .filter((_, index) => (autoAirGroupMask & (1 << index)) !== 0)
+          .join(', ') || 'keine';
+        document.getElementById('autoAirRemaining').textContent = autoAir.enabled
+          ? (autoAir.timer_active
+              ? Math.ceil((autoAir.remaining_ms || 0) / 60000) + ' min'
+              : 'pausiert')
+          : 'deaktiviert';
+        if (document.activeElement !== document.getElementById('autoAirEnabledInput')) {
+          document.getElementById('autoAirEnabledInput').checked = Boolean(autoAir.enabled);
+        }
+        if (document.activeElement !== document.getElementById('autoAirIntervalInput')) {
+          document.getElementById('autoAirIntervalInput').value = Math.round((autoAir.interval_ms || 900000) / 60000);
+        }
+        if (!document.getElementById('autoAirGroups').contains(document.activeElement)) {
+          document.querySelectorAll('.auto-air-group').forEach(input => {
+            input.checked = (autoAirGroupMask & (1 << Number(input.value))) !== 0;
+          });
         }
         document.getElementById('tripId').textContent = data.trip_id || '-';
         document.getElementById('filesystem').textContent = data.filesystem_ready
@@ -4249,11 +4510,19 @@ const char* htmlPage() {
     async function saveSensitivitySetting() {
       const input = document.getElementById('sensitivityInput');
       const value = Number(input.value);
+      const mode = document.getElementById('qualityModeInput').value;
+      const pulseRate100Pct = Number(document.getElementById('pulseRate100Input').value);
+      const pulseRateWindowMs = Number(document.getElementById('pulseRateWindowInput').value);
       try {
         const res = await fetchWithTimeout('/api/sensitivity', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ main_signal_hold_ms: value })
+          body: JSON.stringify({
+            main_signal_hold_ms: value,
+            signal_quality_mode: mode,
+            pulse_rate_100_pct: pulseRate100Pct,
+            pulse_rate_window_ms: pulseRateWindowMs
+          })
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         await refresh();
@@ -4274,6 +4543,28 @@ const char* htmlPage() {
         await refresh();
       } catch (err) {
         document.getElementById('error').textContent = 'Hubwerk-Einstellung speichern fehlgeschlagen';
+      }
+    }
+
+    async function saveAutoAirSetting() {
+      const enabled = document.getElementById('autoAirEnabledInput').checked;
+      const minutes = Number(document.getElementById('autoAirIntervalInput').value);
+      const groupMask = Array.from(document.querySelectorAll('.auto-air-group:checked'))
+        .reduce((mask, input) => mask | (1 << Number(input.value)), 0);
+      if (enabled && groupMask === 0) {
+        document.getElementById('error').textContent = 'Bitte mindestens eine Druckluftgruppe auswählen.';
+        return;
+      }
+      try {
+        const res = await fetchWithTimeout('/api/auto-air', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled, interval_ms: minutes * 60000, group_mask: groupMask })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await refresh();
+      } catch (err) {
+        document.getElementById('error').textContent = 'Druckluft-Einstellung speichern fehlgeschlagen';
       }
     }
 
@@ -4828,7 +5119,13 @@ const char* htmlPage() {
     document.getElementById('cropSave').addEventListener('click', saveCrop);
     document.getElementById('fieldSave').addEventListener('click', saveField);
     document.getElementById('sensitivitySave').addEventListener('click', saveSensitivitySetting);
+    document.getElementById('qualityModeInput').addEventListener('change', event => {
+      const display = event.target.value === 'pulses_per_second' ? '' : 'none';
+      document.getElementById('pulseRateSettingRow').style.display = display;
+      document.getElementById('pulseRateWindowSettingRow').style.display = display;
+    });
     document.getElementById('liftAutoStopSave').addEventListener('click', saveLiftAutoStopSetting);
+    document.getElementById('autoAirSave').addEventListener('click', saveAutoAirSetting);
     document.getElementById('deviceNameSave').addEventListener('click', saveDeviceNameSetting);
     document.getElementById('uploadConfigSave').addEventListener('click', saveUploadConfigSetting);
     document.getElementById('uploadConfigTest').addEventListener('click', testUploadConfig);
@@ -4940,7 +5237,7 @@ const char* htmlPage() {
       }
       window.addEventListener('resize', () => drawTrack());
       connectionTimer = setInterval(updateLastContact, 1000);
-      setInterval(refresh, 1000);
+      setInterval(refresh, 250);
       setInterval(refreshTrack, 3000);
       if (authState.role === 'admin') {
         await loadUsers();
@@ -5811,13 +6108,31 @@ void handleApiSensitivity() {
     server.send(400, "application/json", "{\"error\":\"invalid_sensitivity\"}");
     return;
   }
-  saveSensitivity(holdMs);
+  const String qualityMode = doc["signal_quality_mode"] | (pulseRateDisplayMode ? "pulses_per_second" : "pulse_duration");
+  if (qualityMode != "pulse_duration" && qualityMode != "pulses_per_second") {
+    server.send(400, "application/json", "{\"error\":\"invalid_quality_mode\"}");
+    return;
+  }
+  const uint16_t pulsesAt100Pct = doc["pulse_rate_100_pct"] | pulseRate100Pct;
+  if (pulsesAt100Pct < MIN_PULSE_RATE_100_PCT || pulsesAt100Pct > MAX_PULSE_RATE_100_PCT) {
+    server.send(400, "application/json", "{\"error\":\"invalid_pulse_rate\"}");
+    return;
+  }
+  const uint32_t rateWindowMs = doc["pulse_rate_window_ms"] | pulseRateWindowMs;
+  if (rateWindowMs < MIN_PULSE_RATE_WINDOW_MS || rateWindowMs > MAX_PULSE_RATE_WINDOW_MS) {
+    server.send(400, "application/json", "{\"error\":\"invalid_pulse_rate_window\"}");
+    return;
+  }
+  saveSensitivity(holdMs, qualityMode == "pulses_per_second", pulsesAt100Pct, rateWindowMs);
 
   JsonDocument response;
   response["ok"] = true;
   response["main_signal_hold_ms"] = mainSignalHoldMs;
   response["quality_signal_hold_ms"] = mainSignalHoldMs;
   response["red_signal_hold_ms"] = mainSignalHoldMs;
+  response["signal_quality_mode"] = pulseRateDisplayMode ? "pulses_per_second" : "pulse_duration";
+  response["pulse_rate_100_pct"] = pulseRate100Pct;
+  response["pulse_rate_window_ms"] = pulseRateWindowMs;
   String json;
   serializeJson(response, json);
   server.send(200, "application/json", json);
@@ -5835,6 +6150,32 @@ void handleApiLiftAutoStop() {
   JsonDocument response;
   response["ok"] = true;
   response["auto_stop_delay_ms"] = liftAutoStopDelayMs;
+  String json;
+  serializeJson(response, json);
+  server.send(200, "application/json", json);
+}
+
+void handleApiAutoAir() {
+  const String body = server.arg("plain");
+  JsonDocument doc;
+  if (body.length() == 0 || deserializeJson(doc, body)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_body\"}");
+    return;
+  }
+  const bool enabled = doc["enabled"] | false;
+  const uint32_t intervalMs = doc["interval_ms"] | DEFAULT_AUTO_AIR_INTERVAL_MS;
+  const int groupMask = doc["group_mask"] | static_cast<int>(autoAirGroupMask);
+  const int validGroupMask = (1U << PNEUMATIC_VALVE_COUNT) - 1U;
+  if (groupMask < 0 || groupMask > validGroupMask || (enabled && groupMask == 0)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_group_mask\"}");
+    return;
+  }
+  saveAutoAirConfig(enabled, intervalMs, static_cast<uint8_t>(groupMask));
+  JsonDocument response;
+  response["ok"] = true;
+  response["enabled"] = autoAirEnabled;
+  response["interval_ms"] = autoAirIntervalMs;
+  response["group_mask"] = autoAirGroupMask;
   String json;
   serializeJson(response, json);
   server.send(200, "application/json", json);
@@ -6802,6 +7143,7 @@ void setup() {
   loadCameraSettings();
   loadSensitivity();
   loadLiftAutoStopDelay();
+  loadAutoAirConfig();
   loadUploadConfig();
   loadDeviceConfig();
   loadUsersFromPreferences();
@@ -6846,6 +7188,7 @@ void setup() {
   registerProtectedRoute("/api/field", HTTP_POST, UserRole::Operator, handleApiField);
   registerProtectedRoute("/api/sensitivity", HTTP_POST, UserRole::Operator, handleApiSensitivity);
   registerProtectedRoute("/api/lift-autostop", HTTP_POST, UserRole::Operator, handleApiLiftAutoStop);
+  registerProtectedRoute("/api/auto-air", HTTP_POST, UserRole::Operator, handleApiAutoAir);
   registerProtectedRoute("/api/camera-settings", HTTP_POST, UserRole::Admin, handleApiCameraSettings);
   registerProtectedRoute("/api/recording", HTTP_POST, UserRole::Operator, handleApiRecording);
   registerProtectedRoute("/api/output", HTTP_POST, UserRole::Operator, handleApiOutput);
@@ -6887,6 +7230,7 @@ void loop() {
   pollGnss();
   updateGnssHealthAndRecording();
   updatePneumaticValves();
+  updateAutoAirBlast();
   updateFanTemperatureControl();
   server.handleClient();
   if (recordingActive && millis() - lastFileFlushMs >= FILE_FLUSH_INTERVAL_MS) {
